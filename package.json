@@ -1,0 +1,47 @@
+{
+  "name": "weli-backend",
+  "version": "1.0.0",
+  "description": "Backend oficial de Real Academy FC Reload (Node.js + Fastify + TypeScript)",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "start:prod": "NODE_ENV=production node dist/index.js",
+    "clean": "rimraf dist",
+    "check:types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "@fastify/helmet": "^13.0.2",
+    "@fastify/swagger": "^9.5.2",
+    "@fastify/swagger-ui": "^5.2.3",
+    "@node-rs/argon2": "^1.8.3",
+    "docxtemplater": "^3.67.6",
+    "dotenv": "^17.2.3",
+    "fastify": "^5.6.1",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.15.3",
+    "pizzip": "^3.2.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^24.10.0",
+    "rimraf": "^6.0.1",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.17.0 <23"
+  },
+  "files": [
+    "dist",
+    ".env.production",
+    "package.json",
+    "package-lock.json"
+  ],
+  "license": "MIT",
+  "author": "WELI APP <rodrigo.lagos.fernandez@gmail.com>"
+}
