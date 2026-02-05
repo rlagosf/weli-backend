@@ -6,25 +6,46 @@ import { z } from "zod";
 import { getDb } from "../db";
 import { CONFIG } from "../config";
 
+/* ──────────────────────────────────────────────────────────────
+   Config / constants
+────────────────────────────────────────────────────────────── */
 const JWT_SECRET = CONFIG.JWT_SECRET;
 
-// ✅ Identidad JWT (purga de "rafc"): configurable por env / CONFIG
-// - Puedes definir JWT_ISSUER y JWT_AUDIENCE en tu config o .env
-// - Fallbacks neutros para no romper el login si aún no los agregas
 const JWT_ISSUER =
   String((CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER ?? "app").trim();
 const JWT_AUDIENCE =
   String((CONFIG as any)?.JWT_AUDIENCE ?? process.env.JWT_AUDIENCE ?? "web").trim();
 
-// ✅ Activa logs de performance solo si lo deseas:
-// export AUTH_PERF_LOG=1  (o en .env)
 const PERF_LOG =
   String((CONFIG as any)?.AUTH_PERF_LOG ?? process.env.AUTH_PERF_LOG ?? "0") === "1";
 
+/**
+ * ✅ NinjaHosting / Node App Manager:
+ * Por defecto NO confiamos en XFF porque el cliente puede spoofearlo.
+ * Actívalo solo si confirmas proxy confiable que normaliza headers.
+ */
+const TRUST_PROXY =
+  String((CONFIG as any)?.TRUST_PROXY ?? process.env.TRUST_PROXY ?? "0") === "1";
+
+// ✅ Disponibilidad: limita concurrencia de Argon2 (anti CPU spike)
+const MAX_AUTH_CONCURRENCY = Math.max(
+  2,
+  Number((CONFIG as any)?.AUTH_CONCURRENCY ?? process.env.AUTH_CONCURRENCY ?? 8) || 8
+);
+
+// ✅ Trunca audit extra para no inflar BD
+const AUDIT_EXTRA_MAX_CHARS = Math.max(
+  512,
+  Number(
+    (CONFIG as any)?.AUDIT_EXTRA_MAX_CHARS ??
+      process.env.AUDIT_EXTRA_MAX_CHARS ??
+      2048
+  ) || 2048
+);
+
 /* ──────────────────────────────────────────────────────────────
-   Validación
+   Validation
 ────────────────────────────────────────────────────────────── */
-// ✅ RUT real: 7 u 8 dígitos (sin DV)
 const RutSchema = z.string().regex(/^\d{7,8}$/);
 
 const LoginSchema = z.object({
@@ -38,6 +59,43 @@ const ChangePasswordSchema = z.object({
 });
 
 type ApoderadoToken = { type: "apoderado"; apoderado_id: number; rut: string };
+
+/* ──────────────────────────────────────────────────────────────
+   Small semaphore (limits argon2 concurrency)
+────────────────────────────────────────────────────────────── */
+function createSemaphore(max: number) {
+  let inFlight = 0;
+  const q: Array<() => void> = [];
+
+  const acquire = () =>
+    new Promise<void>((resolve) => {
+      const run = () => {
+        inFlight += 1;
+        resolve();
+      };
+      if (inFlight < max) run();
+      else q.push(run);
+    });
+
+  const release = () => {
+    inFlight = Math.max(0, inFlight - 1);
+    const next = q.shift();
+    if (next) next();
+  };
+
+  return { acquire, release, get inFlight() { return inFlight; } };
+}
+
+const authSem = createSemaphore(MAX_AUTH_CONCURRENCY);
+
+async function withAuthSlot<T>(fn: () => Promise<T>): Promise<T> {
+  await authSem.acquire();
+  try {
+    return await fn();
+  } finally {
+    authSem.release();
+  }
+}
 
 /* ──────────────────────────────────────────────────────────────
    Token helpers
@@ -89,16 +147,11 @@ function getTokenOr401(req: any, reply: any): ApoderadoToken | null {
 }
 
 /* ──────────────────────────────────────────────────────────────
-   Audit helpers (auth_audit)
+   IP helper (anti spoof)
 ────────────────────────────────────────────────────────────── */
-type AuditEvent =
-  | "login"
-  | "logout"
-  | "refresh"
-  | "invalid_token"
-  | "access_denied";
-
 function getIp(req: any): string | null {
+  if (!TRUST_PROXY) return req.ip ? String(req.ip) : null;
+
   const xff = req.headers?.["x-forwarded-for"];
   if (Array.isArray(xff)) return String(xff[0] || "").split(",")[0].trim() || null;
   if (typeof xff === "string" && xff) return xff.split(",")[0].trim() || null;
@@ -107,6 +160,21 @@ function getIp(req: any): string | null {
   if (typeof realIp === "string" && realIp) return realIp.trim();
 
   return req.ip ? String(req.ip) : null;
+}
+
+/* ──────────────────────────────────────────────────────────────
+   Audit helpers (auth_audit)
+────────────────────────────────────────────────────────────── */
+type AuditEvent = "login" | "logout" | "refresh" | "invalid_token" | "access_denied";
+
+function safeJsonTruncate(extra: any, maxChars: number) {
+  if (!extra) return null;
+  try {
+    const s = JSON.stringify(extra);
+    return s.length <= maxChars ? s : s.slice(0, maxChars);
+  } catch {
+    return null;
+  }
 }
 
 async function auditApoderado(params: {
@@ -143,7 +211,7 @@ async function auditApoderado(params: {
         statusCode ?? null,
         ip,
         ua,
-        extra ? JSON.stringify(extra) : null,
+        safeJsonTruncate(extra, AUDIT_EXTRA_MAX_CHARS),
         apoderadoId,
       ]
     );
@@ -157,29 +225,38 @@ function fireAndForgetAudit(p: Parameters<typeof auditApoderado>[0]) {
 }
 
 /* ──────────────────────────────────────────────────────────────
-   Rate limit simple en memoria
-   (producción multi-instancia => Redis/Upstash ideal)
+   Rate limit (in-memory) + GC
 ────────────────────────────────────────────────────────────── */
-const RL_MAX = 8; // 8 intentos
-const RL_WINDOW_MS = 10 * 60_000; // 10 min
-const RL_BLOCK_MS = 15 * 60_000; // 15 min
+const RL_MAX = 8;
+const RL_WINDOW_MS = 10 * 60_000;
+const RL_BLOCK_MS = 15 * 60_000;
 
-type RLState = { count: number; windowStart: number; blockedUntil: number };
+// ✅ evita que el Map crezca infinito
+const RL_MAX_KEYS = 50_000;
+const RL_GC_INTERVAL_MS = 60_000;
+
+type RLState = { count: number; windowStart: number; blockedUntil: number; lastSeen: number };
 const rl = new Map<string, RLState>();
 
 function rlKey(ip: string | null, rut: string) {
   return `${ip || "noip"}:${rut}`;
 }
 
+function rlSafeKeysOk() {
+  return rl.size < RL_MAX_KEYS;
+}
+
 function checkRateLimit(ip: string | null, rut: string) {
-  const key = rlKey(ip, rut);
   const now = Date.now();
+  const key = rlSafeKeysOk() ? rlKey(ip, rut) : `${ip || "noip"}:*`; // degradación segura
   const st = rl.get(key);
 
   if (!st) {
-    rl.set(key, { count: 0, windowStart: now, blockedUntil: 0 });
+    rl.set(key, { count: 0, windowStart: now, blockedUntil: 0, lastSeen: now });
     return { ok: true, retryAfterSec: 0 };
   }
+
+  st.lastSeen = now;
 
   if (st.blockedUntil > now) {
     return { ok: false, retryAfterSec: Math.ceil((st.blockedUntil - now) / 1000) };
@@ -195,9 +272,11 @@ function checkRateLimit(ip: string | null, rut: string) {
 }
 
 function registerFailed(ip: string | null, rut: string) {
-  const key = rlKey(ip, rut);
   const now = Date.now();
-  const st = rl.get(key) ?? { count: 0, windowStart: now, blockedUntil: 0 };
+  const key = rlSafeKeysOk() ? rlKey(ip, rut) : `${ip || "noip"}:*`; // degradación segura
+  const st = rl.get(key) ?? { count: 0, windowStart: now, blockedUntil: 0, lastSeen: now };
+
+  st.lastSeen = now;
 
   if (now - st.windowStart > RL_WINDOW_MS) {
     st.count = 0;
@@ -216,18 +295,30 @@ function registerFailed(ip: string | null, rut: string) {
   rl.set(key, st);
 }
 
-/* ──────────────────────────────────────────────────────────────
-   Dummy hash para igualar tiempos (evita enumeración por timing)
-────────────────────────────────────────────────────────────── */
-const DUMMY_HASH_PROMISE = argon2.hash("dummy-password-not-valid");
+let rlGcStarted = false;
+function startRlGcOnce() {
+  if (rlGcStarted) return;
+  rlGcStarted = true;
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, st] of rl.entries()) {
+      if (now - st.lastSeen > 60 * 60_000) rl.delete(k); // 1h sin uso
+      else if (st.blockedUntil === 0 && now - st.windowStart > 2 * RL_WINDOW_MS) rl.delete(k);
+    }
+  }, RL_GC_INTERVAL_MS).unref?.();
+}
 
 /* ──────────────────────────────────────────────────────────────
-   Hash params razonables (producción)
-   - evita hashes nuevos exageradamente lentos
-   - NO debilita demasiado
+   Dummy hash (timing equalization)
+────────────────────────────────────────────────────────────── */
+const DUMMY_HASH_PROMISE = withAuthSlot(() => argon2.hash("dummy-password-not-valid"));
+
+/* ──────────────────────────────────────────────────────────────
+   Hash params razonables
 ────────────────────────────────────────────────────────────── */
 const ARGON2_HASH_OPTS: Parameters<typeof argon2.hash>[1] = {
-  memoryCost: 19456, // ~19MB
+  memoryCost: 19456,
   timeCost: 2,
   parallelism: 1,
 };
@@ -239,9 +330,8 @@ export default async function auth_apoderado(
   app: FastifyInstance,
   _opts: FastifyPluginOptions
 ) {
-  /* ──────────────────────────────────────────────────────────────
-     POST /api/auth-apoderado/login ✅ PUBLICO
-  ────────────────────────────────────────────────────────────── */
+  startRlGcOnce();
+
   app.post("/login", async (req, reply) => {
     const parsed = LoginSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -259,7 +349,6 @@ export default async function auth_apoderado(
     const db = getDb();
     const ip = getIp(req);
 
-    // Rate limit
     const rlCheck = checkRateLimit(ip, rut);
     if (!rlCheck.ok) {
       fireAndForgetAudit({
@@ -278,10 +367,8 @@ export default async function auth_apoderado(
       return reply.code(429).send({ ok: false, message: "TOO_MANY_ATTEMPTS" });
     }
 
-    // ⏱️ PERF: medimos select/verify/update/audit
     const t0 = Date.now();
 
-    // 1) DB: fetch por RUT (con índice UNIQUE => debería ser rápido)
     const [rows] = await db.query<any[]>(
       `SELECT apoderado_id, rut_apoderado, password_hash, must_change_password
          FROM apoderados_auth
@@ -291,29 +378,32 @@ export default async function auth_apoderado(
     );
 
     const t1 = Date.now();
-
     const auth = rows?.length ? rows[0] : null;
     const apoderadoId = auth ? Number(auth.apoderado_id) || null : null;
 
-    // 2) Argon2: verify constante (si no existe, dummy)
     const hashToVerify = auth?.password_hash ?? (await DUMMY_HASH_PROMISE);
 
     const t2a = Date.now();
-    let ok = false;
-    try {
-      ok = await argon2.verify(hashToVerify, password);
-    } catch {
-      ok = false;
-    }
+    const ok = await withAuthSlot(async () => {
+      try {
+        return await argon2.verify(hashToVerify, password);
+      } catch {
+        return false;
+      }
+    });
     const t2b = Date.now();
 
     if (PERF_LOG) {
       console.log("[AUTH_APODERADO PERF]", {
         rut,
+        ip,
         ms_select: t1 - t0,
         ms_argon2_verify: t2b - t2a,
         ms_total_so_far: t2b - t0,
         has_user: Boolean(auth),
+        argon2_inflight: authSem.inFlight,
+        rl_keys: rl.size,
+        trust_proxy: TRUST_PROXY,
       });
     }
 
@@ -338,14 +428,12 @@ export default async function auth_apoderado(
       return reply.code(401).send({ ok: false, message: "INVALID_CREDENTIALS" });
     }
 
-    // 3) JWT: incluye apoderado_id => endpoints protegidos más rápidos
     const token = signApoderadoToken({
       type: "apoderado",
       rut,
       apoderado_id: Number(auth.apoderado_id),
     });
 
-    // 4) update last_login
     const t3a = Date.now();
     try {
       await db.query(
@@ -358,7 +446,6 @@ export default async function auth_apoderado(
     } catch {}
     const t3b = Date.now();
 
-    // 5) audit success
     fireAndForgetAudit({
       req,
       event: "login",
@@ -392,9 +479,6 @@ export default async function auth_apoderado(
     });
   });
 
-  /* ──────────────────────────────────────────────────────────────
-     POST /api/auth-apoderado/logout 🔒 PROTEGIDO
-  ────────────────────────────────────────────────────────────── */
   app.post("/logout", async (req, reply) => {
     const tokenData = getTokenOr401(req, reply);
     if (!tokenData) {
@@ -419,9 +503,6 @@ export default async function auth_apoderado(
     return reply.send({ ok: true });
   });
 
-  /* ──────────────────────────────────────────────────────────────
-     GET /api/auth-apoderado/me 🔒 PROTEGIDO
-  ────────────────────────────────────────────────────────────── */
   app.get("/me", async (req, reply) => {
     const tokenData = getTokenOr401(req, reply);
     if (!tokenData) {
@@ -459,9 +540,6 @@ export default async function auth_apoderado(
     return reply.send({ ok: true, apoderado: rows[0] });
   });
 
-  /* ──────────────────────────────────────────────────────────────
-     POST /api/auth-apoderado/change-password 🔒 PROTEGIDO
-  ────────────────────────────────────────────────────────────── */
   app.post("/change-password", async (req, reply) => {
     const tokenData = getTokenOr401(req, reply);
     if (!tokenData) {
@@ -508,7 +586,14 @@ export default async function auth_apoderado(
       return reply.code(401).send({ ok: false, message: "UNAUTHORIZED" });
     }
 
-    const ok = await argon2.verify(rows[0].password_hash, parsed.data.current_password);
+    const ok = await withAuthSlot(async () => {
+      try {
+        return await argon2.verify(rows[0].password_hash, parsed.data.current_password);
+      } catch {
+        return false;
+      }
+    });
+
     if (!ok) {
       fireAndForgetAudit({
         req,
@@ -520,8 +605,9 @@ export default async function auth_apoderado(
       return reply.code(401).send({ ok: false, message: "INVALID_CURRENT_PASSWORD" });
     }
 
-    // ✅ Hash con parámetros razonables para producción
-    const newHash = await argon2.hash(parsed.data.new_password, ARGON2_HASH_OPTS);
+    const newHash = await withAuthSlot(() =>
+      argon2.hash(parsed.data.new_password, ARGON2_HASH_OPTS)
+    );
 
     await db.query(
       `UPDATE apoderados_auth

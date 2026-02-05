@@ -4,8 +4,9 @@ import jwt from "jsonwebtoken";
 import { CONFIG } from "../config";
 
 type AnyObj = Record<string, any>;
+
 type AuthContext =
-  | { type: "user"; user_id?: number; rol_id?: number }
+  | { type: "user"; user_id?: number; rol_id?: number; academia_id?: number }
   | { type: "apoderado"; rut: string; apoderado_id?: number };
 
 function getJwtSecret() {
@@ -37,6 +38,20 @@ function extractRole(user: AnyObj): number | undefined {
   return toInt(raw);
 }
 
+function extractAcademiaId(user: AnyObj): number | undefined {
+  const raw =
+    user?.academia_id ??
+    user?.academy_id ??
+    user?.academiaId ??
+    user?.academyId ??
+    user?.academia ??
+    user?.academy ??
+    undefined;
+
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
 export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
   const auth = String(req.headers.authorization || "");
   const [bearer, token] = auth.split(" ");
@@ -66,11 +81,12 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
       return;
     }
 
-    // --- Caso ADMIN/STAFF (token con rol_id, user_id, etc) ---
+    // --- Caso ADMIN/STAFF (token con rol_id, user_id, academia_id, etc) ---
     const rol_id = extractRole(user);
     const user_id = toInt(user?.user_id ?? user?.id ?? user?.uid);
+    const academia_id = extractAcademiaId(user);
 
-    (req as any).auth = { type: "user", user_id, rol_id } satisfies AuthContext;
+    (req as any).auth = { type: "user", user_id, rol_id, academia_id } satisfies AuthContext;
 
     // compat legacy
     (req as any).user = user;

@@ -36,8 +36,19 @@ async function bootstrap() {
     origin: CONFIG.NODE_ENV === "production" ? CONFIG.CORS_ORIGIN : true,
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "Accept",
+      "Cache-Control",
+      "Pragma",
+      "Expires",
+      "x-academia-id",
+    ],
+    exposedHeaders: ["Content-Length", "Content-Type", "Cache-Control"],
+    maxAge: 86400,
   });
+
 
   await app.register(helmet, {
     contentSecurityPolicy: {
