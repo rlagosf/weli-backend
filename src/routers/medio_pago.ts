@@ -15,13 +15,22 @@ const IdParam = z.object({
 
 const CreateSchema = z
   .object({
-    nombre: z.string().trim().min(2, "Debe tener al menos 2 caracteres").max(100, "Máximo 100 caracteres"),
+    nombre: z
+      .string()
+      .trim()
+      .min(2, "Debe tener al menos 2 caracteres")
+      .max(100, "Máximo 100 caracteres"),
   })
   .strict();
 
 const UpdateSchema = z
   .object({
-    nombre: z.string().trim().min(2, "Debe tener al menos 2 caracteres").max(100, "Máximo 100 caracteres").optional(),
+    nombre: z
+      .string()
+      .trim()
+      .min(2, "Debe tener al menos 2 caracteres")
+      .max(100, "Máximo 100 caracteres")
+      .optional(),
   })
   .strict();
 
@@ -33,18 +42,18 @@ function normalize(row: any) {
 }
 
 export default async function medio_pago(app: FastifyInstance) {
-  // ✅ Regla de oro (catálogos)
-  const canRead = [requireAuth, requireRoles([1, 2])]; // admin + staff
-  const canWrite = [requireAuth, requireRoles([1])];  // solo admin
+  // ✅ Catálogo: todos leen, solo 1 y 3 escriben
+  const canRead = [requireAuth, requireRoles([1, 2, 3])];
+  const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  // ───────────────────── Health (READ: 1/2) ─────────────────────
+  // ───────────────────── Health (READ: 1/2/3) ─────────────────────
   app.get("/health", { preHandler: canRead }, async () => ({
     module: "medio_pago",
     status: "ready",
     timestamp: new Date().toISOString(),
   }));
 
-  // ───────────────────── GET todos (READ: 1/2) ─────────────────────
+  // ───────────────────── GET todos (READ: 1/2/3) ─────────────────────
   app.get("/", { preHandler: canRead }, async (_req: FastifyRequest, reply: FastifyReply) => {
     try {
       const [rows]: any = await db.query("SELECT id, nombre FROM medio_pago ORDER BY id ASC");
@@ -63,20 +72,19 @@ export default async function medio_pago(app: FastifyInstance) {
     }
   });
 
-  // ───────────────────── GET por ID (READ: 1/2) ─────────────────────
+  // ───────────────────── GET por ID (READ: 1/2/3) ─────────────────────
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) {
-      return reply.code(400).send({ ok: false, message: parsed.error.issues[0]?.message ?? "ID inválido" });
+      return reply
+        .code(400)
+        .send({ ok: false, message: parsed.error.issues[0]?.message ?? "ID inválido" });
     }
 
     const id = Number(parsed.data.id);
 
     try {
-      const [rows]: any = await db.query(
-        "SELECT id, nombre FROM medio_pago WHERE id = ? LIMIT 1",
-        [id]
-      );
+      const [rows]: any = await db.query("SELECT id, nombre FROM medio_pago WHERE id = ? LIMIT 1", [id]);
 
       if (!rows?.length) {
         return reply.code(404).send({
@@ -98,7 +106,7 @@ export default async function medio_pago(app: FastifyInstance) {
     }
   });
 
-  // ───────────────────── POST (WRITE: solo 1) ─────────────────────
+  // ───────────────────── POST (WRITE: 1/3) ─────────────────────
   app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const parsed = CreateSchema.parse(req.body);
@@ -132,7 +140,7 @@ export default async function medio_pago(app: FastifyInstance) {
     }
   });
 
-  // ───────────────────── PUT (WRITE: solo 1) ─────────────────────
+  // ───────────────────── PUT (WRITE: 1/3) ─────────────────────
   app.put("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const pid = IdParam.safeParse(req.params);
     if (!pid.success) {
@@ -142,8 +150,7 @@ export default async function medio_pago(app: FastifyInstance) {
     const id = Number(pid.data.id);
 
     try {
-      const parsed = UpdateSchema.parse(req.body);
-      const changes = parsed;
+      const changes = UpdateSchema.parse(req.body);
 
       if (Object.keys(changes).length === 0) {
         return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
@@ -163,10 +170,7 @@ export default async function medio_pago(app: FastifyInstance) {
 
       values.push(id);
 
-      const [result]: any = await db.query(
-        `UPDATE medio_pago SET ${setClauses.join(", ")} WHERE id = ?`,
-        values
-      );
+      const [result]: any = await db.query(`UPDATE medio_pago SET ${setClauses.join(", ")} WHERE id = ?`, values);
 
       if (result.affectedRows === 0) {
         return reply.code(404).send({ ok: false, message: "No encontrado" });
@@ -174,7 +178,11 @@ export default async function medio_pago(app: FastifyInstance) {
 
       return reply.send({
         ok: true,
-        updated: { id, ...changes, nombre: changes.nombre?.trim?.() ?? changes.nombre },
+        updated: {
+          id,
+          ...changes,
+          nombre: changes.nombre !== undefined ? changes.nombre.trim() : undefined,
+        },
       });
     } catch (err: any) {
       if (err instanceof ZodError) {
@@ -197,7 +205,7 @@ export default async function medio_pago(app: FastifyInstance) {
     }
   });
 
-  // ───────────────────── DELETE (WRITE: solo 1) ─────────────────────
+  // ───────────────────── DELETE (WRITE: 1/3) ─────────────────────
   app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) {

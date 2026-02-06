@@ -1,5 +1,5 @@
 // src/routers/comunas.ts
-import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
 import { db } from "../db";
 import { requireAuth, requireRoles } from "../middlewares/authz";
@@ -7,18 +7,18 @@ import { requireAuth, requireRoles } from "../middlewares/authz";
 /* ───────── Schemas ───────── */
 
 const IdParam = z.object({
-  id: z.string().regex(/^\d+$/, "ID inválido"),
+  id: z.coerce.number().int().positive(),
 });
 
 const CreateSchema = z
   .object({
-    nombre: z.string().trim().min(1, "El nombre es obligatorio"),
+    nombre: z.string().trim().min(1, "El nombre es obligatorio").max(100),
   })
   .strict();
 
 const UpdateSchema = z
   .object({
-    nombre: z.string().trim().min(1).optional(),
+    nombre: z.string().trim().min(1).max(100).optional(),
   })
   .strict();
 
@@ -32,26 +32,45 @@ function normalizeOut(row: any) {
   };
 }
 
+async function existsByNombre(nombre: string, excludeId?: number) {
+  const n = nombre.trim();
+  if (!n) return false;
+
+  if (excludeId) {
+    const [rows]: any = await db.query(
+      "SELECT id FROM comunas WHERE LOWER(nombre) = LOWER(?) AND id <> ? LIMIT 1",
+      [n, excludeId]
+    );
+    return Array.isArray(rows) && rows.length > 0;
+  }
+
+  const [rows]: any = await db.query(
+    "SELECT id FROM comunas WHERE LOWER(nombre) = LOWER(?) LIMIT 1",
+    [n]
+  );
+  return Array.isArray(rows) && rows.length > 0;
+}
+
 /* ───────── Router ───────── */
 
 export default async function comunas(app: FastifyInstance) {
-  // ✅ Regla de oro: catálogos
-  const canRead = [requireAuth, requireRoles([1, 2])]; // admin + staff
-  const canWrite = [requireAuth, requireRoles([1])];  // solo admin
+  // ✅ Catálogo global
+  // - Read: roles 1/2/3
+  // - Write: roles 1/3 (admin + superadmin)
+  const canRead = [requireAuth, requireRoles([1, 2, 3])];
+  const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  // Health (read: roles 1/2)
+  // Health
   app.get("/health", { preHandler: canRead }, async () => ({
     module: "comunas",
     status: "ready",
     timestamp: new Date().toISOString(),
   }));
 
-  // ───────── GET /comunas ───────── (read: roles 1/2)
+  // GET /comunas
   app.get("/", { preHandler: canRead }, async (_req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const [rows]: any = await db.query(
-        "SELECT id, nombre FROM comunas ORDER BY nombre ASC"
-      );
+      const [rows]: any = await db.query("SELECT id, nombre FROM comunas ORDER BY nombre ASC");
 
       return reply.send({
         ok: true,
@@ -67,23 +86,19 @@ export default async function comunas(app: FastifyInstance) {
     }
   });
 
-  // ───────── GET /comunas/:id ───────── (read: roles 1/2)
+  // GET /comunas/:id
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const pid = IdParam.safeParse(req.params);
     if (!pid.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: pid.error.issues[0]?.message,
-      });
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
     }
 
-    const id = Number(pid.data.id);
+    const { id } = pid.data;
 
     try {
-      const [rows]: any = await db.query(
-        "SELECT id, nombre FROM comunas WHERE id = ? LIMIT 1",
-        [id]
-      );
+      const [rows]: any = await db.query("SELECT id, nombre FROM comunas WHERE id = ? LIMIT 1", [
+        id,
+      ]);
 
       if (!rows || rows.length === 0) {
         return reply.code(404).send({ ok: false, message: "No encontrado" });
@@ -99,18 +114,14 @@ export default async function comunas(app: FastifyInstance) {
     }
   });
 
-  // ───────── POST /comunas ───────── (write: solo rol 1)
+  // POST /comunas
   app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const parsed = CreateSchema.parse(req.body);
+      const nombre = parsed.nombre.trim();
 
-      // Evita duplicados por nombre
-      const [exists]: any = await db.query(
-        "SELECT id FROM comunas WHERE LOWER(nombre) = LOWER(?) LIMIT 1",
-        [parsed.nombre]
-      );
-
-      if (Array.isArray(exists) && exists.length > 0) {
+      const dup = await existsByNombre(nombre);
+      if (dup) {
         return reply.code(409).send({
           ok: false,
           field: "nombre",
@@ -118,12 +129,7 @@ export default async function comunas(app: FastifyInstance) {
         });
       }
 
-      const nombre = parsed.nombre.trim();
-
-      const [result]: any = await db.query(
-        "INSERT INTO comunas (nombre) VALUES (?)",
-        [nombre]
-      );
+      const [result]: any = await db.query("INSERT INTO comunas (nombre) VALUES (?)", [nombre]);
 
       return reply.code(201).send({
         ok: true,
@@ -140,10 +146,7 @@ export default async function comunas(app: FastifyInstance) {
       }
 
       if (err?.errno === 1062) {
-        return reply.code(409).send({
-          ok: false,
-          message: "Duplicado: la comuna ya existe",
-        });
+        return reply.code(409).send({ ok: false, message: "Duplicado: la comuna ya existe" });
       }
 
       return reply.code(500).send({
@@ -154,40 +157,42 @@ export default async function comunas(app: FastifyInstance) {
     }
   });
 
-  // ───────── PATCH /comunas/:id ───────── (write: solo rol 1)
+  // PATCH /comunas/:id
   app.patch("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const pid = IdParam.safeParse(req.params);
     if (!pid.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: pid.error.issues[0]?.message,
-      });
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
     }
+
+    const { id } = pid.data;
 
     try {
       const parsed = UpdateSchema.parse(req.body);
       if (!parsed.nombre) {
-        return reply.code(400).send({
-          ok: false,
-          message: "No hay campos para actualizar",
-        });
+        return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
       }
 
       const nombre = parsed.nombre.trim();
 
-      const [result]: any = await db.query(
-        "UPDATE comunas SET nombre = ? WHERE id = ?",
-        [nombre, Number(pid.data.id)]
-      );
+      const dup = await existsByNombre(nombre, id);
+      if (dup) {
+        return reply.code(409).send({
+          ok: false,
+          field: "nombre",
+          message: "Duplicado: la comuna ya existe",
+        });
+      }
 
-      if (result.affectedRows === 0) {
+      const [result]: any = await db.query("UPDATE comunas SET nombre = ? WHERE id = ?", [
+        nombre,
+        id,
+      ]);
+
+      if (Number(result?.affectedRows ?? 0) === 0) {
         return reply.code(404).send({ ok: false, message: "No encontrado" });
       }
 
-      return reply.send({
-        ok: true,
-        updated: { id: Number(pid.data.id), nombre },
-      });
+      return reply.send({ ok: true, updated: { id, nombre } });
     } catch (err: any) {
       if (err instanceof ZodError) {
         return reply.code(400).send({
@@ -195,6 +200,10 @@ export default async function comunas(app: FastifyInstance) {
           message: "Payload inválido",
           detail: err.issues.map((i) => i.message).join("; "),
         });
+      }
+
+      if (err?.errno === 1062) {
+        return reply.code(409).send({ ok: false, message: "Duplicado: la comuna ya existe" });
       }
 
       return reply.code(500).send({
@@ -205,27 +214,23 @@ export default async function comunas(app: FastifyInstance) {
     }
   });
 
-  // ───────── DELETE /comunas/:id ───────── (write: solo rol 1)
+  // DELETE /comunas/:id
   app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const pid = IdParam.safeParse(req.params);
     if (!pid.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: pid.error.issues[0]?.message,
-      });
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
     }
 
-    try {
-      const [result]: any = await db.query(
-        "DELETE FROM comunas WHERE id = ?",
-        [Number(pid.data.id)]
-      );
+    const { id } = pid.data;
 
-      if (result.affectedRows === 0) {
+    try {
+      const [result]: any = await db.query("DELETE FROM comunas WHERE id = ?", [id]);
+
+      if (Number(result?.affectedRows ?? 0) === 0) {
         return reply.code(404).send({ ok: false, message: "No encontrado" });
       }
 
-      return reply.send({ ok: true, deleted: Number(pid.data.id) });
+      return reply.send({ ok: true, deleted: id });
     } catch (err: any) {
       if (err?.errno === 1451) {
         return reply.code(409).send({

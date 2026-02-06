@@ -1,18 +1,9 @@
 import type { FastifyInstance, FastifyPluginOptions } from "fastify";
 import { z } from "zod";
 import { getDb } from "../db";
-
-// ✅ Ajusta la ruta si tu middleware está en otro path real:
 import { requireAuth, requireRoles } from "../middlewares/authz";
 
-/**
- * ✅ Reglas:
- * - Landing público: GET /?mode=landing
- * - Panel protegido: GET / (default mode=panel) requiere rol 1 y 2
- * - POST/PATCH/DELETE protegido: rol 1 y 2
- * - Estado se maneja por estado_noticia_id (catálogo)
- * - Archivada por defecto = id 3 (fallback), pero se puede resolver por nombre
- */
+const ACADEMIA_HEADER = "x-academia-id";
 
 // ✅ Bool robusto (evita Boolean("false") === true)
 const BoolLike = z.preprocess((v) => {
@@ -99,6 +90,33 @@ async function getEstadoIdByName(db: any, name: string) {
   return row?.id ? Number(row.id) : null;
 }
 
+/** ✅ Resuelve tenant efectivo según rol */
+function resolveAcademiaIdOrFail(req: any, reply: any): number | null {
+  const auth = req.auth as { type: "user"; rol_id?: number; academia_id?: number; user_id?: number } | undefined;
+  const role = Number(auth?.rol_id ?? 0);
+
+  // Rol 1/2: academia_id del token OBLIGATORIO
+  if (role === 1 || role === 2) {
+    const id = Number(auth?.academia_id ?? 0);
+    if (!Number.isFinite(id) || id <= 0) {
+      reply.code(400).send({ ok: false, message: "ACADEMIA_ID_REQUIRED" });
+      return null;
+    }
+    return id;
+  }
+
+  // Rol 3: header x-academia-id (solo obligatorio para mutaciones / si se quiere filtrar)
+  if (role === 3) {
+    const raw = req.headers?.[ACADEMIA_HEADER] ?? req.headers?.[ACADEMIA_HEADER.toLowerCase()];
+    const id = Number(raw ?? 0);
+    if (Number.isFinite(id) && id > 0) return id;
+    return 0; // 0 = sin filtro (ver todas)
+  }
+
+  reply.code(403).send({ ok: false, message: "FORBIDDEN" });
+  return null;
+}
+
 const BaseSchema = z.object({
   slug: z.string().min(1).max(160),
   titulo: z.string().min(1).max(180),
@@ -123,23 +141,25 @@ const CreateSchema = BaseSchema.extend({
 
 const UpdateSchema = BaseSchema.partial().extend({
   published_at: DateTimeLike.nullable().optional(),
-
-  // ✅ permitir actualizar/borrar imagen
   imagen_mime: z.string().max(40).nullable().optional(),
   imagen_base64: z.string().nullable().optional(),
   imagen_bytes: z.coerce.number().int().nonnegative().nullable().optional(),
 });
 
 export default async function admin_noticias(app: FastifyInstance, _opts: FastifyPluginOptions) {
-  // ✅ Guard reutilizable: rol 1 y 2
-  const onlyRoles12 = [requireAuth, requireRoles([1, 2])];
+  // ✅ Panel protegido: roles 1,2,3
+  const onlyPanel = [requireAuth, requireRoles([1, 2, 3])];
 
   /**
    * ✅ GET /api/admin-noticias
-   * - mode=landing: público
-   * - mode=panel (default): protegido (rol 1 y 2)
+   * - mode=landing: público (publicadas)
+   * - mode=panel (default): protegido (rol 1,2,3)
+   *
+   * Panel:
+   * - rol 1/2 => filtra por academia_id del token (obligatorio)
+   * - rol 3 => si manda x-academia-id filtra; si no, ve todas
    */
-  app.get("/", async (req, reply) => {
+  app.get("/", async (req: any, reply) => {
     const parsed = ListQuerySchema.safeParse(req.query);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "BAD_REQUEST" });
 
@@ -147,10 +167,9 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
 
     // 🔐 Panel: proteger (landing queda público)
     if (mode !== "landing") {
-      for (const guard of onlyRoles12) {
-        const r = await guard(req as any, reply as any);
-        if ((reply as any).sent) return;
-        if (r === false) return;
+      for (const guard of onlyPanel) {
+        await guard(req, reply);
+        if (reply.sent) return;
       }
     }
 
@@ -166,7 +185,7 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
       if (!ok) return reply.code(400).send({ ok: false, message: "ESTADO_NOTICIA_INVALID" });
     }
 
-    // ===== LANDING MODE =====
+    // ===== LANDING MODE ===== (público, global)
     if (mode === "landing") {
       const publicadaId =
         (await getEstadoIdByName(db, "Publicada")) ??
@@ -218,9 +237,20 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
       });
     }
 
-    // ===== PANEL MODE (DEFAULT) =====
+    // ===== PANEL MODE =====
+    const academiaId = resolveAcademiaIdOrFail(req, reply);
+    if (academiaId == null) return;
+
     const where: string[] = [];
     const params: any[] = [];
+
+    // tenant filter:
+    // - rol 1/2 => academiaId > 0 (obligatorio)
+    // - rol 3 => academiaId puede ser 0 (sin filtro, ve todo)
+    if (academiaId > 0) {
+      where.push("n.academia_id = ?");
+      params.push(academiaId);
+    }
 
     if (!include_archived && estado_noticia_id === undefined) {
       where.push("n.estado_noticia_id <> ?");
@@ -250,7 +280,8 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
         n.published_at,
         n.is_popup, n.popup_start_at, n.popup_end_at,
         n.pinned, n.pinned_order,
-        n.created_at, n.updated_at
+        n.created_at, n.updated_at,
+        n.academia_id
       FROM noticias n
       JOIN estado_noticias en ON en.id = n.estado_noticia_id
       ${whereSql}
@@ -276,18 +307,31 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
       limit,
       offset,
       archivada_id: archivadaId,
+      academia_id: academiaId > 0 ? academiaId : null,
     });
   });
 
   /**
    * ✅ GET /api/admin-noticias/:id
-   * 🔐 Protegido: incluye base64 + contenido
+   * 🔐 Protegido: roles 1,2,3 (tenant-aware)
    */
-  app.get("/:id", { preHandler: onlyRoles12 }, async (req, reply) => {
+  app.get("/:id", { preHandler: onlyPanel }, async (req: any, reply) => {
     const parsed = IdSchema.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "BAD_REQUEST" });
 
+    const academiaId = resolveAcademiaIdOrFail(req, reply);
+    if (academiaId == null) return;
+
     const db = getDb();
+
+    const where = ["n.id = ?"];
+    const params: any[] = [parsed.data.id];
+
+    if (academiaId > 0) {
+      where.push("n.academia_id = ?");
+      params.push(academiaId);
+    }
+
     const [rows] = (await db.query(
       `
       SELECT
@@ -295,10 +339,10 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
         en.nombre AS estado_nombre
       FROM noticias n
       JOIN estado_noticias en ON en.id = n.estado_noticia_id
-      WHERE n.id = ?
+      WHERE ${where.join(" AND ")}
       LIMIT 1
       `,
-      [parsed.data.id]
+      params
     )) as any;
 
     if (!rows?.length) return reply.code(404).send({ ok: false, message: "NOT_FOUND" });
@@ -306,14 +350,24 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
   });
 
   /**
-   * ✅ POST /api/admin-noticias (rol 1 y 2)
+   * ✅ POST /api/admin-noticias
+   * 🔐 roles 1,2,3 (tenant-aware)
    */
-  app.post("/", { preHandler: onlyRoles12 }, async (req, reply) => {
+  app.post("/", { preHandler: onlyPanel }, async (req: any, reply) => {
     const parsed = CreateSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "BAD_REQUEST" });
 
     const d = parsed.data;
     const db = getDb();
+
+    const academiaId = resolveAcademiaIdOrFail(req, reply);
+    if (academiaId == null) return;
+
+    // Para crear, rol 3 debe seleccionar academia sí o sí
+    const role = Number(req.auth?.rol_id ?? 0);
+    if (role === 3 && academiaId <= 0) {
+      return reply.code(400).send({ ok: false, message: "X_ACADEMIA_ID_REQUIRED" });
+    }
 
     const okEstado = await ensureEstadoExists(db, d.estado_noticia_id);
     if (!okEstado) return reply.code(400).send({ ok: false, message: "ESTADO_NOTICIA_INVALID" });
@@ -342,14 +396,16 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
       const [res] = (await db.query(
         `
         INSERT INTO noticias
-          (slug, titulo, resumen, contenido,
+          (academia_id,
+           slug, titulo, resumen, contenido,
            imagen_mime, imagen_base64, imagen_bytes,
            estado_noticia_id, published_at,
            is_popup, popup_start_at, popup_end_at,
            pinned, pinned_order,
            created_by_admin_id)
         VALUES
-          (?, ?, ?, ?,
+          (?, 
+           ?, ?, ?, ?,
            ?, ?, ?,
            ?, ${publishedAtSql},
            ?, ?, ?,
@@ -357,6 +413,8 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
            ?)
         `,
         [
+          academiaId,
+
           d.slug.trim(),
           d.titulo.trim(),
           d.resumen ?? null,
@@ -375,8 +433,7 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
           pin.pinned,
           pin.pinned_order,
 
-          // ✅ Ideal: tomarlo del token (depende de tu authz)
-          (req as any).user?.id ?? null,
+          req.auth?.user_id ?? null,
         ]
       )) as any;
 
@@ -390,9 +447,10 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
   });
 
   /**
-   * ✅ PATCH /api/admin-noticias/:id (rol 1 y 2)
+   * ✅ PATCH /api/admin-noticias/:id
+   * 🔐 roles 1,2,3 (tenant-aware)
    */
-  app.patch("/:id", { preHandler: onlyRoles12 }, async (req, reply) => {
+  app.patch("/:id", { preHandler: onlyPanel }, async (req: any, reply) => {
     const idParsed = IdSchema.safeParse(req.params);
     if (!idParsed.success) return reply.code(400).send({ ok: false, message: "BAD_REQUEST" });
 
@@ -403,18 +461,36 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
     const d = bodyParsed.data;
     const db = getDb();
 
+    const academiaId = resolveAcademiaIdOrFail(req, reply);
+    if (academiaId == null) return;
+
+    // Para mutaciones, rol 3 debe seleccionar academia sí o sí
+    const role = Number(req.auth?.rol_id ?? 0);
+    if (role === 3 && academiaId <= 0) {
+      return reply.code(400).send({ ok: false, message: "X_ACADEMIA_ID_REQUIRED" });
+    }
+
+    // Cargar actual, pero restringido por tenant si corresponde
+    const where0 = ["id = ?"];
+    const params0: any[] = [id];
+    if (academiaId > 0) {
+      where0.push("academia_id = ?");
+      params0.push(academiaId);
+    }
+
     const [[current]] = (await db.query(
       `
       SELECT
         is_popup, popup_start_at, popup_end_at,
         pinned, pinned_order,
         imagen_mime, imagen_base64, imagen_bytes,
-        published_at
+        published_at,
+        academia_id
       FROM noticias
-      WHERE id = ?
+      WHERE ${where0.join(" AND ")}
       LIMIT 1
       `,
-      [id]
+      params0
     )) as any;
 
     if (!current) return reply.code(404).send({ ok: false, message: "NOT_FOUND" });
@@ -504,15 +580,23 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
 
     params.push(id);
 
+    // Tenant enforcement en UPDATE (no update cross-tenant)
+    const whereUpd = ["id = ?"];
+    const paramsWhere: any[] = [id];
+    if (academiaId > 0) {
+      whereUpd.push("academia_id = ?");
+      paramsWhere.push(academiaId);
+    }
+
     try {
       const [res] = (await db.query(
         `
         UPDATE noticias
         SET ${sets.join(", ")}
-        WHERE id = ?
+        WHERE ${whereUpd.join(" AND ")}
         LIMIT 1
         `,
-        params
+        [...params, ...paramsWhere.slice(1)] // ojo: id ya va en params; acá agregamos el resto
       )) as any;
 
       const affected = Number(res?.affectedRows ?? 0);
@@ -528,19 +612,35 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
   });
 
   /**
-   * ✅ DELETE /api/admin-noticias/:id (rol 1 y 2)
+   * ✅ DELETE /api/admin-noticias/:id
+   * 🔐 roles 1,2,3 (tenant-aware)
    * - Soft archive
    */
-  app.delete("/:id", { preHandler: onlyRoles12 }, async (req, reply) => {
+  app.delete("/:id", { preHandler: onlyPanel }, async (req: any, reply) => {
     const parsed = IdSchema.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "BAD_REQUEST" });
 
     const db = getDb();
 
+    const academiaId = resolveAcademiaIdOrFail(req, reply);
+    if (academiaId == null) return;
+
+    const role = Number(req.auth?.rol_id ?? 0);
+    if (role === 3 && academiaId <= 0) {
+      return reply.code(400).send({ ok: false, message: "X_ACADEMIA_ID_REQUIRED" });
+    }
+
     const archivadaId =
       (await getEstadoIdByName(db, "Archivada")) ??
       (await getEstadoIdByName(db, "Archivado")) ??
       3;
+
+    const whereDel = ["id = ?"];
+    const paramsDel: any[] = [parsed.data.id];
+    if (academiaId > 0) {
+      whereDel.push("academia_id = ?");
+      paramsDel.push(academiaId);
+    }
 
     const [res] = (await db.query(
       `
@@ -550,10 +650,10 @@ export default async function admin_noticias(app: FastifyInstance, _opts: Fastif
           is_popup = 0,
           pinned = 0,
           pinned_order = NULL
-      WHERE id = ?
+      WHERE ${whereDel.join(" AND ")}
       LIMIT 1
       `,
-      [archivadaId, parsed.data.id]
+      [archivadaId, ...paramsDel]
     )) as any;
 
     const affected = Number(res?.affectedRows ?? 0);

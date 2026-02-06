@@ -18,34 +18,37 @@ type ReqUser = {
 };
 
 const IdParam = z.object({
-  id: z.string().regex(/^\d+$/),
+  id: z.coerce.number().int().positive(),
 });
 
 const CreateSchema = z.object({
-  titulo: z.string().min(1).max(200),
-  descripcion: z.string().max(2000).optional().nullable(),
+  titulo: z.string().trim().min(1).max(200),
+  descripcion: z.string().trim().max(2000).optional().nullable(),
   fecha_inicio: z.string().min(10),
   fecha_fin: z.string().min(10),
 });
 
 const UpdateSchema = z.object({
-  titulo: z.string().min(1).max(200).optional(),
-  descripcion: z.string().max(2000).optional().nullable(),
+  titulo: z.string().trim().min(1).max(200).optional(),
+  descripcion: z.string().trim().max(2000).optional().nullable(),
   fecha_inicio: z.string().min(10).optional(),
   fecha_fin: z.string().min(10).optional(),
 });
 
 const PageQuery = z.object({
-  limit: z.coerce.number().int().positive().max(200).optional().default(50),
-  offset: z.coerce.number().int().nonnegative().optional().default(0),
+  limit: z.coerce.number().int().positive().max(200).default(50),
+  offset: z.coerce.number().int().nonnegative().default(0),
 });
 
 // Normaliza fecha de ISO o 'YYYY-MM-DD HH:MM:SS' a 'YYYY-MM-DD HH:MM:SS'
 function toSQLDateTime(input: string): string | null {
   if (!input) return null;
-  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(input)) return input;
+  const s = String(input).trim();
+  if (!s) return null;
 
-  const d = new Date(input);
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) return s;
+
+  const d = new Date(s);
   if (Number.isNaN(d.valueOf())) return null;
 
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -56,6 +59,19 @@ function toSQLDateTime(input: string): string | null {
   const MM = pad(d.getMinutes());
   const SS = pad(d.getSeconds());
   return `${yyyy}-${mm}-${dd} ${HH}:${MM}:${SS}`;
+}
+
+// Comparación segura: convertimos a ISO para Date.parse
+function sqlToIso(sql: string): string {
+  // "YYYY-MM-DD HH:MM:SS" -> "YYYY-MM-DDTHH:MM:SSZ"? ojo tz:
+  // Usaremos sin Z para que Date lo tome como local. Alternativa: comparar strings (ya vienen padding).
+  // Para regla "fin > inicio" basta comparar strings SQL bien formateadas.
+  return sql.replace(" ", "T");
+}
+
+function isEndAfterStart(sqlStart: string, sqlEnd: string): boolean {
+  // Como están en formato fijo "YYYY-MM-DD HH:MM:SS", comparación lexicográfica funciona.
+  return sqlEnd > sqlStart;
 }
 
 function sendDbError(reply: FastifyReply, message: string, err: any) {
@@ -104,17 +120,17 @@ function getAcademiaScope(req: FastifyRequest, reply: FastifyReply): number | nu
 }
 
 export default async function eventos(app: FastifyInstance) {
-  // 🔐 Roles permitidos: 1, 2, 3
-  const onlyRoles123 = [requireAuth, requireRoles([1, 2, 3])];
+  // ✅ Permisos normalizados
+  const canRead = [requireAuth, requireRoles([1, 2, 3])];
+  const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  app.get("/health", async () => ({
+  app.get("/health", { preHandler: canRead }, async () => ({
     module: "eventos",
     status: "ready",
     timestamp: new Date().toISOString(),
   }));
 
   // ✅ Público (solo lectura): próximos eventos (GLOBAL)
-  // Si luego quieres: hacerlo filtrable por academia con query param.
   app.get("/public", async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = PageQuery.safeParse(req.query);
     const { limit, offset } = parsed.success ? parsed.data : { limit: 50, offset: 0 };
@@ -128,15 +144,17 @@ export default async function eventos(app: FastifyInstance) {
           LIMIT ? OFFSET ?`,
         [Number(limit), Number(offset)]
       );
-      return reply.send({ ok: true, items: rows, limit, offset });
+
+      reply.header("Cache-Control", "no-store");
+      return reply.send({ ok: true, items: rows ?? [], limit, offset });
     } catch (err: any) {
       req.log.error({ err }, "GET /eventos/public failed");
       return sendDbError(reply, "Error al listar eventos públicos", err);
     }
   });
 
-  // GET /eventos (rol 1/2/3, filtrado por academia)
-  app.get("/", { preHandler: onlyRoles123 }, async (req, reply) => {
+  // GET /eventos (read 1/2/3, filtrado por academia)
+  app.get("/", { preHandler: canRead }, async (req, reply) => {
     const academiaId = getAcademiaScope(req, reply);
     if (!academiaId) return;
 
@@ -153,22 +171,23 @@ export default async function eventos(app: FastifyInstance) {
         [academiaId, Number(limit), Number(offset)]
       );
 
-      return reply.send({ ok: true, items: rows, limit, offset });
+      reply.header("Cache-Control", "no-store");
+      return reply.send({ ok: true, items: rows ?? [], limit, offset });
     } catch (err: any) {
       req.log.error({ err }, "GET /eventos failed");
       return sendDbError(reply, "Error al listar eventos", err);
     }
   });
 
-  // GET /eventos/:id (rol 1/2/3, filtrado por academia)
-  app.get("/:id", { preHandler: onlyRoles123 }, async (req, reply) => {
+  // GET /eventos/:id (read 1/2/3, filtrado por academia)
+  app.get("/:id", { preHandler: canRead }, async (req, reply) => {
     const academiaId = getAcademiaScope(req, reply);
     if (!academiaId) return;
 
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
-    const id = Number(parsed.data.id);
+    const { id } = parsed.data;
 
     try {
       const [rows]: any = await db.query(
@@ -179,7 +198,9 @@ export default async function eventos(app: FastifyInstance) {
         [id, academiaId]
       );
 
-      if (!rows.length) return reply.code(404).send({ ok: false, message: "No encontrado" });
+      reply.header("Cache-Control", "no-store");
+
+      if (!rows?.length) return reply.code(404).send({ ok: false, message: "No encontrado" });
       return reply.send({ ok: true, item: rows[0] });
     } catch (err: any) {
       req.log.error({ err, id }, "GET /eventos/:id failed");
@@ -187,22 +208,27 @@ export default async function eventos(app: FastifyInstance) {
     }
   });
 
-  // POST /eventos (rol 1/2/3, inserta academia_id)
-  app.post("/", { preHandler: onlyRoles123 }, async (req, reply) => {
+  // POST /eventos (write 1/3, inserta academia_id)
+  app.post("/", { preHandler: canWrite }, async (req, reply) => {
     const academiaId = getAcademiaScope(req, reply);
     if (!academiaId) return;
 
     const parsed = CreateSchema.safeParse(req.body);
     if (!parsed.success) {
-      return reply.code(400).send({ ok: false, message: "Payload inválido", errors: parsed.error.flatten() });
+      return reply.code(400).send({
+        ok: false,
+        message: "Payload inválido",
+        errors: parsed.error.flatten(),
+      });
     }
 
     const { titulo, descripcion, fecha_inicio, fecha_fin } = parsed.data;
+
     const ini = toSQLDateTime(fecha_inicio);
     const fin = toSQLDateTime(fecha_fin);
 
     if (!ini || !fin) return reply.code(400).send({ ok: false, message: "Formato de fecha inválido" });
-    if (new Date(ini) >= new Date(fin)) {
+    if (!isEndAfterStart(ini, fin)) {
       return reply.code(400).send({ ok: false, message: "fecha_fin debe ser mayor que fecha_inicio" });
     }
 
@@ -223,25 +249,30 @@ export default async function eventos(app: FastifyInstance) {
         [id, academiaId]
       );
 
-      return reply.code(201).send({ ok: true, item: rows[0] });
+      reply.header("Cache-Control", "no-store");
+      return reply.code(201).send({ ok: true, item: rows?.[0] ?? null });
     } catch (err: any) {
       req.log.error({ err }, "POST /eventos failed");
       return sendDbError(reply, "Error al crear evento", err);
     }
   });
 
-  // PUT /eventos/:id (rol 1/2/3, update por academia)
-  app.put("/:id", { preHandler: onlyRoles123 }, async (req, reply) => {
+  // PUT /eventos/:id (write 1/3, update por academia)
+  app.put("/:id", { preHandler: canWrite }, async (req, reply) => {
     const academiaId = getAcademiaScope(req, reply);
     if (!academiaId) return;
 
     const pid = IdParam.safeParse(req.params);
     if (!pid.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
-    const id = Number(pid.data.id);
+    const { id } = pid.data;
 
     const parsed = UpdateSchema.safeParse(req.body);
     if (!parsed.success) {
-      return reply.code(400).send({ ok: false, message: "Payload inválido", errors: parsed.error.flatten() });
+      return reply.code(400).send({
+        ok: false,
+        message: "Payload inválido",
+        errors: parsed.error.flatten(),
+      });
     }
 
     const fields: string[] = [];
@@ -249,11 +280,11 @@ export default async function eventos(app: FastifyInstance) {
 
     if (parsed.data.titulo !== undefined) {
       fields.push("titulo = ?");
-      values.push(parsed.data.titulo);
+      values.push(parsed.data.titulo.trim());
     }
     if (parsed.data.descripcion !== undefined) {
       fields.push("descripcion = ?");
-      values.push(parsed.data.descripcion ?? null);
+      values.push(parsed.data.descripcion?.trim() ?? null);
     }
 
     let iniTmp: string | null = null;
@@ -275,16 +306,45 @@ export default async function eventos(app: FastifyInstance) {
       values.push(fin);
     }
 
-    if (iniTmp && finTmp && new Date(iniTmp) >= new Date(finTmp)) {
+    if (fields.length === 0) {
+      return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
+    }
+
+    // Si vienen ambas en el payload, valida directo
+    if (iniTmp && finTmp && !isEndAfterStart(iniTmp, finTmp)) {
       return reply.code(400).send({ ok: false, message: "fecha_fin debe ser mayor que fecha_inicio" });
     }
 
-    if (fields.length === 0) return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
-
     try {
-      const sql = `UPDATE eventos
-                     SET ${fields.join(", ")}, actualizado_en = NOW()
-                   WHERE id = ? AND academia_id = ?`;
+      // Si viene solo una de las fechas, valida contra la otra existente
+      if (iniTmp || finTmp) {
+        const [rowsPrev]: any = await db.query(
+          `SELECT fecha_inicio, fecha_fin
+             FROM eventos
+            WHERE id = ? AND academia_id = ?
+            LIMIT 1`,
+          [id, academiaId]
+        );
+        if (!rowsPrev?.length) return reply.code(404).send({ ok: false, message: "No encontrado" });
+
+        const prevIni = String(rowsPrev[0].fecha_inicio);
+        const prevFin = String(rowsPrev[0].fecha_fin);
+
+        const finalIni = iniTmp ?? prevIni;
+        const finalFin = finTmp ?? prevFin;
+
+        if (!isEndAfterStart(finalIni, finalFin)) {
+          return reply.code(400).send({ ok: false, message: "fecha_fin debe ser mayor que fecha_inicio" });
+        }
+      }
+
+      const sql = `
+        UPDATE eventos
+           SET ${fields.join(", ")},
+               actualizado_en = NOW()
+         WHERE id = ? AND academia_id = ?
+         LIMIT 1
+      `;
       values.push(id, academiaId);
 
       const [result]: any = await db.query(sql, values);
@@ -298,29 +358,32 @@ export default async function eventos(app: FastifyInstance) {
         [id, academiaId]
       );
 
-      return reply.send({ ok: true, item: rows[0] });
+      reply.header("Cache-Control", "no-store");
+      return reply.send({ ok: true, item: rows?.[0] ?? null });
     } catch (err: any) {
       req.log.error({ err, id }, "PUT /eventos/:id failed");
       return sendDbError(reply, "Error al actualizar evento", err);
     }
   });
 
-  // DELETE /eventos/:id (rol 1/2/3, delete por academia)
-  app.delete("/:id", { preHandler: onlyRoles123 }, async (req, reply) => {
+  // DELETE /eventos/:id (write 1/3, delete por academia)
+  app.delete("/:id", { preHandler: canWrite }, async (req, reply) => {
     const academiaId = getAcademiaScope(req, reply);
     if (!academiaId) return;
 
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
-    const id = Number(parsed.data.id);
+    const { id } = parsed.data;
 
     try {
       const [result]: any = await db.query(
-        "DELETE FROM eventos WHERE id = ? AND academia_id = ?",
+        "DELETE FROM eventos WHERE id = ? AND academia_id = ? LIMIT 1",
         [id, academiaId]
       );
 
       if (!result?.affectedRows) return reply.code(404).send({ ok: false, message: "No encontrado" });
+
+      reply.header("Cache-Control", "no-store");
       return reply.send({ ok: true, deleted: id });
     } catch (err: any) {
       req.log.error({ err, id }, "DELETE /eventos/:id failed");

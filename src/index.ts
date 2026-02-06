@@ -43,25 +43,34 @@ async function bootstrap() {
       "Cache-Control",
       "Pragma",
       "Expires",
-      "x-academia-id",
     ],
     exposedHeaders: ["Content-Length", "Content-Type", "Cache-Control"],
     maxAge: 86400,
   });
 
-
+  // ✅ Helmet: en dev sin CSP para no romper fetch desde Vite/otro origin
   await app.register(helmet, {
-    contentSecurityPolicy: {
-      useDefaults: true,
-      directives: {
-        "default-src": ["'none'"],
-        "base-uri": ["'none'"],
-        "form-action": ["'none'"],
-        "frame-ancestors": ["'none'"],
-        "img-src": ["'self'", "data:"],
-        "connect-src": ["'self'"],
-      },
-    },
+    contentSecurityPolicy: CONFIG.NODE_ENV === "production"
+      ? {
+          useDefaults: true,
+          directives: {
+            "default-src": ["'none'"],
+            "base-uri": ["'none'"],
+            "form-action": ["'none'"],
+            "frame-ancestors": ["'none'"],
+            "img-src": ["'self'", "data:"],
+            // En prod: permitir self + CORS_ORIGIN (si existe)
+            "connect-src": [
+              "'self'",
+              ...(CONFIG.CORS_ORIGIN
+                ? Array.isArray(CONFIG.CORS_ORIGIN)
+                  ? CONFIG.CORS_ORIGIN
+                  : [String(CONFIG.CORS_ORIGIN)]
+                : []),
+            ],
+          },
+        }
+      : false,
     frameguard: { action: "deny" },
     hsts:
       CONFIG.NODE_ENV === "production"
@@ -129,7 +138,6 @@ async function bootstrap() {
         },
         servers: [
           { url: `http://127.0.0.1:${CONFIG.PORT || 8000}`, description: "Local" },
-          // Si aún no tienes dominio final, déjalo genérico
           { url: "https://example.com/api", description: "Producción" },
         ],
         components: {
@@ -213,20 +221,39 @@ async function bootstrap() {
 
       // ✅ Apoderado
       if (payload?.type === "apoderado") {
-        (req as any).user = {
-          type: "apoderado",
-          apoderado_id: Number(payload.apoderado_id),
+        const authObj = {
+          type: "apoderado" as const,
+          apoderado_id: payload?.apoderado_id != null ? Number(payload.apoderado_id) : undefined,
           rut: String(payload.rut ?? ""),
         };
+
+        // ✅ Nuevo estándar
+        (req as any).auth = authObj;
+        // 🔁 Legacy
+        (req as any).user = authObj;
         return;
       }
 
-      // ✅ Panel (admin/staff)
+      // ✅ Panel (admin/staff/superadmin)
+      const authObj = {
+        type: "user" as const,
+        user_id: payload?.sub != null ? Number(payload.sub) : undefined,
+        rol_id: payload?.rol_id != null ? Number(payload.rol_id) : undefined,
+        nombre_usuario: String(payload.nombre_usuario ?? ""),
+        // ✅ Propagar academia_id desde JWT (para rol 1/2). Rol 3 puede venir null.
+        academia_id: payload?.academia_id != null ? Number(payload.academia_id) : null,
+      };
+
+      // ✅ Nuevo estándar
+      (req as any).auth = authObj;
+
+      // 🔁 Legacy (si middlewares/routers antiguos aún usan req.user)
       (req as any).user = {
         type: "admin",
-        id: Number(payload.sub),
-        rol_id: Number(payload.rol_id),
-        nombre_usuario: String(payload.nombre_usuario ?? ""),
+        id: authObj.user_id ?? null,
+        rol_id: authObj.rol_id ?? null,
+        nombre_usuario: authObj.nombre_usuario,
+        academia_id: authObj.academia_id,
       };
     } catch {
       return reply.code(401).send({ ok: false, message: "Token inválido o expirado" });

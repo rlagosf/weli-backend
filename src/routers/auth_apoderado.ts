@@ -9,8 +9,6 @@ import { CONFIG } from "../config";
 /* ──────────────────────────────────────────────────────────────
    Config / constants
 ────────────────────────────────────────────────────────────── */
-const JWT_SECRET = CONFIG.JWT_SECRET;
-
 const JWT_ISSUER =
   String((CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER ?? "app").trim();
 const JWT_AUDIENCE =
@@ -42,6 +40,12 @@ const AUDIT_EXTRA_MAX_CHARS = Math.max(
       2048
   ) || 2048
 );
+
+function getJwtSecret() {
+  const s = CONFIG.JWT_SECRET;
+  if (!s) throw new Error("JWT_SECRET missing (CONFIG.JWT_SECRET)");
+  return s;
+}
 
 /* ──────────────────────────────────────────────────────────────
    Validation
@@ -101,7 +105,7 @@ async function withAuthSlot<T>(fn: () => Promise<T>): Promise<T> {
    Token helpers
 ────────────────────────────────────────────────────────────── */
 function signApoderadoToken(payload: ApoderadoToken) {
-  if (!JWT_SECRET) throw new Error("JWT_SECRET missing");
+  const JWT_SECRET = getJwtSecret();
   if (!JWT_ISSUER) throw new Error("JWT_ISSUER missing");
   if (!JWT_AUDIENCE) throw new Error("JWT_AUDIENCE missing");
 
@@ -118,6 +122,8 @@ function verifyApoderadoToken(authHeader?: string): ApoderadoToken | null {
   if (bearer !== "Bearer" || !token) return null;
 
   try {
+    const JWT_SECRET = getJwtSecret();
+
     const decoded = jwt.verify(token, JWT_SECRET, {
       issuer: JWT_ISSUER,
       audience: JWT_AUDIENCE,
@@ -231,7 +237,6 @@ const RL_MAX = 8;
 const RL_WINDOW_MS = 10 * 60_000;
 const RL_BLOCK_MS = 15 * 60_000;
 
-// ✅ evita que el Map crezca infinito
 const RL_MAX_KEYS = 50_000;
 const RL_GC_INTERVAL_MS = 60_000;
 
@@ -246,13 +251,18 @@ function rlSafeKeysOk() {
   return rl.size < RL_MAX_KEYS;
 }
 
+/**
+ * ✅ Cuenta intentos dentro de ventana (además de bloquear por fallos).
+ * - Si está bloqueado → 429
+ * - Si excede RL_MAX en ventana → bloquea
+ */
 function checkRateLimit(ip: string | null, rut: string) {
   const now = Date.now();
   const key = rlSafeKeysOk() ? rlKey(ip, rut) : `${ip || "noip"}:*`; // degradación segura
   const st = rl.get(key);
 
   if (!st) {
-    rl.set(key, { count: 0, windowStart: now, blockedUntil: 0, lastSeen: now });
+    rl.set(key, { count: 1, windowStart: now, blockedUntil: 0, lastSeen: now });
     return { ok: true, retryAfterSec: 0 };
   }
 
@@ -268,6 +278,16 @@ function checkRateLimit(ip: string | null, rut: string) {
     st.blockedUntil = 0;
   }
 
+  st.count += 1;
+
+  if (st.count >= RL_MAX) {
+    st.blockedUntil = now + RL_BLOCK_MS;
+    st.count = 0;
+    st.windowStart = now;
+    return { ok: false, retryAfterSec: Math.ceil(RL_BLOCK_MS / 1000) };
+  }
+
+  rl.set(key, st);
   return { ok: true, retryAfterSec: 0 };
 }
 
@@ -284,6 +304,7 @@ function registerFailed(ip: string | null, rut: string) {
     st.blockedUntil = 0;
   }
 
+  // “fail bias”: suma extra para castigar brute force real
   st.count += 1;
 
   if (st.count >= RL_MAX) {
@@ -461,16 +482,6 @@ export default async function auth_apoderado(
         ms_total: Date.now() - t0,
       },
     });
-
-    if (PERF_LOG) {
-      console.log("[AUTH_APODERADO PERF FINAL]", {
-        rut,
-        ms_select: t1 - t0,
-        ms_argon2_verify: t2b - t2a,
-        ms_update: t3b - t3a,
-        ms_total: Date.now() - t0,
-      });
-    }
 
     return reply.send({
       ok: true,

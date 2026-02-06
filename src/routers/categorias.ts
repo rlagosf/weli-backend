@@ -1,35 +1,39 @@
 // src/routers/categorias.ts
-import { FastifyInstance } from "fastify";
+import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db";
 import { requireAuth, requireRoles } from "../middlewares/authz";
 
+const IdParam = z.object({
+  id: z.coerce.number().int().positive(),
+});
+
 const CategoriaCreateSchema = z.object({
-  nombre: z.string().min(1, "nombre requerido").max(100),
+  nombre: z.string().trim().min(1, "nombre requerido").max(100),
 });
 
 const CategoriaUpdateSchema = z.object({
-  nombre: z.string().min(1, "nombre requerido").max(100),
+  nombre: z.string().trim().min(1, "nombre requerido").max(100),
 });
 
 export default async function categorias(app: FastifyInstance) {
   // ✅ Regla de oro: catálogos
-  const canRead = [requireAuth, requireRoles([1, 2])]; // admin + staff
-  const canWrite = [requireAuth, requireRoles([1])];   // solo admin
+  // - Read: admin(1) + staff(2) + superadmin(3)
+  // - Write: admin(1) + superadmin(3)
+  const canRead = [requireAuth, requireRoles([1, 2, 3])];
+  const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  // Health (read: roles 1/2)
+  // Health (read)
   app.get("/health", { preHandler: canRead }, async () => ({
     module: "categorias",
     status: "ready",
     timestamp: new Date().toISOString(),
   }));
 
-  // Listar todas (read: roles 1/2)
+  // Listar todas (read)
   app.get("/", { preHandler: canRead }, async (_req, reply) => {
     try {
-      const [rows] = await db.query(
-        "SELECT id, nombre FROM categorias ORDER BY id ASC"
-      );
+      const [rows] = await db.query("SELECT id, nombre FROM categorias ORDER BY id ASC");
       return reply.send({ ok: true, items: rows });
     } catch {
       return reply.code(500).send({
@@ -39,12 +43,14 @@ export default async function categorias(app: FastifyInstance) {
     }
   });
 
-  // Obtener por ID (read: roles 1/2)
+  // Obtener por ID (read)
   app.get("/:id", { preHandler: canRead }, async (req, reply) => {
-    const id = Number((req.params as any).id);
-    if (Number.isNaN(id)) {
+    const parsed = IdParam.safeParse(req.params);
+    if (!parsed.success) {
       return reply.code(400).send({ ok: false, message: "ID inválido" });
     }
+
+    const { id } = parsed.data;
 
     try {
       const [rows]: any = await db.query(
@@ -52,7 +58,7 @@ export default async function categorias(app: FastifyInstance) {
         [id]
       );
 
-      if (!rows.length) {
+      if (!rows?.length) {
         return reply.code(404).send({ ok: false, message: "No encontrada" });
       }
 
@@ -65,73 +71,74 @@ export default async function categorias(app: FastifyInstance) {
     }
   });
 
-  // Crear (write: solo rol 1)
+  // Crear (write: rol 1 y 3)
   app.post("/", { preHandler: canWrite }, async (req, reply) => {
     try {
       const data = CategoriaCreateSchema.parse(req.body);
+      const nombre = data.nombre.trim();
 
-      const [result]: any = await db.query(
-        "INSERT INTO categorias (nombre) VALUES (?)",
-        [data.nombre]
-      );
+      const [result]: any = await db.query("INSERT INTO categorias (nombre) VALUES (?)", [
+        nombre,
+      ]);
 
       return reply.code(201).send({
         ok: true,
         id: result.insertId,
-        nombre: data.nombre,
+        nombre,
       });
     } catch (error: any) {
       const msg =
         error?.code === "ER_DUP_ENTRY"
           ? "El nombre ya existe"
           : error?.message ?? "BAD_REQUEST";
-      return reply.code(400).send({ ok: false, message: msg });
+      return reply.code(error?.code === "ER_DUP_ENTRY" ? 409 : 400).send({ ok: false, message: msg });
     }
   });
 
-  // Actualizar (write: solo rol 1)
+  // Actualizar (write: rol 1 y 3)
   app.put("/:id", { preHandler: canWrite }, async (req, reply) => {
-    const id = Number((req.params as any).id);
-    if (Number.isNaN(id)) {
+    const idParsed = IdParam.safeParse(req.params);
+    if (!idParsed.success) {
       return reply.code(400).send({ ok: false, message: "ID inválido" });
     }
+
+    const { id } = idParsed.data;
 
     try {
       const { nombre } = CategoriaUpdateSchema.parse(req.body);
 
       const [result]: any = await db.query(
         "UPDATE categorias SET nombre = ? WHERE id = ?",
-        [nombre, id]
+        [nombre.trim(), id]
       );
 
-      if (result.affectedRows === 0) {
+      if (Number(result?.affectedRows ?? 0) === 0) {
         return reply.code(404).send({ ok: false, message: "No encontrada" });
       }
 
-      return reply.send({ ok: true, updated: { id, nombre } });
+      return reply.send({ ok: true, updated: { id, nombre: nombre.trim() } });
     } catch (error: any) {
       const msg =
         error?.code === "ER_DUP_ENTRY"
           ? "El nombre ya existe"
           : error?.message ?? "BAD_REQUEST";
-      return reply.code(400).send({ ok: false, message: msg });
+      return reply.code(error?.code === "ER_DUP_ENTRY" ? 409 : 400).send({ ok: false, message: msg });
     }
   });
 
-  // Eliminar (write: solo rol 1)
+  // Eliminar (write: rol 1 y 3)
   app.delete("/:id", { preHandler: canWrite }, async (req, reply) => {
-    const id = Number((req.params as any).id);
-    if (Number.isNaN(id)) {
+    const parsed = IdParam.safeParse(req.params);
+    if (!parsed.success) {
       return reply.code(400).send({ ok: false, message: "ID inválido" });
     }
 
-    try {
-      const [result]: any = await db.query(
-        "DELETE FROM categorias WHERE id = ?",
-        [id]
-      );
+    const { id } = parsed.data;
 
-      if (result.affectedRows === 0) {
+    try {
+      const [result]: any = await db.query("DELETE FROM categorias WHERE id = ?", [id]);
+
+      if (Number(result?.affectedRows ?? 0) === 0) {
         return reply.code(404).send({ ok: false, message: "No encontrada" });
       }
 

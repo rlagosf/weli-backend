@@ -52,6 +52,49 @@ function extractAcademiaId(user: AnyObj): number | undefined {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
+/**
+ * ✅ Fallback duro: si el backend ya armó req.user en un hook global
+ * (como en src/index.ts), reconstruimos req.auth para que requireRoles /
+ * requireApoderado no fallen por "auth missing".
+ */
+function readLegacyAuthFromReq(req: FastifyRequest): AuthContext | undefined {
+  const u = (req as any).user as AnyObj | undefined;
+  if (!u) return undefined;
+
+  const type = String(u?.type ?? "").toLowerCase();
+
+  // Hook global suele usar type:"admin" para panel
+  if (type === "admin" || type === "user" || type === "staff" || type === "superadmin") {
+    const rol_id = extractRole(u);
+    const user_id = toInt(u?.user_id ?? u?.id ?? u?.uid);
+    const academia_id =
+      extractAcademiaId(u) ?? (toInt(u?.academia_id) ?? undefined);
+
+    return { type: "user", user_id, rol_id, academia_id };
+  }
+
+  if (type === "apoderado") {
+    const rut = String(u?.rut ?? "");
+    if (!/^\d{8}$/.test(rut)) return undefined;
+    const apoderado_id = toInt(u?.apoderado_id);
+    return { type: "apoderado", rut, apoderado_id };
+  }
+
+  return undefined;
+}
+
+/** ✅ Normaliza: si no existe req.auth, intenta reconstruirlo desde req.user */
+function ensureAuthContext(req: FastifyRequest): AuthContext | undefined {
+  let a = (req as any).auth as AuthContext | undefined;
+
+  if (!a) {
+    a = readLegacyAuthFromReq(req);
+    if (a) (req as any).auth = a; // cache para el resto del pipeline
+  }
+
+  return a;
+}
+
 export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
   const auth = String(req.headers.authorization || "");
   const [bearer, token] = auth.split(" ");
@@ -73,7 +116,11 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
       }
 
       const apoderado_id = toInt(user?.apoderado_id);
-      (req as any).auth = { type: "apoderado", rut, apoderado_id } satisfies AuthContext;
+      (req as any).auth = {
+        type: "apoderado",
+        rut,
+        apoderado_id,
+      } satisfies AuthContext;
 
       // compat legacy
       (req as any).user = user;
@@ -99,7 +146,8 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
 }
 
 export async function requireApoderado(req: FastifyRequest, reply: FastifyReply) {
-  const a = (req as any).auth as AuthContext | undefined;
+  const a = ensureAuthContext(req);
+
   if (!a || a.type !== "apoderado") {
     return reply.code(403).send({ ok: false, message: "FORBIDDEN" });
   }
@@ -109,7 +157,7 @@ export function requireRoles(allowed: number[]) {
   const set = new Set(allowed.map(Number));
 
   return async function (req: FastifyRequest, reply: FastifyReply) {
-    const a = (req as any).auth as AuthContext | undefined;
+    const a = ensureAuthContext(req);
 
     if (!a || a.type !== "user") {
       return reply.code(403).send({ ok: false, message: "FORBIDDEN" });

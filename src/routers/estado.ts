@@ -10,7 +10,7 @@ import { requireAuth, requireRoles } from "../middlewares/authz";
  */
 
 const IdParam = z.object({
-  id: z.string().regex(/^\d+$/, "ID inválido"),
+  id: z.coerce.number().int().positive(),
 });
 
 const CreateSchema = z
@@ -33,26 +33,24 @@ function normalize(row: any) {
 }
 
 export default async function estado(app: FastifyInstance) {
-  // ✅ Regla de oro: catálogos
-  const canRead = [requireAuth, requireRoles([1, 2])]; // admin + staff
-  const canWrite = [requireAuth, requireRoles([1])];  // solo admin
+  // ✅ Catálogo (sin academia scope)
+  const canRead = [requireAuth, requireRoles([1, 2, 3])]; // admin + staff + superadmin
+  const canWrite = [requireAuth, requireRoles([1, 3])];  // admin + superadmin
 
-  // ───────────────────────────── Health (read: roles 1/2) ─────────────────────────────
   app.get("/health", { preHandler: canRead }, async () => ({
     module: "estado",
     status: "ready",
     timestamp: new Date().toISOString(),
   }));
 
-  // ───────────────────────────── GET all (read: roles 1/2) ─────────────────────────────
   app.get("/", { preHandler: canRead }, async (_req: FastifyRequest, reply: FastifyReply) => {
     try {
       const [rows]: any = await db.query("SELECT id, nombre FROM estado ORDER BY id ASC");
-
+      reply.header("Cache-Control", "no-store");
       return reply.send({
         ok: true,
-        count: rows.length,
-        items: rows.map(normalize),
+        count: rows?.length ?? 0,
+        items: (rows ?? []).map(normalize),
       });
     } catch (err: any) {
       return reply.code(500).send({
@@ -63,27 +61,25 @@ export default async function estado(app: FastifyInstance) {
     }
   });
 
-  // ───────────────────────────── GET by ID (read: roles 1/2) ─────────────────────────────
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
-    const id = Number(parsed.data.id);
+    const { id } = parsed.data;
 
     try {
-      const [rows]: any = await db.query("SELECT id, nombre FROM estado WHERE id = ? LIMIT 1", [id]);
+      const [rows]: any = await db.query(
+        "SELECT id, nombre FROM estado WHERE id = ? LIMIT 1",
+        [id]
+      );
 
-      if (!rows.length) {
-        return reply.code(404).send({
-          ok: false,
-          message: "Estado no encontrado",
-        });
+      reply.header("Cache-Control", "no-store");
+
+      if (!rows?.length) {
+        return reply.code(404).send({ ok: false, message: "Estado no encontrado" });
       }
 
-      return reply.send({
-        ok: true,
-        item: normalize(rows[0]),
-      });
+      return reply.send({ ok: true, item: normalize(rows[0]) });
     } catch (err: any) {
       return reply.code(500).send({
         ok: false,
@@ -93,13 +89,17 @@ export default async function estado(app: FastifyInstance) {
     }
   });
 
-  // ───────────────────────────── POST (write: solo rol 1) ─────────────────────────────
   app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const parsed = CreateSchema.parse(req.body);
       const nombre = parsed.nombre.trim();
 
-      const [result]: any = await db.query("INSERT INTO estado (nombre) VALUES (?)", [nombre]);
+      const [result]: any = await db.query(
+        "INSERT INTO estado (nombre) VALUES (?)",
+        [nombre]
+      );
+
+      reply.header("Cache-Control", "no-store");
 
       return reply.code(201).send({
         ok: true,
@@ -112,11 +112,8 @@ export default async function estado(app: FastifyInstance) {
         return reply.code(400).send({ ok: false, message: issues });
       }
 
-      if (err?.errno === 1062) {
-        return reply.code(409).send({
-          ok: false,
-          message: "El estado ya existe",
-        });
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
+        return reply.code(409).send({ ok: false, message: "El estado ya existe" });
       }
 
       return reply.code(500).send({
@@ -127,12 +124,11 @@ export default async function estado(app: FastifyInstance) {
     }
   });
 
-  // ───────────────────────────── PUT (write: solo rol 1) ─────────────────────────────
   app.put("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsedID = IdParam.safeParse(req.params);
     if (!parsedID.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
-    const id = Number(parsedID.data.id);
+    const { id } = parsedID.data;
 
     try {
       const parsedBody = UpdateSchema.parse(req.body);
@@ -141,31 +137,40 @@ export default async function estado(app: FastifyInstance) {
         return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
       }
 
-      // Normalización consistente
-      const updates: any = { ...parsedBody };
-      if (updates.nombre !== undefined) updates.nombre = String(updates.nombre).trim();
+      const sets: string[] = [];
+      const params: any[] = [];
 
-      const [result]: any = await db.query("UPDATE estado SET ? WHERE id = ?", [updates, id]);
+      if (parsedBody.nombre !== undefined) {
+        sets.push("nombre = ?");
+        params.push(parsedBody.nombre.trim());
+      }
+
+      if (!sets.length) {
+        return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
+      }
+
+      params.push(id);
+
+      const [result]: any = await db.query(
+        `UPDATE estado SET ${sets.join(", ")} WHERE id = ? LIMIT 1`,
+        params
+      );
+
+      reply.header("Cache-Control", "no-store");
 
       if (result.affectedRows === 0) {
         return reply.code(404).send({ ok: false, message: "No encontrado" });
       }
 
-      return reply.send({
-        ok: true,
-        updated: { id, ...updates },
-      });
+      return reply.send({ ok: true, updated: { id, ...parsedBody } });
     } catch (err: any) {
       if (err instanceof ZodError) {
         const issues = err.issues.map((i) => `${i.path}: ${i.message}`).join("; ");
         return reply.code(400).send({ ok: false, message: issues });
       }
 
-      if (err?.errno === 1062) {
-        return reply.code(409).send({
-          ok: false,
-          message: "El estado ya existe",
-        });
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
+        return reply.code(409).send({ ok: false, message: "El estado ya existe" });
       }
 
       return reply.code(500).send({
@@ -176,31 +181,28 @@ export default async function estado(app: FastifyInstance) {
     }
   });
 
-  // ───────────────────────────── DELETE (write: solo rol 1) ─────────────────────────────
   app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
-    const id = Number(parsed.data.id);
+    const { id } = parsed.data;
 
     try {
-      const [result]: any = await db.query("DELETE FROM estado WHERE id = ?", [id]);
+      const [result]: any = await db.query(
+        "DELETE FROM estado WHERE id = ? LIMIT 1",
+        [id]
+      );
+
+      reply.header("Cache-Control", "no-store");
 
       if (result.affectedRows === 0) {
         return reply.code(404).send({ ok: false, message: "No encontrado" });
       }
 
-      return reply.send({
-        ok: true,
-        deleted: id,
-      });
+      return reply.send({ ok: true, deleted: id });
     } catch (err: any) {
-      // opcional: si hay FK, suele ser 1451
-      if (err?.errno === 1451) {
-        return reply.code(409).send({
-          ok: false,
-          message: "No se puede eliminar: está en uso",
-        });
+      if (err?.errno === 1451 || err?.code === "ER_ROW_IS_REFERENCED_2") {
+        return reply.code(409).send({ ok: false, message: "No se puede eliminar: está en uso" });
       }
 
       return reply.code(500).send({

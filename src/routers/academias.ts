@@ -36,20 +36,21 @@ const ListQuery = z.object({
 });
 
 /* =========================
-   Router (DEFAULT)
+   Router (SUPERADMIN)
 ========================= */
 
 export default async function academias(app: FastifyInstance) {
   // ✅ Solo SUPERADMIN (rol 3) puede usar TODO este router
   const onlySuper = [requireAuth, requireRoles([3])];
 
-  // Health (rol 3)
+  /* ───────── Health ───────── */
   app.get("/health", { preHandler: onlySuper }, async () => ({
     module: "academias",
     status: "ready",
     timestamp: new Date().toISOString(),
   }));
 
+  /* ───────── List ───────── */
   // GET /api/academias?limit&offset&q&estado_id&deporte_id  (rol 3)
   app.get("/", { preHandler: onlySuper }, async (req, reply) => {
     try {
@@ -75,7 +76,6 @@ export default async function academias(app: FastifyInstance) {
 
       const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
-      // ✅ JOIN deportes + estado_academia para entregar NOMBRES (no IDs feos)
       const [rows] = await db.query(
         `
         SELECT
@@ -117,6 +117,7 @@ export default async function academias(app: FastifyInstance) {
     }
   });
 
+  /* ───────── Get by id ───────── */
   // GET /api/academias/:id  (rol 3)
   app.get("/:id", { preHandler: onlySuper }, async (req, reply) => {
     const parsed = IdParam.safeParse((req as any).params);
@@ -157,6 +158,7 @@ export default async function academias(app: FastifyInstance) {
     }
   });
 
+  /* ───────── Create ───────── */
   // POST /api/academias  (rol 3)
   app.post("/", { preHandler: onlySuper }, async (req, reply) => {
     try {
@@ -180,18 +182,16 @@ export default async function academias(app: FastifyInstance) {
         nombre,
       });
     } catch (error: any) {
-      const msg =
-        error?.code === "ER_DUP_ENTRY"
-          ? "Ya existe una academia con ese nombre"
-          : error?.message ?? "BAD_REQUEST";
+      const isDup = error?.code === "ER_DUP_ENTRY";
+      const msg = isDup
+        ? "Ya existe una academia con ese nombre"
+        : error?.message ?? "BAD_REQUEST";
 
-      return reply.code(error?.code === "ER_DUP_ENTRY" ? 409 : 400).send({
-        ok: false,
-        message: msg,
-      });
+      return reply.code(isDup ? 409 : 400).send({ ok: false, message: msg });
     }
   });
 
+  /* ───────── Update ───────── */
   // PUT /api/academias/:id  (rol 3)
   app.put("/:id", { preHandler: onlySuper }, async (req, reply) => {
     const parsed = IdParam.safeParse((req as any).params);
@@ -241,18 +241,16 @@ export default async function academias(app: FastifyInstance) {
 
       return reply.send({ ok: true, updated: id });
     } catch (error: any) {
-      const msg =
-        error?.code === "ER_DUP_ENTRY"
-          ? "Ya existe una academia con ese nombre"
-          : error?.message ?? "BAD_REQUEST";
+      const isDup = error?.code === "ER_DUP_ENTRY";
+      const msg = isDup
+        ? "Ya existe una academia con ese nombre"
+        : error?.message ?? "BAD_REQUEST";
 
-      return reply.code(error?.code === "ER_DUP_ENTRY" ? 409 : 400).send({
-        ok: false,
-        message: msg,
-      });
+      return reply.code(isDup ? 409 : 400).send({ ok: false, message: msg });
     }
   });
 
+  /* ───────── Delete ───────── */
   // DELETE /api/academias/:id  (rol 3)
   app.delete("/:id", { preHandler: onlySuper }, async (req, reply) => {
     const parsed = IdParam.safeParse((req as any).params);
@@ -271,12 +269,12 @@ export default async function academias(app: FastifyInstance) {
 
       return reply.send({ ok: true, deleted: id });
     } catch (error: any) {
-      const msg =
-        error?.code === "ER_ROW_IS_REFERENCED_2"
-          ? "No se puede eliminar: está siendo usada por datos del sistema"
-          : error?.message ?? "SERVER_ERROR";
+      const isFk = error?.code === "ER_ROW_IS_REFERENCED_2";
+      const msg = isFk
+        ? "No se puede eliminar: está siendo usada por datos del sistema"
+        : error?.message ?? "SERVER_ERROR";
 
-      return reply.code(500).send({ ok: false, message: msg });
+      return reply.code(isFk ? 409 : 500).send({ ok: false, message: msg });
     }
   });
 }

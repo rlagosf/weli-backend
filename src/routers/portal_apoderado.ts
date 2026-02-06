@@ -14,14 +14,14 @@ function getApoderadoAuth(req: FastifyRequest, reply: FastifyReply): ApoderadoAu
   const a = (req as any).auth;
 
   // 🔁 fallback por si tu middleware aún usa req.user:
-  // (pero SOLO si además trae type apoderado)
   const u = (req as any).user;
 
   const src = a ?? u ?? null;
   const type = String(src?.type ?? "").toLowerCase();
   const rut = String(src?.rut ?? "");
 
-  if (type !== "apoderado" || !/^\d{8}$/.test(rut)) {
+  // ✅ acepta 7 u 8 dígitos (consistente con jugadores)
+  if (type !== "apoderado" || !/^\d{7,8}$/.test(rut)) {
     reply.code(401).send({ ok: false, message: "UNAUTHORIZED" });
     return null;
   }
@@ -34,9 +34,8 @@ function getApoderadoAuth(req: FastifyRequest, reply: FastifyReply): ApoderadoAu
   return { type: "apoderado", rut, apoderado_id };
 }
 
-async function requireApoderadoPortalOk(rut: string) {
-  const db = getDb();
-  const [rows] = await db.query<any[]>(
+async function requireApoderadoPortalOk(db: any, rut: string) {
+  const [rows] = await db.query(
     `SELECT must_change_password
        FROM apoderados_auth
       WHERE rut_apoderado = ?
@@ -44,15 +43,17 @@ async function requireApoderadoPortalOk(rut: string) {
     [rut]
   );
 
-  if (!rows?.length) return { ok: false as const, code: 401, message: "UNAUTHORIZED" };
-  if (Number(rows[0]?.must_change_password) === 1) {
+  const arr = rows as any[];
+  if (!arr?.length) return { ok: false as const, code: 401, message: "UNAUTHORIZED" };
+  if (Number(arr[0]?.must_change_password) === 1) {
     return { ok: false as const, code: 403, message: "PASSWORD_CHANGE_REQUIRED" };
   }
   return { ok: true as const };
 }
 
-async function assertGuardOrReply(rut: string, reply: FastifyReply): Promise<boolean> {
-  const guard = await requireApoderadoPortalOk(rut);
+
+async function assertGuardOrReply(db: any, rut: string, reply: FastifyReply): Promise<boolean> {
+  const guard = await requireApoderadoPortalOk(db, rut);
   if (!guard.ok) {
     reply.code(guard.code).send({ ok: false, message: guard.message });
     return false;
@@ -63,7 +64,8 @@ async function assertGuardOrReply(rut: string, reply: FastifyReply): Promise<boo
 /* ──────────────────────────────────────────────────────────────
    Schemas
 ────────────────────────────────────────────────────────────── */
-const RutJugadorParam = z.object({ rut: z.string().regex(/^\d{8}$/) });
+// ✅ consistente: 7 u 8 dígitos
+const RutJugadorParam = z.object({ rut: z.string().regex(/^\d{7,8}$/) });
 
 const FotoBodySchema = z
   .object({
@@ -93,6 +95,11 @@ const cleanBase64 = (raw: any) => {
     .replace(/\s+/g, "");
 };
 
+const isValidFotoMime = (m: any) => {
+  const mm = String(m ?? "").toLowerCase().trim();
+  return ["image/jpeg", "image/jpg", "image/png", "image/webp"].includes(mm);
+};
+
 async function assertJugadorPertenece(db: any, rutJugador: string, rutApoderado: string) {
   const [own] = await db.query(
     `SELECT 1
@@ -101,16 +108,13 @@ async function assertJugadorPertenece(db: any, rutJugador: string, rutApoderado:
       LIMIT 1`,
     [rutJugador, rutApoderado]
   );
-  return Boolean(own?.length);
+  return Boolean((own as any)?.length);
 }
 
 /* ──────────────────────────────────────────────────────────────
    Router
 ────────────────────────────────────────────────────────────── */
-export default async function portal_apoderado(
-  app: FastifyInstance,
-  _opts: FastifyPluginOptions
-) {
+export default async function portal_apoderado(app: FastifyInstance, _opts: FastifyPluginOptions) {
   // 🔒 Blindaje total: token válido + debe ser apoderado (middleware)
   app.addHook("preHandler", requireAuth);
   app.addHook("preHandler", requireApoderado);
@@ -122,12 +126,12 @@ export default async function portal_apoderado(
     const auth = getApoderadoAuth(req, reply);
     if (!auth) return;
 
-    if (!(await assertGuardOrReply(auth.rut, reply))) return;
-
     const db = getDb();
+    if (!(await assertGuardOrReply(db, auth.rut, reply))) return;
+
     let ap: any = null;
 
-    // 1) Preferente: apoderados_auth (si tiene columnas)
+    // 1) Preferente: apoderados_auth
     try {
       const [rows] = await db.query<any[]>(
         `SELECT rut_apoderado, nombre_apoderado, email, telefono
@@ -141,7 +145,7 @@ export default async function portal_apoderado(
       ap = ap ?? null;
     }
 
-    // 2) Fallback: jugadores
+    // 2) Fallback: jugadores (ojo: email suele ser del jugador, depende de tu modelo)
     const needsFallback =
       !String(ap?.nombre_apoderado ?? "").trim() ||
       !String(ap?.email ?? "").trim() ||
@@ -190,9 +194,8 @@ export default async function portal_apoderado(
     const auth = getApoderadoAuth(req, reply);
     if (!auth) return;
 
-    if (!(await assertGuardOrReply(auth.rut, reply))) return;
-
     const db = getDb();
+    if (!(await assertGuardOrReply(db, auth.rut, reply))) return;
 
     const [rows] = await db.query<any[]>(
       `SELECT
@@ -236,13 +239,13 @@ export default async function portal_apoderado(
     const auth = getApoderadoAuth(req, reply);
     if (!auth) return;
 
-    if (!(await assertGuardOrReply(auth.rut, reply))) return;
+    const db = getDb();
+    if (!(await assertGuardOrReply(db, auth.rut, reply))) return;
 
     const parsed = RutJugadorParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "BAD_REQUEST" });
 
     const rutJugador = parsed.data.rut;
-    const db = getDb();
 
     const okOwn = await assertJugadorPertenece(db, rutJugador, auth.rut);
     if (!okOwn) return reply.code(403).send({ ok: false, message: "FORBIDDEN" });
@@ -272,7 +275,8 @@ export default async function portal_apoderado(
     const auth = getApoderadoAuth(req, reply);
     if (!auth) return;
 
-    if (!(await assertGuardOrReply(auth.rut, reply))) return;
+    const db = getDb();
+    if (!(await assertGuardOrReply(db, auth.rut, reply))) return;
 
     const parsed = RutJugadorParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "BAD_REQUEST" });
@@ -281,7 +285,6 @@ export default async function portal_apoderado(
     if (!body.success) return reply.code(400).send({ ok: false, message: "BAD_REQUEST" });
 
     const rutJugador = parsed.data.rut;
-    const db = getDb();
 
     const okOwn = await assertJugadorPertenece(db, rutJugador, auth.rut);
     if (!okOwn) return reply.code(403).send({ ok: false, message: "FORBIDDEN" });
@@ -290,11 +293,29 @@ export default async function portal_apoderado(
       ? String(body.data.foto_base64).replace(/\s+/g, "")
       : null;
 
-    const fotoMime = body.data.foto_mime ? String(body.data.foto_mime).toLowerCase() : null;
+    const fotoMime = body.data.foto_mime ? String(body.data.foto_mime).toLowerCase().trim() : null;
+
+    // ✅ reglas mínimas: o borras todo (null/null) o envías mime permitido + base64 “con contenido”
+    if (fotoBase64 == null && fotoMime == null) {
+      await db.query(
+        `UPDATE jugadores
+            SET foto_base64 = NULL, foto_mime = NULL, foto_updated_at = NOW()
+          WHERE rut_jugador = ?`,
+        [rutJugador]
+      );
+      return reply.send({ ok: true, cleared: true });
+    }
+
+    if (!fotoMime || !isValidFotoMime(fotoMime)) {
+      return reply.code(400).send({ ok: false, message: "FOTO_MIME_INVALIDO" });
+    }
+    if (!fotoBase64 || fotoBase64.length < 50) {
+      return reply.code(400).send({ ok: false, message: "FOTO_BASE64_INVALIDA" });
+    }
 
     await db.query(
       `UPDATE jugadores
-          SET foto_base64 = ?, foto_mime = ?
+          SET foto_base64 = ?, foto_mime = ?, foto_updated_at = NOW()
         WHERE rut_jugador = ?`,
       [fotoBase64, fotoMime, rutJugador]
     );
@@ -309,13 +330,13 @@ export default async function portal_apoderado(
     const auth = getApoderadoAuth(req, reply);
     if (!auth) return;
 
-    if (!(await assertGuardOrReply(auth.rut, reply))) return;
+    const db = getDb();
+    if (!(await assertGuardOrReply(db, auth.rut, reply))) return;
 
     const parsed = RutJugadorParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "BAD_REQUEST" });
 
     const rutJugador = parsed.data.rut;
-    const db = getDb();
 
     const okOwn = await assertJugadorPertenece(db, rutJugador, auth.rut);
     if (!okOwn) return reply.code(403).send({ ok: false, message: "FORBIDDEN" });
@@ -467,13 +488,13 @@ export default async function portal_apoderado(
     const auth = getApoderadoAuth(req, reply);
     if (!auth) return;
 
-    if (!(await assertGuardOrReply(auth.rut, reply))) return;
+    const db = getDb();
+    if (!(await assertGuardOrReply(db, auth.rut, reply))) return;
 
     const parsed = RutJugadorParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "BAD_REQUEST" });
 
     const rutJugador = parsed.data.rut;
-    const db = getDb();
 
     const okOwn = await assertJugadorPertenece(db, rutJugador, auth.rut);
     if (!okOwn) return reply.code(403).send({ ok: false, message: "FORBIDDEN" });
@@ -507,6 +528,12 @@ export default async function portal_apoderado(
       return reply.code(500).send({ ok: false, message: "CONTRATO_INVALIDO" });
     }
 
+    // ✅ hard limit de seguridad (evita reventar memoria por error)
+    const MAX_BYTES = 6 * 1024 * 1024; // 6MB
+    if (buf.length > MAX_BYTES) {
+      return reply.code(413).send({ ok: false, message: "CONTRATO_DEMASIADO_GRANDE" });
+    }
+
     reply.header("Content-Type", "application/pdf");
     reply.header("Content-Disposition", `inline; filename="Contrato_${rutJugador}.pdf"`);
     reply.header("Cache-Control", "no-store, max-age=0");
@@ -521,13 +548,13 @@ export default async function portal_apoderado(
     const auth = getApoderadoAuth(req, reply);
     if (!auth) return;
 
-    if (!(await assertGuardOrReply(auth.rut, reply))) return;
+    const db = getDb();
+    if (!(await assertGuardOrReply(db, auth.rut, reply))) return;
 
     const parsed = RutJugadorParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "BAD_REQUEST" });
 
     const rutJugador = parsed.data.rut;
-    const db = getDb();
 
     const okOwn = await assertJugadorPertenece(db, rutJugador, auth.rut);
     if (!okOwn) return reply.code(403).send({ ok: false, message: "FORBIDDEN" });

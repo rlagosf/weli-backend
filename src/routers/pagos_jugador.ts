@@ -97,18 +97,24 @@ const ListQuery = PageQuery.extend({
 /* ────────────────────────────────────────────────────────────── */
 
 export default async function pagos_jugador(app: FastifyInstance) {
-  // 🔐 SOLO ADMIN (rol 1)
-  const onlyRole1 = [requireAuth, requireRoles([1])];
+  /**
+   * 🔐 FINANZAS: acceso estrictamente restringido
+   * - canRead  -> solo rol 1
+   * - canWrite -> solo rol 1
+   * (ni rol 3 superadmin puede ver/alterar pagos)
+   */
+  const canRead = [requireAuth, requireRoles([1,3])];
+  const canWrite = [requireAuth, requireRoles([1])];
 
   // Health (🔐 rol 1)
-  app.get("/health", { preHandler: onlyRole1 }, async () => ({
+  app.get("/health", { preHandler: canRead }, async () => ({
     module: "pagos_jugador",
     status: "ready",
     timestamp: new Date().toISOString(),
   }));
 
   /* ───────── GET listado con filtros + paginación (🔐 rol 1) ───────── */
-  app.get("/", { preHandler: onlyRole1 }, async (req, reply) => {
+  app.get("/", { preHandler: canRead }, async (req, reply) => {
     const queryParsed = ListQuery.safeParse((req as any).query);
     if (!queryParsed.success) {
       return reply.code(400).send({
@@ -169,7 +175,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
   });
 
   /* ───────── GET estado de cuenta (🔐 rol 1) ───────── */
-  app.get("/estado-cuenta", { preHandler: onlyRole1 }, async (_req, reply) => {
+  app.get("/estado-cuenta", { preHandler: canRead }, async (_req, reply) => {
     try {
       const now = new Date();
       const currentYear = now.getFullYear();
@@ -287,7 +293,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
   });
 
   /* ───────── GET estado mensualidad (solo deudores) (🔐 rol 1) ───────── */
-  app.get("/mensualidad-estado", { preHandler: onlyRole1 }, async (_req, reply) => {
+  app.get("/mensualidad-estado", { preHandler: canRead }, async (_req, reply) => {
     try {
       const now = new Date();
       const currentYear = now.getFullYear();
@@ -389,7 +395,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
   /* ───────── GET por jugador_rut (🔐 rol 1) ───────── */
   // ✅ Importante: va ANTES de "/:id" para no ser capturado por la ruta dinámica.
-  app.get("/jugador/:jugador_rut", { preHandler: onlyRole1 }, async (req, reply) => {
+  app.get("/jugador/:jugador_rut", { preHandler: canRead }, async (req, reply) => {
     const parsed = RutParam.safeParse((req as any).params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "RUT inválido" });
 
@@ -413,7 +419,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
   });
 
   /* ───────── GET por ID (🔐 rol 1) ───────── */
-  app.get("/:id", { preHandler: onlyRole1 }, async (req, reply) => {
+  app.get("/:id", { preHandler: canRead }, async (req, reply) => {
     const parsed = IdParam.safeParse((req as any).params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
@@ -431,7 +437,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
   });
 
   /* ───────── POST crear (🔐 rol 1) ───────── */
-  app.post("/", { preHandler: onlyRole1 }, async (req, reply) => {
+  app.post("/", { preHandler: canWrite }, async (req, reply) => {
     const raw = (req as any).body ?? {};
     const normalized = normalizeBody(raw);
 
@@ -459,7 +465,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
   });
 
   /* ───────── PUT actualizar (🔐 rol 1) ───────── */
-  app.put("/:id", { preHandler: onlyRole1 }, async (req, reply) => {
+  app.put("/:id", { preHandler: canWrite }, async (req, reply) => {
     const pid = IdParam.safeParse((req as any).params);
     if (!pid.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
@@ -501,7 +507,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
   });
 
   /* ───────── DELETE eliminar (🔐 rol 1) ───────── */
-  app.delete("/:id", { preHandler: onlyRole1 }, async (req, reply) => {
+  app.delete("/:id", { preHandler: canWrite }, async (req, reply) => {
     const parsed = IdParam.safeParse((req as any).params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 

@@ -1,5 +1,5 @@
 // src/routers/establec_educ.ts
-import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
 import { db } from "../db";
 import { requireAuth, requireRoles } from "../middlewares/authz";
@@ -7,10 +7,11 @@ import { requireAuth, requireRoles } from "../middlewares/authz";
 /**
  * Tabla: establec_educ
  * Campos: id (PK), nombre (VARCHAR UNIQUE)
+ * Scope: catálogo global (sin academia)
  */
 
 const IdParam = z.object({
-  id: z.string().regex(/^\d+$/, "ID inválido"),
+  id: z.coerce.number().int().positive(),
 });
 
 const CreateSchema = z
@@ -33,30 +34,28 @@ function normalize(row: any) {
 }
 
 export default async function establec_educ(app: FastifyInstance) {
-  // ✅ Regla de oro (catálogo)
-  const canRead = [requireAuth, requireRoles([1, 2])]; // admin + staff
-  const canWrite = [requireAuth, requireRoles([1])];  // solo admin
+  // ✅ Catálogo:
+  // - READ: roles 1/2/3
+  // - WRITE: roles 1 y 3
+  const canRead = [requireAuth, requireRoles([1, 2, 3])];
+  const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  // ─────────────────────────── Health (read: roles 1/2) ───────────────────────────
+  // ─────────────────────────── Health ───────────────────────────
   app.get("/health", { preHandler: canRead }, async () => ({
     module: "establec_educ",
     status: "ready",
     timestamp: new Date().toISOString(),
   }));
 
-  // ─────────────────────────── GET all (read: roles 1/2) ───────────────────────────
+  // ─────────────────────────── GET all ───────────────────────────
   app.get("/", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const [rows]: any = await db.query(
-        "SELECT id, nombre FROM establec_educ ORDER BY nombre ASC"
-      );
-
+      const [rows]: any = await db.query("SELECT id, nombre FROM establec_educ ORDER BY nombre ASC");
       reply.header("Cache-Control", "no-store");
-
       return reply.send({
         ok: true,
-        count: rows.length,
-        items: rows.map(normalize),
+        count: rows?.length ?? 0,
+        items: (rows || []).map(normalize),
       });
     } catch (err: any) {
       req.log.error({ err }, "establec_educ: error listando establecimientos");
@@ -68,44 +67,29 @@ export default async function establec_educ(app: FastifyInstance) {
     }
   });
 
-  // ─────────────────────────── GET /:id/ (read: roles 1/2) ───────────────────────────
-  // Soportar trailing slash: "/api/establecimientos-educ/71/" -> "../71"
+  // ─────────────────────────── GET /:id/ (trailing slash) ───────────────────────────
   app.get("/:id/", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
-    if (!parsed.success) {
-      return reply.code(400).send({ ok: false, message: "ID inválido" });
-    }
+    if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
     return reply.redirect(`../${parsed.data.id}`);
   });
 
-  // ─────────────────────────── GET by ID (read: roles 1/2) ───────────────────────────
+  // ─────────────────────────── GET by ID ───────────────────────────
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
-    if (!parsed.success) {
-      return reply.code(400).send({ ok: false, message: "ID inválido" });
-    }
+    if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
-    const id = Number(parsed.data.id);
+    const id = parsed.data.id;
 
     try {
-      const [rows]: any = await db.query(
-        "SELECT id, nombre FROM establec_educ WHERE id = ? LIMIT 1",
-        [id]
-      );
-
+      const [rows]: any = await db.query("SELECT id, nombre FROM establec_educ WHERE id = ? LIMIT 1", [id]);
       reply.header("Cache-Control", "no-store");
 
-      if (!rows.length) {
-        return reply.code(404).send({
-          ok: false,
-          message: "Establecimiento no encontrado",
-        });
+      if (!rows?.length) {
+        return reply.code(404).send({ ok: false, message: "Establecimiento no encontrado" });
       }
 
-      return reply.send({
-        ok: true,
-        item: normalize(rows[0]),
-      });
+      return reply.send({ ok: true, item: normalize(rows[0]) });
     } catch (err: any) {
       req.log.error({ err, id }, "establec_educ: error obteniendo establecimiento por id");
       return reply.code(500).send({
@@ -116,34 +100,24 @@ export default async function establec_educ(app: FastifyInstance) {
     }
   });
 
-  // ─────────────────────────── POST (write: solo rol 1) ───────────────────────────
+  // ─────────────────────────── POST ───────────────────────────
   app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const parsed = CreateSchema.parse(req.body);
       const nombre = parsed.nombre.trim();
 
-      const [result]: any = await db.query("INSERT INTO establec_educ (nombre) VALUES (?)", [
-        nombre,
-      ]);
+      const [result]: any = await db.query("INSERT INTO establec_educ (nombre) VALUES (?)", [nombre]);
 
       reply.header("Cache-Control", "no-store");
-
-      return reply.code(201).send({
-        ok: true,
-        id: result.insertId,
-        nombre,
-      });
+      return reply.code(201).send({ ok: true, id: result.insertId, nombre });
     } catch (err: any) {
       if (err instanceof ZodError) {
-        const issues = err.issues.map((i) => `${i.path}: ${i.message}`).join("; ");
+        const issues = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
         return reply.code(400).send({ ok: false, message: issues });
       }
 
-      if (err?.errno === 1062) {
-        return reply.code(409).send({
-          ok: false,
-          message: "El establecimiento ya existe",
-        });
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
+        return reply.code(409).send({ ok: false, message: "El establecimiento ya existe" });
       }
 
       req.log.error({ err }, "establec_educ: error creando establecimiento");
@@ -155,17 +129,15 @@ export default async function establec_educ(app: FastifyInstance) {
     }
   });
 
-  // ─────────────────────────── PUT (write: solo rol 1) ───────────────────────────
+  // ─────────────────────────── PUT ───────────────────────────
   app.put("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsedId = IdParam.safeParse(req.params);
-    if (!parsedId.success) {
-      return reply.code(400).send({ ok: false, message: "ID inválido" });
-    }
-    const id = Number(parsedId.data.id);
+    if (!parsedId.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
+
+    const id = parsedId.data.id;
 
     try {
       const parsedBody = UpdateSchema.parse(req.body);
-
       if (Object.keys(parsedBody).length === 0) {
         return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
       }
@@ -173,39 +145,41 @@ export default async function establec_educ(app: FastifyInstance) {
       const setClauses: string[] = [];
       const values: any[] = [];
 
+      let updatedNombre: string | undefined;
+
       if (parsedBody.nombre !== undefined) {
+        updatedNombre = parsedBody.nombre.trim();
         setClauses.push("nombre = ?");
-        values.push(parsedBody.nombre.trim());
+        values.push(updatedNombre);
+      }
+
+      if (!setClauses.length) {
+        return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
       }
 
       values.push(id);
 
       const [result]: any = await db.query(
-        `UPDATE establec_educ SET ${setClauses.join(", ")} WHERE id = ?`,
+        `UPDATE establec_educ SET ${setClauses.join(", ")} WHERE id = ? LIMIT 1`,
         values
       );
 
       reply.header("Cache-Control", "no-store");
 
-      if (result.affectedRows === 0) {
-        return reply.code(404).send({ ok: false, message: "No encontrado" });
-      }
+      if (result.affectedRows === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       return reply.send({
         ok: true,
-        updated: { id, ...parsedBody },
+        updated: { id, ...(updatedNombre !== undefined ? { nombre: updatedNombre } : {}) },
       });
     } catch (err: any) {
       if (err instanceof ZodError) {
-        const issues = err.issues.map((i) => `${i.path}: ${i.message}`).join("; ");
+        const issues = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
         return reply.code(400).send({ ok: false, message: issues });
       }
 
-      if (err?.errno === 1062) {
-        return reply.code(409).send({
-          ok: false,
-          message: "El establecimiento ya existe",
-        });
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
+        return reply.code(409).send({ ok: false, message: "El establecimiento ya existe" });
       }
 
       req.log.error({ err, id }, "establec_educ: error actualizando establecimiento");
@@ -217,28 +191,21 @@ export default async function establec_educ(app: FastifyInstance) {
     }
   });
 
-  // ─────────────────────────── DELETE (write: solo rol 1) ───────────────────────────
+  // ─────────────────────────── DELETE ───────────────────────────
   app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
-    if (!parsed.success) {
-      return reply.code(400).send({ ok: false, message: "ID inválido" });
-    }
+    if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
-    const id = Number(parsed.data.id);
+    const id = parsed.data.id;
 
     try {
-      const [result]: any = await db.query("DELETE FROM establec_educ WHERE id = ?", [id]);
+      const [result]: any = await db.query("DELETE FROM establec_educ WHERE id = ? LIMIT 1", [id]);
 
       reply.header("Cache-Control", "no-store");
 
-      if (result.affectedRows === 0) {
-        return reply.code(404).send({ ok: false, message: "No encontrado" });
-      }
+      if (result.affectedRows === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
-      return reply.send({
-        ok: true,
-        deleted: id,
-      });
+      return reply.send({ ok: true, deleted: id });
     } catch (err: any) {
       req.log.error({ err, id }, "establec_educ: error eliminando establecimiento");
       return reply.code(500).send({

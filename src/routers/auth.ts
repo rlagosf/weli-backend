@@ -5,6 +5,7 @@ import { verify as argon2Verify, hash as argon2Hash } from "@node-rs/argon2";
 import jwt, { SignOptions } from "jsonwebtoken";
 import { db } from "../db";
 import { CONFIG } from "../config";
+import { requireAuth as authzRequireAuth, requireRoles as authzRequireRoles } from "../middlewares/authz";
 
 /* ───────────────────────── Config ───────────────────────── */
 
@@ -48,6 +49,12 @@ const AUDIT_EXTRA_MAX_CHARS = Math.max(
       2048
   ) || 2048
 );
+
+function getJwtSecret() {
+  const s = CONFIG.JWT_SECRET;
+  if (!s) throw new Error("JWT_SECRET missing (CONFIG.JWT_SECRET)");
+  return s;
+}
 
 /* ───────────────────────── Auditoría ───────────────────────── */
 
@@ -181,7 +188,7 @@ function checkRateLimit(ip: string | null, nombre_usuario: string) {
 
   const st = rl.get(key);
   if (!st) {
-    rl.set(key, { count: 0, windowStart: now, blockedUntil: 0, lastSeen: now });
+    rl.set(key, { count: 1, windowStart: now, blockedUntil: 0, lastSeen: now });
     return { ok: true, retryAfterSec: 0 };
   }
 
@@ -197,6 +204,17 @@ function checkRateLimit(ip: string | null, nombre_usuario: string) {
     st.blockedUntil = 0;
   }
 
+  st.count += 1;
+
+  if (st.count >= RL_MAX) {
+    st.blockedUntil = now + RL_BLOCK_MS;
+    st.count = 0;
+    st.windowStart = now;
+    rl.set(key, st);
+    return { ok: false, retryAfterSec: Math.ceil(RL_BLOCK_MS / 1000) };
+  }
+
+  rl.set(key, st);
   return { ok: true, retryAfterSec: 0 };
 }
 
@@ -245,136 +263,8 @@ function startRlGcOnce() {
 
 const DUMMY_HASH_PROMISE = withAuthSlot(() => argon2Hash("dummy-password-not-valid"));
 
-/* ───────────────────────── Helpers ───────────────────────── */
-
-function getBearerToken(req: FastifyRequest) {
-  const h = (req.headers.authorization || "").trim();
-  const [type, token] = h.split(" ");
-  if (type !== "Bearer" || !token) return null;
-  return token;
-}
-
-// ✅ Incluimos academia_id en contexto de usuario autenticado
-type ReqUser = {
-  id: number;
-  nombre_usuario: string;
-  email: string | null;
-  rol_id: number;
-  estado_id: number;
-  academia_id: number | null;
-};
-
-async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
-  const token = getBearerToken(req);
-  if (!token) {
-    fireAndForgetAudit("access_denied", req, 401, null, { reason: "missing_token" });
-    return reply.code(401).send({ ok: false, message: "Token requerido" });
-  }
-
-  let decoded: any;
-  try {
-    decoded = jwt.verify(token, CONFIG.JWT_SECRET, {
-      issuer: JWT_ISSUER,
-      audience: JWT_AUDIENCE,
-    });
-  } catch {
-    fireAndForgetAudit("invalid_token", req, 401, null, { reason: "jwt_verify_failed" });
-    return reply.code(401).send({ ok: false, message: "Token inválido" });
-  }
-
-  const userId = Number(decoded?.sub);
-  if (!Number.isFinite(userId) || userId <= 0) {
-    fireAndForgetAudit("invalid_token", req, 401, null, { reason: "invalid_sub" });
-    return reply.code(401).send({ ok: false, message: "Token inválido" });
-  }
-
-  // ✅ academia_id puede venir en token (más rápido) pero validamos en DB igual
-  const tokenAcademiaId =
-    decoded?.academia_id === null || decoded?.academia_id === undefined
-      ? null
-      : Number(decoded?.academia_id);
-
-  try {
-    const [rows]: any = await db.query(
-      `SELECT id, nombre_usuario, email, rol_id, estado_id, academia_id
-       FROM usuarios
-       WHERE id = ?
-       LIMIT 1`,
-      [userId]
-    );
-
-    if (!rows?.length) {
-      fireAndForgetAudit("access_denied", req, 401, userId, { reason: "user_not_found" });
-      return reply.code(401).send({ ok: false, message: "No autorizado" });
-    }
-
-    const user = rows[0];
-    const rol = Number(user.rol_id);
-    const estado = Number(user.estado_id);
-    const academiaIdDb = user.academia_id === null ? null : Number(user.academia_id);
-
-    if (estado !== ACTIVE_ESTADO_ID) {
-      fireAndForgetAudit("access_denied", req, 403, user.id, {
-        reason: "user_inactive",
-        estado_id: estado,
-      });
-      return reply.code(403).send({ ok: false, message: "Usuario inactivo" });
-    }
-
-    if (!ALLOWED_PANEL_ROLES.has(rol)) {
-      fireAndForgetAudit("access_denied", req, 403, user.id, {
-        reason: "role_not_allowed",
-        rol_id: rol,
-      });
-      return reply.code(403).send({ ok: false, message: "No autorizado" });
-    }
-
-    // ✅ Consistencia: si token trae academia_id, y es distinto a DB => token “viejo”
-    if (
-      tokenAcademiaId !== null &&
-      academiaIdDb !== null &&
-      Number.isFinite(tokenAcademiaId) &&
-      tokenAcademiaId !== academiaIdDb
-    ) {
-      fireAndForgetAudit("invalid_token", req, 401, user.id, {
-        reason: "academy_mismatch",
-        tokenAcademiaId,
-        academiaIdDb,
-      });
-      return reply.code(401).send({ ok: false, message: "Token inválido" });
-    }
-
-    (req as any).user = {
-      id: user.id,
-      nombre_usuario: user.nombre_usuario,
-      email: user.email,
-      rol_id: rol,
-      estado_id: estado,
-      academia_id: academiaIdDb,
-    } satisfies ReqUser;
-
-    return;
-  } catch (err: any) {
-    req.log.error({ err }, "requireAuth failed");
-    fireAndForgetAudit("access_denied", req, 500, userId, {
-      reason: "db_error",
-      message: err?.message,
-    });
-    return reply.code(500).send({ ok: false, message: "Error de autenticación" });
-  }
-}
-
 /* ───────────────────────── Schemas ───────────────────────── */
 
-/**
- * ✅ Login multi-tenant:
- * - rol 3 (superadmin): NO requiere academia_id
- * - rol 1/2 (admin/staff): SÍ requiere academia_id
- *
- * Para esto:
- * - recibimos academia_id opcional
- * - después de obtener el usuario, aplicamos la regla.
- */
 const LoginSchema = z.object({
   nombre_usuario: z.string().trim().min(3).max(80),
   password: z.string().min(4).max(200),
@@ -422,11 +312,6 @@ export default async function auth(app: FastifyInstance) {
       const t0 = Date.now();
 
       try {
-        /**
-         * ✅ Importante:
-         * - En primer query NO filtramos por academia_id aún, porque no sabemos el rol.
-         * - Sí filtramos por estado activo para evitar comparar hashes de usuarios muertos.
-         */
         const [rows]: any = await db.query(
           `SELECT id, nombre_usuario, email, password, rol_id, estado_id, academia_id
            FROM usuarios
@@ -465,7 +350,7 @@ export default async function auth(app: FastifyInstance) {
               rl_keys: rl.size,
               trust_proxy: TRUST_PROXY,
             },
-            "AUTH_ADMIN_LOGIN_PERF"
+            "AUTH_PANEL_LOGIN_PERF"
           );
         }
 
@@ -483,12 +368,18 @@ export default async function auth(app: FastifyInstance) {
         const estado = Number(user.estado_id);
         const academiaIdDb = user.academia_id === null ? null : Number(user.academia_id);
 
+        if (!ALLOWED_PANEL_ROLES.has(rol)) {
+          fireAndForgetAudit("access_denied", req, 403, user.id, {
+            reason: "role_not_allowed",
+            rol_id: rol,
+          });
+          return reply.code(403).send({ ok: false, message: "No autorizado" });
+        }
+
         // ✅ Regla multi-tenant
         if (rol === 3) {
           // superadmin: NO requiere academia_id
-          // (puede venir igual, pero no lo usamos como “scope” obligatorio)
         } else {
-          // admin/staff: REQUIERE academia_id (y debe coincidir con el usuario)
           if (!academia_id_input || !Number.isFinite(academia_id_input) || academia_id_input <= 0) {
             fireAndForgetAudit("access_denied", req, 400, user.id, {
               reason: "missing_academia_id_for_role",
@@ -501,7 +392,6 @@ export default async function auth(app: FastifyInstance) {
           }
 
           if (!academiaIdDb || academiaIdDb !== academia_id_input) {
-            // No revelamos si existe otra academia o no: mensaje genérico
             fireAndForgetAudit("access_denied", req, 401, user.id, {
               reason: "academy_mismatch",
               rol_id: rol,
@@ -512,15 +402,15 @@ export default async function auth(app: FastifyInstance) {
           }
         }
 
+        // ✅ Payload compatible con authz.ts (extractUser lee decoded.user)
         const payload = {
-          sub: user.id,
-          nombre_usuario: user.nombre_usuario,
-          rol_id: rol,
-          type: "panel",
-          // ✅ academy scope:
-          // - superadmin: null (o puedes omitirlo)
-          // - admin/staff: academiaIdDb (validado)
-          academia_id: rol === 3 ? null : academiaIdDb,
+          user: {
+            type: "admin",
+            id: Number(user.id),
+            rol_id: rol,
+            nombre_usuario: String(user.nombre_usuario ?? ""),
+            academia_id: rol === 3 ? null : academiaIdDb,
+          },
         };
 
         const signOpts: SignOptions = {
@@ -529,7 +419,7 @@ export default async function auth(app: FastifyInstance) {
           expiresIn: (CONFIG.JWT_EXPIRES_IN as any) || "12h",
         };
 
-        const token = jwt.sign(payload, CONFIG.JWT_SECRET, signOpts);
+        const token = jwt.sign(payload, getJwtSecret(), signOpts);
 
         fireAndForgetAudit("login", req, 200, user.id, { ok: true, rol_id: rol });
 
@@ -557,11 +447,14 @@ export default async function auth(app: FastifyInstance) {
     }
   );
 
+  // Logout panel (roles 1/2/3)
   app.post(
     "/logout",
-    { preHandler: [requireAuth] },
+    { preHandler: [authzRequireAuth, authzRequireRoles([1, 2, 3])] },
     async (req: FastifyRequest, reply: FastifyReply) => {
-      const userId = (req as any).user?.id ?? null;
+      const auth = (req as any).auth;
+      const userId = auth?.type === "user" ? auth?.user_id ?? null : null;
+
       fireAndForgetAudit("logout", req, 200, userId);
       return reply.send({ ok: true, message: "logout" });
     }
