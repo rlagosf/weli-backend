@@ -17,8 +17,13 @@ import { registerSchemas } from "./schemas/schemas";
 const APP_NAME = "WELI";
 
 // ✅ Identidad JWT (alineada con auth.ts / auth_apoderado.ts)
-const JWT_ISSUER = String((CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER ?? "app").trim();
-const JWT_AUDIENCE = String((CONFIG as any)?.JWT_AUDIENCE ?? process.env.JWT_AUDIENCE ?? "web").trim();
+const JWT_ISSUER = String(
+  (CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER ?? "app"
+).trim();
+
+const JWT_AUDIENCE = String(
+  (CONFIG as any)?.JWT_AUDIENCE ?? process.env.JWT_AUDIENCE ?? "web"
+).trim();
 
 /* ───────────────────────────────────────────────
  * Crear instancia Fastify
@@ -32,45 +37,62 @@ const app = Fastify({
  * ─────────────────────────────────────────────── */
 async function bootstrap() {
   /* ───────── Middlewares base ───────── */
+
+  // ✅ Robustez: permitir headers extra desde env (evita futuros preflights rotos)
+  const envAllowed = String(process.env.CORS_ALLOWED_HEADERS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  // ✅ Base headers permitidos (incluye el que te rompe: x-academia-id)
+  const BASE_ALLOWED_HEADERS = [
+    "Content-Type",
+    "Authorization",
+    "Accept",
+    "Cache-Control",
+    "Pragma",
+    "Expires",
+    "x-academia-id", // ✅ CLAVE para tu superdashboard
+    "X-Academia-Id", // ✅ por si algún fetch lo manda con casing distinto
+  ];
+
+  const allowedHeaders = Array.from(
+    new Set([...BASE_ALLOWED_HEADERS, ...envAllowed])
+  );
+
   await app.register(cors, {
     origin: CONFIG.NODE_ENV === "production" ? CONFIG.CORS_ORIGIN : true,
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "Accept",
-      "Cache-Control",
-      "Pragma",
-      "Expires",
-    ],
+    allowedHeaders,
     exposedHeaders: ["Content-Length", "Content-Type", "Cache-Control"],
     maxAge: 86400,
   });
 
   // ✅ Helmet: en dev sin CSP para no romper fetch desde Vite/otro origin
   await app.register(helmet, {
-    contentSecurityPolicy: CONFIG.NODE_ENV === "production"
-      ? {
-          useDefaults: true,
-          directives: {
-            "default-src": ["'none'"],
-            "base-uri": ["'none'"],
-            "form-action": ["'none'"],
-            "frame-ancestors": ["'none'"],
-            "img-src": ["'self'", "data:"],
-            // En prod: permitir self + CORS_ORIGIN (si existe)
-            "connect-src": [
-              "'self'",
-              ...(CONFIG.CORS_ORIGIN
-                ? Array.isArray(CONFIG.CORS_ORIGIN)
-                  ? CONFIG.CORS_ORIGIN
-                  : [String(CONFIG.CORS_ORIGIN)]
-                : []),
-            ],
-          },
-        }
-      : false,
+    contentSecurityPolicy:
+      CONFIG.NODE_ENV === "production"
+        ? {
+            useDefaults: true,
+            directives: {
+              "default-src": ["'none'"],
+              "base-uri": ["'none'"],
+              "form-action": ["'none'"],
+              "frame-ancestors": ["'none'"],
+              "img-src": ["'self'", "data:"],
+              // En prod: permitir self + CORS_ORIGIN (si existe)
+              "connect-src": [
+                "'self'",
+                ...(CONFIG.CORS_ORIGIN
+                  ? Array.isArray(CONFIG.CORS_ORIGIN)
+                    ? CONFIG.CORS_ORIGIN
+                    : [String(CONFIG.CORS_ORIGIN)]
+                  : []),
+              ],
+            },
+          }
+        : false,
     frameguard: { action: "deny" },
     hsts:
       CONFIG.NODE_ENV === "production"
@@ -115,16 +137,26 @@ async function bootstrap() {
     time: new Date().toISOString(),
   });
 
-  app.get("/", async (_req, reply) => reply.header("Content-Type", HTML_CT).send(homeHtml()));
-  app.get("/api", async (_req, reply) => reply.header("Content-Type", HTML_CT).send(homeHtml()));
+  app.get("/", async (_req, reply) =>
+    reply.header("Content-Type", HTML_CT).send(homeHtml())
+  );
+  app.get("/api", async (_req, reply) =>
+    reply.header("Content-Type", HTML_CT).send(homeHtml())
+  );
 
-  app.get("/health", async (req, reply) => reply.header("Content-Type", JSON_CT).send(healthJson(req)));
-  app.get("/api/health", async (req, reply) => reply.header("Content-Type", JSON_CT).send(healthJson(req)));
+  app.get("/health", async (req, reply) =>
+    reply.header("Content-Type", JSON_CT).send(healthJson(req))
+  );
+  app.get("/api/health", async (req, reply) =>
+    reply.header("Content-Type", JSON_CT).send(healthJson(req))
+  );
 
   /* ───────── Favicon / robots ───────── */
   app.get("/favicon.ico", async (_req, reply) => reply.code(204).send());
   app.get("/robots.txt", async (_req, reply) =>
-    reply.header("Content-Type", "text/plain; charset=UTF-8").send("User-agent: *\nDisallow:\n")
+    reply
+      .header("Content-Type", "text/plain; charset=UTF-8")
+      .send("User-agent: *\nDisallow:\n")
   );
 
   /* ───────── Swagger (solo en dev) ───────── */
@@ -182,7 +214,7 @@ async function bootstrap() {
     /^\/auth-apoderado\/login(?:\/.*)?$/i,
     /^\/api\/auth-apoderado\/login(?:\/.*)?$/i,
 
-    // Logout (si lo dejas público, ok; si no, quítalo del PUBLIC)
+    // Logout
     /^\/auth\/logout(?:\/.*)?$/i,
     /^\/api\/auth\/logout(?:\/.*)?$/i,
 
@@ -200,6 +232,7 @@ async function bootstrap() {
   ];
 
   app.addHook("onRequest", async (req, reply) => {
+    // ✅ Preflight y HEAD no deben pasar por auth
     if (req.method === "OPTIONS" || req.method === "HEAD") return;
 
     const path = req.url.split("?")[0];
@@ -223,7 +256,8 @@ async function bootstrap() {
       if (payload?.type === "apoderado") {
         const authObj = {
           type: "apoderado" as const,
-          apoderado_id: payload?.apoderado_id != null ? Number(payload.apoderado_id) : undefined,
+          apoderado_id:
+            payload?.apoderado_id != null ? Number(payload.apoderado_id) : undefined,
           rut: String(payload.rut ?? ""),
         };
 
@@ -247,7 +281,7 @@ async function bootstrap() {
       // ✅ Nuevo estándar
       (req as any).auth = authObj;
 
-      // 🔁 Legacy (si middlewares/routers antiguos aún usan req.user)
+      // 🔁 Legacy (si routers antiguos aún usan req.user)
       (req as any).user = {
         type: "admin",
         id: authObj.user_id ?? null,
@@ -292,7 +326,9 @@ async function bootstrap() {
   const HOST = "0.0.0.0";
 
   await app.listen({ port: PORT, host: HOST });
-  app.log.info(`🟢 ${APP_NAME} API ready (env=${CONFIG.NODE_ENV}) — listening on ${HOST}:${PORT}`);
+  app.log.info(
+    `🟢 ${APP_NAME} API ready (env=${CONFIG.NODE_ENV}) — listening on ${HOST}:${PORT}`
+  );
 }
 
 bootstrap().catch((err) => {

@@ -5,7 +5,10 @@ import { verify as argon2Verify, hash as argon2Hash } from "@node-rs/argon2";
 import jwt, { SignOptions } from "jsonwebtoken";
 import { db } from "../db";
 import { CONFIG } from "../config";
-import { requireAuth as authzRequireAuth, requireRoles as authzRequireRoles } from "../middlewares/authz";
+import {
+  requireAuth as authzRequireAuth,
+  requireRoles as authzRequireRoles,
+} from "../middlewares/authz";
 
 /* ───────────────────────── Config ───────────────────────── */
 
@@ -13,25 +16,25 @@ import { requireAuth as authzRequireAuth, requireRoles as authzRequireRoles } fr
 const ALLOWED_PANEL_ROLES = new Set([1, 2, 3]);
 const ACTIVE_ESTADO_ID = 1;
 
-const JWT_ISSUER =
-  String((CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER ?? "app").trim();
-const JWT_AUDIENCE =
-  String((CONFIG as any)?.JWT_AUDIENCE ?? process.env.JWT_AUDIENCE ?? "web").trim();
+const JWT_ISSUER = String(
+  (CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER ?? "app"
+).trim();
+
+const JWT_AUDIENCE = String(
+  (CONFIG as any)?.JWT_AUDIENCE ?? process.env.JWT_AUDIENCE ?? "web"
+).trim();
 
 const PERF_LOG =
   String((CONFIG as any)?.AUTH_PERF_LOG ?? process.env.AUTH_PERF_LOG ?? "0") === "1";
 
 /**
- * ✅ NinjaHosting:
- * Por defecto NO confiamos en XFF (spoofable).
- * Activa solo si confirmas reverse proxy confiable que setea XFF.
+ * Por defecto NO confiamos en XFF.
  */
 const TRUST_PROXY =
   String((CONFIG as any)?.TRUST_PROXY ?? process.env.TRUST_PROXY ?? "0") === "1";
 
 /**
- * ✅ Disponibilidad:
- * Limita cuántos Argon2 pueden correr en paralelo (anti CPU spike).
+ * Limita cuántos Argon2 corren en paralelo.
  */
 const MAX_AUTH_CONCURRENCY = Math.max(
   2,
@@ -39,7 +42,7 @@ const MAX_AUTH_CONCURRENCY = Math.max(
 );
 
 /**
- * ✅ Evita inflar la tabla auth_audit con extras gigantes.
+ * Evita inflar auth_audit.extra
  */
 const AUDIT_EXTRA_MAX_CHARS = Math.max(
   512,
@@ -51,9 +54,49 @@ const AUDIT_EXTRA_MAX_CHARS = Math.max(
 );
 
 function getJwtSecret() {
-  const s = CONFIG.JWT_SECRET;
+  const s = CONFIG.JWT_SECRET ?? process.env.JWT_SECRET;
   if (!s) throw new Error("JWT_SECRET missing (CONFIG.JWT_SECRET)");
-  return s;
+  return String(s);
+}
+
+/**
+ * ✅ CORRECCIÓN TS:
+ * jsonwebtoken tipa expiresIn como `number | StringValue | undefined`.
+ * Por eso NO puede ser `string | number` genérico.
+ */
+type ExpiresIn = SignOptions["expiresIn"]; // number | StringValue | undefined
+
+function normalizeExpiresIn(v: unknown): ExpiresIn {
+  // default seguro
+  const FALLBACK: ExpiresIn = "12h";
+
+  if (v == null) return FALLBACK;
+
+  // number directo => segundos
+  if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+    return Math.floor(v);
+  }
+
+  // string => validar formato permitido
+  const s = String(v).trim();
+  if (!s) return FALLBACK;
+
+  // "3600" => seconds
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+    return FALLBACK;
+  }
+
+  // "12h", "30m", "15s", "7d", "1w", "500ms", "1y" (con o sin espacios)
+  const compact = s.replace(/\s+/g, "");
+  if (/^\d+(ms|s|m|h|d|w|y)$/i.test(compact)) {
+    // TS: esto calza con StringValue (string con unidad)
+    return compact as ExpiresIn;
+  }
+
+  // si llega basura, no arriesgamos
+  return FALLBACK;
 }
 
 /* ───────────────────────── Auditoría ───────────────────────── */
@@ -142,7 +185,13 @@ function createSemaphore(max: number) {
     if (next) next();
   };
 
-  return { acquire, release, get inFlight() { return inFlight; } };
+  return {
+    acquire,
+    release,
+    get inFlight() {
+      return inFlight;
+    },
+  };
 }
 
 const authSem = createSemaphore(MAX_AUTH_CONCURRENCY);
@@ -222,8 +271,12 @@ function registerFailed(ip: string | null, nombre_usuario: string) {
   const now = Date.now();
   const key = rlSafeKeysOk() ? rlKey(ip, nombre_usuario) : `${ip || "noip"}:*`;
 
-  const st =
-    rl.get(key) ?? { count: 0, windowStart: now, blockedUntil: 0, lastSeen: now };
+  const st = rl.get(key) ?? {
+    count: 0,
+    windowStart: now,
+    blockedUntil: 0,
+    lastSeen: now,
+  };
 
   st.lastSeen = now;
 
@@ -253,8 +306,7 @@ function startRlGcOnce() {
     const now = Date.now();
     for (const [k, st] of rl.entries()) {
       if (now - st.lastSeen > 60 * 60_000) rl.delete(k);
-      else if (st.blockedUntil === 0 && now - st.windowStart > 2 * RL_WINDOW_MS)
-        rl.delete(k);
+      else if (st.blockedUntil === 0 && now - st.windowStart > 2 * RL_WINDOW_MS) rl.delete(k);
     }
   }, RL_GC_INTERVAL_MS).unref?.();
 }
@@ -268,6 +320,7 @@ const DUMMY_HASH_PROMISE = withAuthSlot(() => argon2Hash("dummy-password-not-val
 const LoginSchema = z.object({
   nombre_usuario: z.string().trim().min(3).max(80),
   password: z.string().min(4).max(200),
+  // opcional
   academia_id: z.coerce.number().int().positive().optional(),
 });
 
@@ -376,50 +429,92 @@ export default async function auth(app: FastifyInstance) {
           return reply.code(403).send({ ok: false, message: "No autorizado" });
         }
 
-        // ✅ Regla multi-tenant
+        /* ───────── Regla multi-tenant (robusta) ───────── */
+        let academia_id_effective: number | null = null;
+
         if (rol === 3) {
-          // superadmin: NO requiere academia_id
+          academia_id_effective = null;
         } else {
-          if (!academia_id_input || !Number.isFinite(academia_id_input) || academia_id_input <= 0) {
+          if (academiaIdDb == null || !Number.isFinite(academiaIdDb) || academiaIdDb <= 0) {
             fireAndForgetAudit("access_denied", req, 400, user.id, {
-              reason: "missing_academia_id_for_role",
+              reason: "user_missing_academia_id_db",
               rol_id: rol,
             });
             return reply.code(400).send({
               ok: false,
-              message: "Debes seleccionar una academia para ingresar.",
+              message: "Usuario sin academia asignada. Contacta al administrador.",
             });
           }
 
-          if (!academiaIdDb || academiaIdDb !== academia_id_input) {
-            fireAndForgetAudit("access_denied", req, 401, user.id, {
-              reason: "academy_mismatch",
-              rol_id: rol,
-              academia_id_input,
-              academia_id_db: academiaIdDb,
-            });
-            return reply.code(401).send({ ok: false, message: "Credenciales inválidas" });
+          if (academia_id_input !== undefined) {
+            if (!Number.isFinite(academia_id_input) || academia_id_input <= 0) {
+              fireAndForgetAudit("access_denied", req, 400, user.id, {
+                reason: "invalid_academia_id_input",
+                rol_id: rol,
+                academia_id_input,
+              });
+              return reply.code(400).send({ ok: false, message: "academia_id inválido." });
+            }
+
+            if (academiaIdDb !== academia_id_input) {
+              fireAndForgetAudit("access_denied", req, 401, user.id, {
+                reason: "academy_mismatch",
+                rol_id: rol,
+                academia_id_input,
+                academia_id_db: academiaIdDb,
+              });
+              return reply.code(401).send({ ok: false, message: "Credenciales inválidas" });
+            }
           }
+
+          academia_id_effective = academiaIdDb;
         }
 
-        // ✅ Payload compatible con authz.ts (extractUser lee decoded.user)
+        // ✅ Payload dual (compatibilidad total)
+        // IMPORTANTE: sub debe ser string (si no, jsonwebtoken puede explotar)
+        const userIdStr = String(user.id);
+
         const payload = {
+          // top-level (para compat)
+          type: "admin",
+          sub: userIdStr,
+          rol_id: rol,
+          nombre_usuario: String(user.nombre_usuario ?? ""),
+          academia_id: academia_id_effective,
+
+          // nested (para authz.extractUser(decoded) => decoded.user)
           user: {
             type: "admin",
             id: Number(user.id),
             rol_id: rol,
             nombre_usuario: String(user.nombre_usuario ?? ""),
-            academia_id: rol === 3 ? null : academiaIdDb,
+            academia_id: academia_id_effective,
           },
         };
 
         const signOpts: SignOptions = {
           issuer: JWT_ISSUER,
           audience: JWT_AUDIENCE,
-          expiresIn: (CONFIG.JWT_EXPIRES_IN as any) || "12h",
+          expiresIn: normalizeExpiresIn(
+            (CONFIG as any).JWT_EXPIRES_IN ?? process.env.JWT_EXPIRES_IN
+          ),
+          // ✅ NO subject aquí: ya usamos sub en payload (evita duplicación)
         };
 
-        const token = jwt.sign(payload, getJwtSecret(), signOpts);
+        let token: string;
+        try {
+          token = jwt.sign(payload, getJwtSecret(), signOpts);
+        } catch (e: any) {
+          req.log.error(
+            { err: e, issuer: JWT_ISSUER, audience: JWT_AUDIENCE, expiresIn: signOpts.expiresIn },
+            "[auth/login] jwt.sign failed"
+          );
+          fireAndForgetAudit("access_denied", req, 500, user.id, {
+            reason: "jwt_sign_failed",
+            message: e?.message,
+          });
+          return reply.code(500).send({ ok: false, message: "Error procesando login" });
+        }
 
         fireAndForgetAudit("login", req, 200, user.id, { ok: true, rol_id: rol });
 
@@ -433,7 +528,7 @@ export default async function auth(app: FastifyInstance) {
             email: user.email,
             rol_id: rol,
             estado_id: estado,
-            academia_id: rol === 3 ? null : academiaIdDb,
+            academia_id: academia_id_effective,
           },
         });
       } catch (err: any) {
