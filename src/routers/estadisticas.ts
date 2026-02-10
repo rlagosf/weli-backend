@@ -1,5 +1,5 @@
 // src/routes/estadisticas.ts
-import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
+import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db";
 import { requireAuth, requireRoles } from "../middlewares/authz";
@@ -24,13 +24,21 @@ const PageQuery = z.object({
   jugador_id: z.coerce.number().int().positive().optional(),
 });
 
-// Base para crear/asegurar stats acumuladas del jugador
+// ✅ agregado global (SUM) por deporte, opcional academia, opcional partido
+const AggregateQuery = z.object({
+  academia_id: z.coerce.number().int().positive().optional(),
+  deporte_id: z.coerce.number().int().positive(), // 🔥 requerido
+  // si no viene => acumulado (NULL). Si viene número => por partido específico. Si viene "null" => acumulado
+  partido_id: z
+    .union([z.coerce.number().int().positive(), z.literal("null"), z.null()])
+    .optional(),
+});
+
 const CreateSchema = z
   .object({
     academia_id: z.coerce.number().int().positive(),
     deporte_id: z.coerce.number().int().positive(),
     jugador_id: z.coerce.number().int().positive(),
-    // futuro: partido/fecha si lo necesitas (no obligatorio ahora)
     partido_id: z.coerce.number().int().positive().nullable().optional(),
   })
   .passthrough();
@@ -60,7 +68,9 @@ const baseKeys = new Set([
   "sanciones_federativas",
 ]);
 
-// Whitelist por deporte (detalle)
+/**
+ * ✅ Whitelist por deporte (detalle)
+ */
 const allowedSportKeys: Record<number, Set<string>> = {
   1: new Set([
     "goles",
@@ -128,22 +138,24 @@ const allowedSportKeys: Record<number, Set<string>> = {
     "juegos_ganados_total",
   ]),
   4: new Set([
-    "primer_servicio_pct",
-    "saques_ganadores",
+    "primer_saque_pct",
     "puntos_primer_saque",
-    "saque_dir_t",
-    "saque_dir_cristal",
-    "resto_paralelo",
-    "resto_cruzado",
-    "resto_globo",
-    "resto_directo",
-    "voleas_ganadoras_pct",
-    "errores_volea_no_forzados",
-    "remates_ganadores_pct",
+    "puntos_segundo_saque",
     "puntos_oro_jugados",
     "puntos_oro_ganados",
+    "puntos_oro_ganados_con_saque",
     "errores_no_forzados",
-    "golpes_ganadores",
+    "errores_forzados",
+    "winners",
+    "tiempo_red_pct",
+    "tiempo_fondo_pct",
+    "puntos_red_ganados",
+    "voleas_total",
+    "voleas_ganadoras",
+    "voleas_errores",
+    "remates_total",
+    "remates_ganadores",
+    "remates_errores",
   ]),
   5: new Set([
     "efectividad_servicio_pct",
@@ -177,16 +189,16 @@ const allowedSportKeys: Record<number, Set<string>> = {
   ]),
 };
 
-// floats (lo demás int)
 const floatKeys = new Set([
   "distancia_recorrida_km",
   "sideout_pct",
   "breakpoints_pct",
   "primer_servicio_pct",
-  "voleas_ganadoras_pct",
-  "remates_ganadores_pct",
+  "primer_saque_pct",
   "efectividad_servicio_pct",
   "efectividad_devolucion_pct",
+  "tiempo_red_pct",
+  "tiempo_fondo_pct",
   "ts_pct",
   "efg_pct",
   "usg_pct",
@@ -251,7 +263,6 @@ async function ensureStatsBase(
   jugador_id: number,
   partido_id: number | null
 ): Promise<number> {
-  // acumulado: partido_id NULL por defecto
   await db.query(
     `
     INSERT INTO stats_base (academia_id, deporte_id, jugador_id, partido_id)
@@ -291,7 +302,10 @@ async function ensureSportRow(deporte_id: number, stats_id: number) {
 }
 
 async function getJoinedStatsByStatsId(stats_id: number) {
-  const [baseRows]: any = await db.query("SELECT * FROM stats_base WHERE id = ? LIMIT 1", [stats_id]);
+  const [baseRows]: any = await db.query(
+    "SELECT * FROM stats_base WHERE id = ? LIMIT 1",
+    [stats_id]
+  );
   const base = baseRows?.[0];
   if (!base) return null;
 
@@ -299,7 +313,10 @@ async function getJoinedStatsByStatsId(stats_id: number) {
   const table = SPORT_TABLE[deporte_id];
   if (!table) return { base, sport: null };
 
-  const [sportRows]: any = await db.query(`SELECT * FROM \`${table}\` WHERE stats_id = ? LIMIT 1`, [stats_id]);
+  const [sportRows]: any = await db.query(
+    `SELECT * FROM \`${table}\` WHERE stats_id = ? LIMIT 1`,
+    [stats_id]
+  );
   return { base, sport: sportRows?.[0] ?? null };
 }
 
@@ -307,10 +324,31 @@ async function getJoinedStatsByJugadorId(jugador_id: number) {
   const scope = await getJugadorScope(jugador_id);
   if (!scope) return null;
 
-  const stats_id = await ensureStatsBase(scope.academia_id, scope.deporte_id, scope.jugador_id, null);
+  const stats_id = await ensureStatsBase(
+    scope.academia_id,
+    scope.deporte_id,
+    scope.jugador_id,
+    null
+  );
   await ensureSportRow(scope.deporte_id, stats_id);
 
   return await getJoinedStatsByStatsId(stats_id);
+}
+
+function buildSportJoinAndSelect(deporte_id?: number) {
+  if (!deporte_id || !SPORT_TABLE[deporte_id]) {
+    return { joinSql: "", selectColsSql: "" };
+  }
+
+  const table = SPORT_TABLE[deporte_id];
+  const sportKeys = allowedSportKeys[deporte_id] ?? new Set<string>();
+
+  const joinSql = `LEFT JOIN \`${table}\` sd ON sd.stats_id = sb.id`;
+
+  const cols = [...sportKeys].map((k) => `sd.\`${k}\` AS \`${k}\``).join(", ");
+  const selectColsSql = cols ? `, ${cols}` : "";
+
+  return { joinSql, selectColsSql };
 }
 
 /* ─────────────────── Router ─────────────────── */
@@ -331,22 +369,199 @@ export default async function estadisticas(app: FastifyInstance) {
     timestamp: new Date().toISOString(),
   }));
 
-  // Debug auth (solo lectura)
+  // Debug auth
   app.get("/debug/whoami", { preHandler: canRead }, async (req: any, reply) => {
-    return reply.send({
-      ok: true,
-      user: req.user ?? null,
-    });
+    return reply.send({ ok: true, user: req.user ?? null });
+  });
+
+  /**
+   * ✅ AGGREGATE (SUM) — lo que necesitas para Estadísticas Globales
+   * GET /estadisticas/aggregate?deporte_id=1&academia_id=123
+   * - deporte_id requerido
+   * - academia_id opcional
+   * - partido_id opcional:
+   *   - omitido => acumulado (sb.partido_id IS NULL)
+   *   - partido_id=99 => por ese partido
+   *   - partido_id=null => acumulado
+   */
+  app.get("/aggregate", { preHandler: canRead }, async (req, reply) => {
+    const parsed = AggregateQuery.safeParse((req as any).query);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        ok: false,
+        message: "Query inválida",
+        errors: parsed.error.flatten(),
+      });
+    }
+
+    const { academia_id, deporte_id } = parsed.data;
+
+    const table = SPORT_TABLE[deporte_id];
+    if (!table) {
+      return reply.code(400).send({ ok: false, message: "DEPORTE_NO_SOPORTADO" });
+    }
+
+    // partido_id normalizado
+    let partido_id: number | null | undefined = undefined;
+    if ("partido_id" in parsed.data) {
+      const v: any = (parsed.data as any).partido_id;
+      if (v === "null" || v === null) partido_id = null;
+      else if (typeof v === "number") partido_id = v;
+      else partido_id = undefined;
+    }
+
+    const where: string[] = ["sb.deporte_id = ?"];
+    const params: any[] = [deporte_id];
+
+    if (academia_id) {
+      where.push("sb.academia_id = ?");
+      params.push(academia_id);
+    }
+
+    // ✅ default acumulado si no mandan partido_id
+    if (partido_id === undefined || partido_id === null) {
+      where.push("sb.partido_id IS NULL");
+    } else {
+      where.push("sb.partido_id = ?");
+      params.push(partido_id);
+    }
+
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+
+    const sportKeys = allowedSportKeys[deporte_id] ?? new Set<string>();
+
+    // SUM base
+    const baseSumCols = [...baseKeys]
+      .map((k) => `SUM(COALESCE(sb.\`${k}\`,0)) AS \`${k}\``)
+      .join(", ");
+
+    // SUM sport
+    const sportSumCols = [...sportKeys]
+      .map((k) => `SUM(COALESCE(sd.\`${k}\`,0)) AS \`${k}\``)
+      .join(", ");
+
+    // métricas extra: cuántas filas base y cuántas faltan en detalle
+    try {
+      const [rows]: any = await db.query(
+        `
+        SELECT
+          COUNT(*) AS rows_base,
+          SUM(CASE WHEN sd.stats_id IS NULL THEN 1 ELSE 0 END) AS rows_detail_missing,
+          ${baseSumCols}
+          ${sportSumCols ? `, ${sportSumCols}` : ""}
+        FROM stats_base sb
+        LEFT JOIN \`${table}\` sd ON sd.stats_id = sb.id
+        ${whereSql}
+        `,
+        params
+      );
+
+      const r = rows?.[0] ?? {};
+      const totals: Record<string, number> = {};
+
+      // normaliza numeritos
+      for (const k of [...baseKeys, ...sportKeys]) {
+        const val = r?.[k];
+        const n = Number(val ?? 0);
+        totals[k] = Number.isFinite(n) ? n : 0;
+      }
+
+      return reply.send({
+        ok: true,
+        scope: {
+          deporte_id,
+          academia_id: academia_id ?? null,
+          partido_id: partido_id ?? null,
+          table,
+        },
+        meta: {
+          rows_base: Number(r?.rows_base ?? 0) || 0,
+          rows_detail_missing: Number(r?.rows_detail_missing ?? 0) || 0,
+        },
+        totals,
+      });
+    } catch (err: any) {
+      return reply.code(500).send({
+        ok: false,
+        message: "Error al agregar estadísticas",
+        error: sqlErr(err),
+      });
+    }
+  });
+
+  /**
+   * ✅ REPAIR faltantes (crea filas de detalle que falten)
+   * Útil para arreglar ese "faltantes = 1"
+   * GET /estadisticas/repair-missing?deporte_id=1&academia_id=123
+   */
+  app.get("/repair-missing", { preHandler: canWrite }, async (req, reply) => {
+    const parsed = AggregateQuery.safeParse((req as any).query);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        ok: false,
+        message: "Query inválida",
+        errors: parsed.error.flatten(),
+      });
+    }
+
+    const { academia_id, deporte_id } = parsed.data;
+    const table = SPORT_TABLE[deporte_id];
+    if (!table) return reply.code(400).send({ ok: false, message: "DEPORTE_NO_SOPORTADO" });
+
+    const where: string[] = ["sb.deporte_id = ?", "sb.partido_id IS NULL"];
+    const params: any[] = [deporte_id];
+    if (academia_id) {
+      where.push("sb.academia_id = ?");
+      params.push(academia_id);
+    }
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+
+    try {
+      // toma stats_base que no tengan detalle
+      const [missing]: any = await db.query(
+        `
+        SELECT sb.id AS stats_id
+        FROM stats_base sb
+        LEFT JOIN \`${table}\` sd ON sd.stats_id = sb.id
+        ${whereSql}
+          AND sd.stats_id IS NULL
+        LIMIT 5000
+        `,
+        params
+      );
+
+      const ids = (missing || []).map((x: any) => Number(x.stats_id)).filter((n: number) => Number.isFinite(n) && n > 0);
+
+      for (const id of ids) {
+        await ensureSportRow(deporte_id, id);
+      }
+
+      return reply.send({
+        ok: true,
+        deporte_id,
+        academia_id: academia_id ?? null,
+        repaired: ids.length,
+      });
+    } catch (err: any) {
+      return reply.code(500).send({
+        ok: false,
+        message: "Error al reparar faltantes",
+        error: sqlErr(err),
+      });
+    }
   });
 
   /**
    * ✅ LISTADO (paginado) desde stats_base (acumulado por defecto: partido_id NULL)
-   * filtros: academia_id, deporte_id, jugador_id
    */
   app.get("/", { preHandler: canRead }, async (req, reply) => {
     const parsed = PageQuery.safeParse((req as any).query);
     if (!parsed.success) {
-      return reply.code(400).send({ ok: false, message: "Query inválida", errors: parsed.error.flatten() });
+      return reply.code(400).send({
+        ok: false,
+        message: "Query inválida",
+        errors: parsed.error.flatten(),
+      });
     }
 
     const { limit, offset, academia_id, deporte_id, jugador_id } = parsed.data;
@@ -368,46 +583,31 @@ export default async function estadisticas(app: FastifyInstance) {
     }
 
     const whereSql = `WHERE ${where.join(" AND ")}`;
-
-    // ✅ JOIN dinámico a la tabla detalle SOLO si viene deporte_id
-    let sportJoinSql = "";
-    let sportSelectSql = "";
-
-    if (deporte_id && SPORT_TABLE[deporte_id]) {
-      const table = SPORT_TABLE[deporte_id];
-      const sportKeys = allowedSportKeys[deporte_id] ?? new Set<string>();
-
-      // alias fijo para el detalle
-      sportJoinSql = `LEFT JOIN \`${table}\` sd ON sd.stats_id = sb.id`;
-
-      // selecciona SOLO las columnas whitelisteadas (seguro y consistente)
-      const sportCols = [...sportKeys].map((k) => `sd.\`${k}\` AS \`${k}\``).join(", ");
-      if (sportCols) sportSelectSql = `, ${sportCols}`;
-    }
+    const { joinSql, selectColsSql } = buildSportJoinAndSelect(deporte_id);
 
     try {
       const [rows]: any = await db.query(
         `
-      SELECT
-        sb.id AS stats_id,
-        sb.academia_id,
-        sb.deporte_id,
-        sb.jugador_id,
-        sb.minutos_jugados,
-        sb.partidos_jugados,
-        sb.lesiones,
-        sb.dias_baja,
-        sb.sanciones_federativas,
-        j.nombre_jugador,
-        j.rut_jugador
-        ${sportSelectSql}
-      FROM stats_base sb
-      JOIN jugadores j ON j.id = sb.jugador_id
-      ${sportJoinSql}
-      ${whereSql}
-      ORDER BY sb.id DESC
-      LIMIT ? OFFSET ?
-      `,
+        SELECT
+          sb.id AS stats_id,
+          sb.academia_id,
+          sb.deporte_id,
+          sb.jugador_id,
+          sb.minutos_jugados,
+          sb.partidos_jugados,
+          sb.lesiones,
+          sb.dias_baja,
+          sb.sanciones_federativas,
+          j.nombre_jugador,
+          j.rut_jugador
+          ${selectColsSql}
+        FROM stats_base sb
+        JOIN jugadores j ON j.id = sb.jugador_id
+        ${joinSql}
+        ${whereSql}
+        ORDER BY sb.id DESC
+        LIMIT ? OFFSET ?
+        `,
         [...params, limit, offset]
       );
 
@@ -419,24 +619,101 @@ export default async function estadisticas(app: FastifyInstance) {
         joined_sport: Boolean(deporte_id && SPORT_TABLE[deporte_id]),
         note: deporte_id
           ? undefined
-          : "Para incluir métricas de deporte (goles, asistencias, etc.) debes enviar deporte_id en la query.",
+          : "Para incluir métricas del deporte, envía deporte_id (1..6).",
       });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al listar", error: sqlErr(err) });
+      return reply.code(500).send({
+        ok: false,
+        message: "Error al listar",
+        error: sqlErr(err),
+      });
     }
   });
 
-
   /**
-   * ✅ GET por stats_id (cabecera + detalle)
-   * /estadisticas/:id  -> id = stats_id (stats_base.id)
-   *
-   * OJO: esta ruta debe ir DESPUÉS de rutas específicas para no pisarlas.
+   * ✅ Alias: /estadisticas/joined -> usa el mismo handler que "/"
+   * (para compat con front que insista con /joined)
    */
+  app.get("/joined", { preHandler: canRead }, async (req, reply) => {
+    // reusa exactamente la misma lógica: simplemente redirige internamente
+    // (sin 302 para no romper CORS/clients)
+    (req as any).url = "/";
+    // Llamamos manualmente al handler de "/"
+    // Fastify no expone fácil el handler ya registrado, así que duplicamos por pragmatismo:
+    const parsed = PageQuery.safeParse((req as any).query);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        ok: false,
+        message: "Query inválida",
+        errors: parsed.error.flatten(),
+      });
+    }
+
+    const { limit, offset, academia_id, deporte_id, jugador_id } = parsed.data;
+
+    const where: string[] = ["sb.partido_id IS NULL"];
+    const params: any[] = [];
+
+    if (academia_id) {
+      where.push("sb.academia_id = ?");
+      params.push(academia_id);
+    }
+    if (deporte_id) {
+      where.push("sb.deporte_id = ?");
+      params.push(deporte_id);
+    }
+    if (jugador_id) {
+      where.push("sb.jugador_id = ?");
+      params.push(jugador_id);
+    }
+
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+    const { joinSql, selectColsSql } = buildSportJoinAndSelect(deporte_id);
+
+    try {
+      const [rows]: any = await db.query(
+        `
+        SELECT
+          sb.id AS stats_id,
+          sb.academia_id,
+          sb.deporte_id,
+          sb.jugador_id,
+          sb.minutos_jugados,
+          sb.partidos_jugados,
+          sb.lesiones,
+          sb.dias_baja,
+          sb.sanciones_federativas,
+          j.nombre_jugador,
+          j.rut_jugador
+          ${selectColsSql}
+        FROM stats_base sb
+        JOIN jugadores j ON j.id = sb.jugador_id
+        ${joinSql}
+        ${whereSql}
+        ORDER BY sb.id DESC
+        LIMIT ? OFFSET ?
+        `,
+        [...params, limit, offset]
+      );
+
+      return reply.send({
+        ok: true,
+        items: rows,
+        limit,
+        offset,
+        joined_sport: Boolean(deporte_id && SPORT_TABLE[deporte_id]),
+      });
+    } catch (err: any) {
+      return reply.code(500).send({
+        ok: false,
+        message: "Error al listar (joined)",
+        error: sqlErr(err),
+      });
+    }
+  });
 
   /**
    * ✅ Conveniencia por jugador_id
-   * GET /estadisticas/by-jugador/:jugador_id
    */
   app.get("/by-jugador/:jugador_id", { preHandler: canRead }, async (req, reply) => {
     const p = JugadorIdParam.safeParse((req as any).params);
@@ -456,7 +733,6 @@ export default async function estadisticas(app: FastifyInstance) {
 
   /**
    * ✅ Conveniencia por RUT
-   * GET /estadisticas/by-rut/:rut
    */
   app.get("/by-rut/:rut", { preHandler: canRead }, async (req, reply) => {
     const parsed = RutParam.safeParse((req as any).params);
@@ -481,8 +757,6 @@ export default async function estadisticas(app: FastifyInstance) {
 
   /**
    * ✅ POST /estadisticas
-   * WRITE: roles 1 y 3
-   * Crea/asegura stats_base + fila detalle según deporte y actualiza con payload.
    */
   app.post("/", { preHandler: canWrite }, async (req, reply) => {
     const parsed = CreateSchema.safeParse((req as any).body);
@@ -501,7 +775,6 @@ export default async function estadisticas(app: FastifyInstance) {
     const table = SPORT_TABLE[deporte_id];
     if (!table) return reply.code(400).send({ ok: false, message: "DEPORTE_NO_SOPORTADO" });
 
-    // Validación dura: jugador pertenece a academia/deporte
     const scope = await getJugadorScope(jugador_id);
     if (!scope) return reply.code(404).send({ ok: false, message: "Jugador no encontrado" });
 
@@ -516,27 +789,17 @@ export default async function estadisticas(app: FastifyInstance) {
 
     const { base, sport, rejected } = pickBaseAndSport(deporte_id, raw);
 
-    // nunca permitir scope en updates
-    delete (base as any).academia_id;
-    delete (base as any).deporte_id;
-    delete (base as any).jugador_id;
-    delete (base as any).partido_id;
-
-    delete (sport as any).academia_id;
-    delete (sport as any).deporte_id;
-    delete (sport as any).jugador_id;
-    delete (sport as any).partido_id;
+    for (const k of ["academia_id", "deporte_id", "jugador_id", "partido_id"]) {
+      delete (base as any)[k];
+      delete (sport as any)[k];
+    }
 
     try {
       const stats_id = await ensureStatsBase(academia_id, deporte_id, jugador_id, partido_id);
       await ensureSportRow(deporte_id, stats_id);
 
-      if (Object.keys(base).length) {
-        await db.query("UPDATE stats_base SET ? WHERE id = ?", [base, stats_id]);
-      }
-      if (Object.keys(sport).length) {
-        await db.query(`UPDATE \`${table}\` SET ? WHERE stats_id = ?`, [sport, stats_id]);
-      }
+      if (Object.keys(base).length) await db.query("UPDATE stats_base SET ? WHERE id = ?", [base, stats_id]);
+      if (Object.keys(sport).length) await db.query(`UPDATE \`${table}\` SET ? WHERE stats_id = ?`, [sport, stats_id]);
 
       const joined = await getJoinedStatsByStatsId(stats_id);
       return reply.code(201).send({ ok: true, stats_id, item: joined, rejected_keys: rejected });
@@ -546,8 +809,7 @@ export default async function estadisticas(app: FastifyInstance) {
   });
 
   /**
-   * ✅ PUT /estadisticas/:id  (id = stats_id)
-   * WRITE: roles 1 y 3
+   * ✅ PUT /estadisticas/:id
    */
   app.put("/:id", { preHandler: canWrite }, async (req, reply) => {
     const pid = IdParam.safeParse((req as any).params);
@@ -572,16 +834,10 @@ export default async function estadisticas(app: FastifyInstance) {
 
       const { base, sport, rejected } = pickBaseAndSport(deporte_id, raw);
 
-      // impedir scope accidental
-      delete (base as any).academia_id;
-      delete (base as any).deporte_id;
-      delete (base as any).jugador_id;
-      delete (base as any).partido_id;
-
-      delete (sport as any).academia_id;
-      delete (sport as any).deporte_id;
-      delete (sport as any).jugador_id;
-      delete (sport as any).partido_id;
+      for (const k of ["academia_id", "deporte_id", "jugador_id", "partido_id"]) {
+        delete (base as any)[k];
+        delete (sport as any)[k];
+      }
 
       if (!Object.keys(base).length && !Object.keys(sport).length) {
         return reply.code(400).send({
@@ -593,12 +849,8 @@ export default async function estadisticas(app: FastifyInstance) {
 
       await ensureSportRow(deporte_id, stats_id);
 
-      if (Object.keys(base).length) {
-        await db.query("UPDATE stats_base SET ? WHERE id = ?", [base, stats_id]);
-      }
-      if (Object.keys(sport).length) {
-        await db.query(`UPDATE \`${table}\` SET ? WHERE stats_id = ?`, [sport, stats_id]);
-      }
+      if (Object.keys(base).length) await db.query("UPDATE stats_base SET ? WHERE id = ?", [base, stats_id]);
+      if (Object.keys(sport).length) await db.query(`UPDATE \`${table}\` SET ? WHERE stats_id = ?`, [sport, stats_id]);
 
       const joined = await getJoinedStatsByStatsId(stats_id);
       return reply.send({ ok: true, stats_id, item: joined, rejected_keys: rejected });
@@ -608,9 +860,7 @@ export default async function estadisticas(app: FastifyInstance) {
   });
 
   /**
-   * ✅ DELETE /estadisticas/:id (id = stats_id)
-   * WRITE: roles 1 y 3
-   * Borra stats_base => cascada borra detalle
+   * ✅ DELETE /estadisticas/:id
    */
   app.delete("/:id", { preHandler: canWrite }, async (req, reply) => {
     const parsed = IdParam.safeParse((req as any).params);
@@ -620,7 +870,6 @@ export default async function estadisticas(app: FastifyInstance) {
 
     try {
       const [result]: any = await db.query("DELETE FROM stats_base WHERE id = ?", [stats_id]);
-
       if (result.affectedRows === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       return reply.send({ ok: true, deleted: stats_id });
@@ -630,8 +879,8 @@ export default async function estadisticas(app: FastifyInstance) {
   });
 
   /**
-   * ✅ GET /estadisticas/:id  (READ)
-   * lo ponemos al final para no pisar /by-rut y /by-jugador
+   * ✅ GET /estadisticas/:id
+   * (al final para no pisar /aggregate, /joined, /by-*)
    */
   app.get("/:id", { preHandler: canRead }, async (req, reply) => {
     const parsed = IdParam.safeParse((req as any).params);

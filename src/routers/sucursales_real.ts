@@ -15,16 +15,17 @@ const IdParam = z.object({ id: z.coerce.number().int().positive() });
 const CreateSchema = z
   .object({
     nombre: z.string().trim().min(3, "El nombre debe tener al menos 3 caracteres").max(100, "Máximo 100 caracteres"),
-    // 👇 solo útil para superadmin (rol 3). Para rol 1 se fuerza desde token.
-    academia_id: z.coerce.number().int().positive().optional(),
   })
   .strict();
 
 const UpdateSchema = z
   .object({
-    nombre: z.string().trim().min(3, "El nombre debe tener al menos 3 caracteres").max(100, "Máximo 100 caracteres").optional(),
-    // 👇 no permitimos mover sucursal de academia por API (evita cagazos)
-    // academia_id: jamás por update
+    nombre: z
+      .string()
+      .trim()
+      .min(3, "El nombre debe tener al menos 3 caracteres")
+      .max(100, "Máximo 100 caracteres")
+      .optional(),
   })
   .strict();
 
@@ -37,58 +38,56 @@ const PageQuery = z.object({
 function normalize(row: any) {
   return {
     id: Number(row.id),
-    academia_id: Number(row.academia_id),
+    academia_id: row.academia_id != null ? Number(row.academia_id) : null,
     nombre: String(row.nombre ?? ""),
   };
 }
 
-// ───────── auth helpers (academy scope) ─────────
-function getAuth(req: any) {
-  return (req as any).auth as
-    | { type: "user"; user_id?: number; rol_id?: number; academia_id?: number }
-    | { type: "apoderado"; rut: string; apoderado_id?: number }
-    | undefined;
+/* ──────────────────────────────────────────────────────────────
+   Multi-academia helpers (WELI) — MISMA REGLA QUE POSICIONES
+   Regla:
+   - rol 1/2: academia_id desde token
+   - rol 3: academia_id desde header x-academia-id (obligatorio)
+────────────────────────────────────────────────────────────── */
+function getRolId(req: FastifyRequest): number {
+  const a: any = (req as any).auth;
+  const u: any = (req as any).user;
+  const raw = a?.rol_id ?? u?.rol_id ?? u?.role_id ?? u?.role ?? 0;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
 }
 
-function isSuper(req: any) {
-  const a = getAuth(req);
-  return a?.type === "user" && Number(a.rol_id) === 3;
-}
+function getEffectiveAcademiaId(req: FastifyRequest): number {
+  const rol = getRolId(req);
 
-/**
- * Retorna academia_id si aplica (rol 1/2), o null si es superadmin.
- * Si falta academia_id en rol 1/2 => 403.
- */
-function getAcademiaIdOr403(req: any, reply: FastifyReply): number | null {
-  const a = getAuth(req);
-  if (!a || a.type !== "user") {
-    reply.code(403).send({ ok: false, message: "FORBIDDEN" });
-    return 0 as any;
+  if (rol === 3) {
+    const hdr = req.headers["x-academia-id"];
+    const raw = Array.isArray(hdr) ? hdr[0] : hdr;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw Object.assign(new Error("FORBIDDEN: falta x-academia-id para superadmin"), {
+        statusCode: 403,
+      });
+    }
+    return n;
   }
 
-  if (Number(a.rol_id) === 3) return null; // superadmin: sin filtro
+  const a: any = (req as any).auth;
+  const u: any = (req as any).user;
+  const raw =
+    a?.academia_id ??
+    u?.academia_id ??
+    u?.academy_id ??
+    u?.academiaId ??
+    u?.academyId ??
+    u?.academia ??
+    u?.academy;
 
-  const academia_id = Number(a.academia_id ?? 0);
-  if (!Number.isFinite(academia_id) || academia_id <= 0) {
-    reply.code(403).send({ ok: false, message: "ACADEMIA_REQUIRED" });
-    return 0 as any;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
   }
-  return academia_id;
-}
-
-async function assertSucursalInAcademiaOr404(id: number, academia_id: number | null, reply: FastifyReply) {
-  if (!academia_id) return true; // super bypass
-
-  const [rows]: any = await db.query(
-    "SELECT id FROM sucursales_real WHERE id = ? AND academia_id = ? LIMIT 1",
-    [id, academia_id]
-  );
-  if (!rows?.length) {
-    // multi-tenant: mejor 404 que 403 (no filtra existencia)
-    reply.code(404).send({ ok: false, message: "Sucursal no encontrada" });
-    return false;
-  }
-  return true;
+  return n;
 }
 
 // escape mínimo para LIKE
@@ -97,11 +96,9 @@ function escapeLike(s: string) {
 }
 
 export default async function sucursales_real(app: FastifyInstance) {
-  // ✅ Permisos reales
   const canRead = [requireAuth, requireRoles([1, 2, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  // ─────────────────── HEALTH (READ) ───────────────────
   app.get("/health", { preHandler: canRead }, async (_req, reply) => {
     reply.header("Cache-Control", "no-store");
     return {
@@ -111,27 +108,20 @@ export default async function sucursales_real(app: FastifyInstance) {
     };
   });
 
-  // ─────────────────── LISTADO (READ) ───────────────────
+  // GET /sucursales-real (scoped)
   app.get("/", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
-    const parsed = PageQuery.safeParse((req as any).query);
+    const parsed = PageQuery.safeParse(req.query);
     if (!parsed.success) {
       return reply.code(400).send({ ok: false, message: "Query inválida", errors: parsed.error.flatten() });
     }
 
     const { limit, offset, q } = parsed.data;
 
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-
     try {
-      let sql = "SELECT id, academia_id, nombre FROM sucursales_real WHERE 1=1";
-      const args: any[] = [];
+      const academiaId = getEffectiveAcademiaId(req);
 
-      // filtro academia (rol 1/2)
-      if (academia_id) {
-        sql += " AND academia_id = ?";
-        args.push(academia_id);
-      }
+      let sql = "SELECT id, academia_id, nombre FROM sucursales_real WHERE academia_id = ?";
+      const args: any[] = [academiaId];
 
       if (q) {
         sql += " AND nombre LIKE ? ESCAPE '\\\\'";
@@ -152,83 +142,52 @@ export default async function sucursales_real(app: FastifyInstance) {
         count: rows?.length ?? 0,
       });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al listar sucursales", detail: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      return reply.code(code).send({ ok: false, message: "Error al listar sucursales", detail: err?.message });
     }
   });
 
-  // ─────────────────── OBTENER POR ID (READ) ───────────────────
+  // GET /sucursales-real/:id (scoped)
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
-    const parsed = IdParam.safeParse((req as any).params);
+    const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
-    const id = parsed.data.id;
-
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-
-    const okOwn = await assertSucursalInAcademiaOr404(id, academia_id, reply);
-    if (!okOwn) return;
-
     try {
-      const whereAcademia = academia_id ? " AND academia_id = ?" : "";
-      const params = academia_id ? [id, academia_id] : [id];
+      const academiaId = getEffectiveAcademiaId(req);
+      const id = parsed.data.id;
 
       const [rows]: any = await db.query(
-        `SELECT id, academia_id, nombre
-           FROM sucursales_real
-          WHERE id = ?${whereAcademia}
-          LIMIT 1`,
-        params
+        "SELECT id, academia_id, nombre FROM sucursales_real WHERE id = ? AND academia_id = ? LIMIT 1",
+        [id, academiaId]
       );
 
       reply.header("Cache-Control", "no-store");
 
       if (!rows?.length) return reply.code(404).send({ ok: false, message: "Sucursal no encontrada" });
-
       return reply.send({ ok: true, item: normalize(rows[0]) });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al obtener sucursal", detail: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      return reply.code(code).send({ ok: false, message: "Error al obtener sucursal", detail: err?.message });
     }
   });
 
-  // ─────────────────── CREAR (WRITE) ───────────────────
+  // POST /sucursales-real (scoped)
   app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const parsed = CreateSchema.parse((req as any).body);
-      const nombre = parsed.nombre.trim();
+      const body = CreateSchema.parse(req.body);
+      const nombre = body.nombre.trim();
 
-      // academia_id:
-      // - rol 1: SIEMPRE desde token
-      // - rol 3: puede especificarla en body (si no, error)
-      const auth = getAuth(req);
-      const superAdmin = isSuper(req);
-
-      let academia_id: number | null = null;
-
-      if (!auth || auth.type !== "user") {
-        return reply.code(403).send({ ok: false, message: "FORBIDDEN" });
-      }
-
-      if (superAdmin) {
-        academia_id = parsed.academia_id ? Number(parsed.academia_id) : null;
-        if (!academia_id) {
-          return reply.code(400).send({ ok: false, message: "academia_id requerido para superadmin" });
-        }
-      } else {
-        academia_id = Number(auth.academia_id ?? 0);
-        if (!academia_id) return reply.code(403).send({ ok: false, message: "ACADEMIA_REQUIRED" });
-      }
+      const academiaId = getEffectiveAcademiaId(req);
 
       const [result]: any = await db.query(
         "INSERT INTO sucursales_real (academia_id, nombre) VALUES (?, ?)",
-        [academia_id, nombre]
+        [academiaId, nombre]
       );
 
       return reply.code(201).send({
         ok: true,
         id: result.insertId,
-        academia_id,
-        nombre,
+        item: { id: result.insertId, academia_id: academiaId, nombre },
       });
     } catch (err: any) {
       if (err instanceof ZodError) {
@@ -237,52 +196,37 @@ export default async function sucursales_real(app: FastifyInstance) {
       }
 
       if (err?.errno === 1062) {
-        // Idealmente UNIQUE(academia_id, nombre)
-        return reply.code(409).send({ ok: false, message: "Ya existe una sucursal con ese nombre" });
+        return reply.code(409).send({ ok: false, message: "Ya existe una sucursal con ese nombre en esta academia" });
       }
 
-      return reply.code(500).send({ ok: false, message: "Error al crear sucursal", detail: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      return reply.code(code).send({ ok: false, message: "Error al crear sucursal", detail: err?.message });
     }
   });
 
-  // ─────────────────── ACTUALIZAR (WRITE) ───────────────────
+  // PUT /sucursales-real/:id (scoped)
   app.put("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
-    const pid = IdParam.safeParse((req as any).params);
+    const pid = IdParam.safeParse(req.params);
     if (!pid.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
-    const id = pid.data.id;
-
     try {
-      const body = UpdateSchema.parse((req as any).body);
+      const body = UpdateSchema.parse(req.body);
       const changes: any = {};
       if (body.nombre !== undefined) changes.nombre = body.nombre.trim();
 
       if (Object.keys(changes).length === 0) {
         return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
       }
-
-      const academia_id = getAcademiaIdOr403(req, reply);
-      if ((reply as any).sent) return;
-
-      const okOwn = await assertSucursalInAcademiaOr404(id, academia_id, reply);
-      if (!okOwn) return;
-
-      const whereAcademia = academia_id ? " AND academia_id = ?" : "";
-      const params: any[] = [];
-      const setClauses: string[] = [];
-      if (changes.nombre !== undefined) {
-        setClauses.push("nombre = ?");
-        params.push(changes.nombre);
+      if ("nombre" in changes && !changes.nombre) {
+        return reply.code(400).send({ ok: false, field: "nombre", message: "Nombre no puede ser vacío" });
       }
 
-      params.push(id);
-      if (academia_id) params.push(academia_id);
+      const academiaId = getEffectiveAcademiaId(req);
+      const id = pid.data.id;
 
       const [result]: any = await db.query(
-        `UPDATE sucursales_real
-            SET ${setClauses.join(", ")}
-          WHERE id = ?${whereAcademia}`,
-        params
+        "UPDATE sucursales_real SET ? WHERE id = ? AND academia_id = ?",
+        [changes, id, academiaId]
       );
 
       if (result.affectedRows === 0) {
@@ -297,33 +241,26 @@ export default async function sucursales_real(app: FastifyInstance) {
       }
 
       if (err?.errno === 1062) {
-        return reply.code(409).send({ ok: false, message: "Ya existe una sucursal con ese nombre" });
+        return reply.code(409).send({ ok: false, message: "Ya existe una sucursal con ese nombre en esta academia" });
       }
 
-      return reply.code(500).send({ ok: false, message: "Error al actualizar sucursal", detail: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      return reply.code(code).send({ ok: false, message: "Error al actualizar sucursal", detail: err?.message });
     }
   });
 
-  // ─────────────────── ELIMINAR (WRITE) ───────────────────
+  // DELETE /sucursales-real/:id (scoped)
   app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
-    const parsed = IdParam.safeParse((req as any).params);
+    const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
-    const id = parsed.data.id;
-
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-
-    const okOwn = await assertSucursalInAcademiaOr404(id, academia_id, reply);
-    if (!okOwn) return;
-
     try {
-      const whereAcademia = academia_id ? " AND academia_id = ?" : "";
-      const params = academia_id ? [id, academia_id] : [id];
+      const academiaId = getEffectiveAcademiaId(req);
+      const id = parsed.data.id;
 
       const [result]: any = await db.query(
-        `DELETE FROM sucursales_real WHERE id = ?${whereAcademia}`,
-        params
+        "DELETE FROM sucursales_real WHERE id = ? AND academia_id = ?",
+        [id, academiaId]
       );
 
       if (result.affectedRows === 0) {
@@ -340,7 +277,8 @@ export default async function sucursales_real(app: FastifyInstance) {
         });
       }
 
-      return reply.code(500).send({ ok: false, message: "Error al eliminar sucursal", detail: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      return reply.code(code).send({ ok: false, message: "Error al eliminar sucursal", detail: err?.message });
     }
   });
 }

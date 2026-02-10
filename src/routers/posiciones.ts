@@ -14,7 +14,7 @@ const IdParam = z.object({ id: z.coerce.number().int().positive() });
 
 const CreateSchema = z
   .object({
-    nombre: z.string().trim().min(2, "Debe tener al menos 2 caracteres").max(100).optional(),
+    nombre: z.string().trim().min(2, "Debe tener al menos 2 caracteres").max(100),
   })
   .strict();
 
@@ -35,19 +35,21 @@ function normalize(row: any) {
 /* ──────────────────────────────────────────────────────────────
    Multi-academia helpers (WELI)
    Regla:
-   - rol 1/2: academia_id desde token (req.user.academia_id)
+   - rol 1/2: academia_id desde token
    - rol 3: academia_id desde header x-academia-id (obligatorio)
 ────────────────────────────────────────────────────────────── */
-function getUserRolId(req: FastifyRequest): number {
-  const u: any = (req as any).user || {};
-  const r = Number(u?.rol_id ?? u?.role_id ?? u?.role ?? 0);
-  return Number.isFinite(r) ? r : 0;
+function getRolId(req: FastifyRequest): number {
+  const a: any = (req as any).auth;
+  const u: any = (req as any).user;
+  const raw = a?.rol_id ?? u?.rol_id ?? u?.role_id ?? u?.role ?? 0;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
 }
 
 function getEffectiveAcademiaId(req: FastifyRequest): number {
-  const rol = getUserRolId(req);
-  const u: any = (req as any).user || {};
+  const rol = getRolId(req);
 
+  // rol 3: header obligatorio
   if (rol === 3) {
     const hdr = req.headers["x-academia-id"];
     const raw = Array.isArray(hdr) ? hdr[0] : hdr;
@@ -60,7 +62,12 @@ function getEffectiveAcademiaId(req: FastifyRequest): number {
     return n;
   }
 
+  // rol 1/2: token obligatorio
+  const a: any = (req as any).auth;
+  const u: any = (req as any).user;
+
   const raw =
+    a?.academia_id ??
     u?.academia_id ??
     u?.academy_id ??
     u?.academiaId ??
@@ -79,14 +86,13 @@ export default async function posiciones(app: FastifyInstance) {
   const canRead = [requireAuth, requireRoles([1, 2, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  // ───────────────────── Health (READ) ─────────────────────
   app.get("/health", { preHandler: canRead }, async () => ({
     module: "posiciones",
     status: "ready",
     timestamp: new Date().toISOString(),
   }));
 
-  // ───────────────────── GET /posiciones (READ) ─────────────────────
+  // GET /posiciones (scoped)
   app.get("/", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const academiaId = getEffectiveAcademiaId(req);
@@ -103,7 +109,7 @@ export default async function posiciones(app: FastifyInstance) {
     }
   });
 
-  // ───────────────────── GET /posiciones/:id (READ) ─────────────────────
+  // GET /posiciones/:id (scoped)
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
@@ -125,12 +131,11 @@ export default async function posiciones(app: FastifyInstance) {
     }
   });
 
-  // ───────────────────── POST /posiciones (WRITE) ─────────────────────
+  // POST /posiciones (scoped)
   app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const body = CreateSchema.parse(req.body);
-      const nombre = String(body.nombre ?? "").trim();
-      if (!nombre) return reply.code(400).send({ ok: false, field: "nombre", message: "Nombre es obligatorio" });
+      const nombre = body.nombre.trim();
 
       const academiaId = getEffectiveAcademiaId(req);
 
@@ -145,17 +150,15 @@ export default async function posiciones(app: FastifyInstance) {
         const detail = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
         return reply.code(400).send({ ok: false, message: "Payload inválido", detail });
       }
-
       if (err?.errno === 1062) {
         return reply.code(409).send({ ok: false, message: "La posición ya existe en esta academia" });
       }
-
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
       return reply.code(code).send({ ok: false, message: "Error al crear posición", detail: err?.message });
     }
   });
 
-  // ───────────────────── PUT /posiciones/:id (WRITE) ─────────────────────
+  // PUT /posiciones/:id (scoped)
   app.put("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const pid = IdParam.safeParse(req.params);
     if (!pid.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
@@ -175,7 +178,6 @@ export default async function posiciones(app: FastifyInstance) {
       const academiaId = getEffectiveAcademiaId(req);
       const id = pid.data.id;
 
-      // ✅ update scoped (si no pertenece, affectedRows=0 -> 404)
       const [result]: any = await db.query(
         "UPDATE posiciones SET ? WHERE id = ? AND academia_id = ?",
         [changes, id, academiaId]
@@ -188,17 +190,15 @@ export default async function posiciones(app: FastifyInstance) {
         const detail = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
         return reply.code(400).send({ ok: false, message: "Payload inválido", detail });
       }
-
       if (err?.errno === 1062) {
         return reply.code(409).send({ ok: false, message: "La posición ya existe en esta academia" });
       }
-
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
       return reply.code(code).send({ ok: false, message: "Error al actualizar posición", detail: err?.message });
     }
   });
 
-  // ───────────────────── DELETE /posiciones/:id (WRITE) ─────────────────────
+  // DELETE /posiciones/:id (scoped)
   app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
@@ -222,7 +222,6 @@ export default async function posiciones(app: FastifyInstance) {
           detail: err?.sqlMessage ?? err?.message,
         });
       }
-
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
       return reply.code(code).send({ ok: false, message: "Error al eliminar posición", detail: err?.message });
     }

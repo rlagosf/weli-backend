@@ -14,9 +14,7 @@ const CreateSchema = z.object({
   listado_base64: z.string().min(10),
 });
 
-const IdParam = z.object({
-  id: z.coerce.number().int().positive(),
-});
+const IdParam = z.object({ id: z.coerce.number().int().positive() });
 
 const EventoConvParam = z.object({
   evento_id: z.coerce.number().int().positive(),
@@ -46,11 +44,22 @@ function getAuth(req: any) {
     | undefined;
 }
 
-function isSuper(req: any) {
-  const a = getAuth(req);
-  return a?.type === "user" && Number(a.rol_id) === 3;
+function getHeaderAcademiaId(req: any): number | null {
+  const raw =
+    (req.headers?.["x-academia-id"] as any) ??
+    (req.headers?.["X-Academia-Id"] as any) ??
+    null;
+
+  const v = Array.isArray(raw) ? raw[0] : raw;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+/**
+ * ✅ Academia efectiva:
+ * - rol 3 (superadmin): OBLIGATORIO x-academia-id (academia "objetivo" del super-dashboard)
+ * - rol 1/2: usa auth.academia_id
+ */
 function getAcademiaIdOr403(req: any, reply: any) {
   const a = getAuth(req);
   if (!a || a.type !== "user") {
@@ -58,7 +67,16 @@ function getAcademiaIdOr403(req: any, reply: any) {
     return null;
   }
 
-  if (Number(a.rol_id) === 3) return null; // superadmin: sin filtro
+  const rol = Number(a.rol_id ?? 0);
+
+  if (rol === 3) {
+    const headerAcademia = getHeaderAcademiaId(req);
+    if (!headerAcademia) {
+      reply.code(403).send({ ok: false, message: "ACADEMIA_TARGET_REQUIRED" });
+      return null;
+    }
+    return headerAcademia;
+  }
 
   const academia_id = Number(a.academia_id ?? 0);
   if (!Number.isFinite(academia_id) || academia_id <= 0) {
@@ -72,18 +90,16 @@ function getAcademiaIdOr403(req: any, reply: any) {
    ROUTER
 ─────────────────────────────── */
 export default async function convocatorias_historico(app: FastifyInstance) {
-  // ✅ roles 1/2/3
   const canRead = [requireAuth, requireRoles([1, 2, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  // Health
   app.get("/health", { preHandler: canRead }, async () => ({
     module: "convocatorias_historico",
     status: "ready",
     timestamp: new Date().toISOString(),
   }));
 
-  // LISTAR (rol 1/2 limitado por academia; rol 3 ve todo)
+  // LISTAR (SIEMPRE scoping por academia efectiva)
   app.get("/", { preHandler: canRead }, async (req, reply) => {
     try {
       const parsed = PaginationQuery.safeParse((req as any).query);
@@ -96,29 +112,25 @@ export default async function convocatorias_historico(app: FastifyInstance) {
       const academia_id = getAcademiaIdOr403(req, reply);
       if ((reply as any).sent) return;
 
-      // ⚠️ Asume tabla eventos(id, academia_id). Ajusta si tu tabla se llama distinto.
-      const whereAcademia = academia_id ? "WHERE e.academia_id = ?" : "";
-      const params = academia_id ? [academia_id, limit, offset] : [limit, offset];
-
       const [rows]: any = await db.query(
         `
         SELECT h.id, h.evento_id, h.convocatoria_id, h.fecha_generacion, h.generado_por
-        FROM convocatorias_historico h
-        JOIN eventos e ON e.id = h.evento_id
-        ${whereAcademia}
-        ORDER BY h.fecha_generacion DESC, h.id DESC
-        LIMIT ? OFFSET ?
+          FROM convocatorias_historico h
+          JOIN eventos e ON e.id = h.evento_id
+         WHERE e.academia_id = ?
+         ORDER BY h.fecha_generacion DESC, h.id DESC
+         LIMIT ? OFFSET ?
         `,
-        params
+        [academia_id, limit, offset]
       );
 
-      return reply.send({ ok: true, items: rows, page, pageSize: limit });
+      return reply.send({ ok: true, items: rows, page, pageSize: limit, academia_id });
     } catch (e: any) {
       return reply.code(500).send({ ok: false, message: "Error al listar", error: e?.message });
     }
   });
 
-  // Obtener por evento + convocatoria
+  // Obtener por evento + convocatoria (SIEMPRE scoping)
   app.get(
     "/evento/:evento_id/convocatoria/:convocatoria_id",
     { preHandler: canRead },
@@ -132,24 +144,20 @@ export default async function convocatorias_historico(app: FastifyInstance) {
       if ((reply as any).sent) return;
 
       try {
-        const whereAcademia = academia_id ? "AND e.academia_id = ?" : "";
-        const params = academia_id
-          ? [evento_id, convocatoria_id, academia_id]
-          : [evento_id, convocatoria_id];
-
         const [rows]: any = await db.query(
           `
           SELECT h.id, h.evento_id, h.convocatoria_id, h.fecha_generacion, h.generado_por
-          FROM convocatorias_historico h
-          JOIN eventos e ON e.id = h.evento_id
-          WHERE h.evento_id = ? AND h.convocatoria_id = ?
-          ${whereAcademia}
-          ORDER BY h.fecha_generacion DESC, h.id DESC
+            FROM convocatorias_historico h
+            JOIN eventos e ON e.id = h.evento_id
+           WHERE h.evento_id = ?
+             AND h.convocatoria_id = ?
+             AND e.academia_id = ?
+           ORDER BY h.fecha_generacion DESC, h.id DESC
           `,
-          params
+          [evento_id, convocatoria_id, academia_id]
         );
 
-        return reply.send({ ok: true, items: rows });
+        return reply.send({ ok: true, items: rows, academia_id });
       } catch (e: any) {
         return reply.code(500).send({
           ok: false,
@@ -160,7 +168,7 @@ export default async function convocatorias_historico(app: FastifyInstance) {
     }
   );
 
-  // Ver PDF (IMPORTANTE: antes que "/:id")
+  // Ver PDF (SIEMPRE scoping)
   app.get("/ver/:id", { preHandler: canRead }, async (req, reply) => {
     const p = IdParam.safeParse((req as any).params);
     if (!p.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
@@ -171,19 +179,16 @@ export default async function convocatorias_historico(app: FastifyInstance) {
     if ((reply as any).sent) return;
 
     try {
-      const whereAcademia = academia_id ? "AND e.academia_id = ?" : "";
-      const params = academia_id ? [id, academia_id] : [id];
-
       const [rows]: any = await db.query(
         `
         SELECT h.listado_base64
-        FROM convocatorias_historico h
-        JOIN eventos e ON e.id = h.evento_id
-        WHERE h.id = ?
-        ${whereAcademia}
-        LIMIT 1
+          FROM convocatorias_historico h
+          JOIN eventos e ON e.id = h.evento_id
+         WHERE h.id = ?
+           AND e.academia_id = ?
+         LIMIT 1
         `,
-        params
+        [id, academia_id]
       );
 
       if (!rows?.length) return reply.code(404).send({ ok: false, message: "No encontrado" });
@@ -195,15 +200,11 @@ export default async function convocatorias_historico(app: FastifyInstance) {
       reply.header("Content-Disposition", `inline; filename="convocatoria_${id}.pdf"`);
       return reply.send(buf);
     } catch (e: any) {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error al generar PDF",
-        error: e?.message,
-      });
+      return reply.code(500).send({ ok: false, message: "Error al generar PDF", error: e?.message });
     }
   });
 
-  // OBTENER POR ID (al final)
+  // OBTENER POR ID (SIEMPRE scoping)
   app.get("/:id", { preHandler: canRead }, async (req, reply) => {
     const p = IdParam.safeParse((req as any).params);
     if (!p.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
@@ -214,42 +215,31 @@ export default async function convocatorias_historico(app: FastifyInstance) {
     if ((reply as any).sent) return;
 
     try {
-      const whereAcademia = academia_id ? "AND e.academia_id = ?" : "";
-      const params = academia_id ? [id, academia_id] : [id];
-
       const [rows]: any = await db.query(
         `
         SELECT h.*
-        FROM convocatorias_historico h
-        JOIN eventos e ON e.id = h.evento_id
-        WHERE h.id = ?
-        ${whereAcademia}
-        LIMIT 1
+          FROM convocatorias_historico h
+          JOIN eventos e ON e.id = h.evento_id
+         WHERE h.id = ?
+           AND e.academia_id = ?
+         LIMIT 1
         `,
-        params
+        [id, academia_id]
       );
 
       if (!rows?.length) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
-      return reply.send({ ok: true, item: rows[0] });
+      return reply.send({ ok: true, item: rows[0], academia_id });
     } catch (e: any) {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error al obtener registro",
-        error: e?.message,
-      });
+      return reply.code(500).send({ ok: false, message: "Error al obtener registro", error: e?.message });
     }
   });
 
-  // Crear registro (rol 1/2 limitado por academia; rol 3 bypass)
+  // Crear registro (VALIDA evento dentro de academia efectiva)
   app.post("/", { preHandler: canWrite }, async (req, reply) => {
     const parsed = CreateSchema.safeParse((req as any).body);
     if (!parsed.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: "Payload inválido",
-        errors: parsed.error.flatten(),
-      });
+      return reply.code(400).send({ ok: false, message: "Payload inválido", errors: parsed.error.flatten() });
     }
 
     const { evento_id, convocatoria_id, listado_base64 } = parsed.data;
@@ -259,20 +249,15 @@ export default async function convocatorias_historico(app: FastifyInstance) {
     if ((reply as any).sent) return;
 
     try {
-      // ✅ Validar que evento pertenece a la academia (solo roles 1/2)
-      if (academia_id) {
-        const [chk]: any = await db.query(
-          `SELECT id FROM eventos WHERE id = ? AND academia_id = ? LIMIT 1`,
-          [evento_id, academia_id]
-        );
-        if (!chk?.length) {
-          return reply.code(403).send({ ok: false, message: "FORBIDDEN_EVENTO" });
-        }
-      }
+      // ✅ Validar evento pertenece a academia efectiva (incluye rol 3)
+      const [chk]: any = await db.query(
+        `SELECT id FROM eventos WHERE id = ? AND academia_id = ? LIMIT 1`,
+        [evento_id, academia_id]
+      );
+      if (!chk?.length) return reply.code(403).send({ ok: false, message: "FORBIDDEN_EVENTO" });
 
       const pure = stripDataUrlPrefix(listado_base64);
       const bytes = approxBytes(pure);
-
       if (bytes > MAX_BYTES) {
         return reply.code(413).send({
           ok: false,
@@ -303,14 +288,11 @@ export default async function convocatorias_historico(app: FastifyInstance) {
         id: result.insertId,
         evento_id,
         convocatoria_id,
+        academia_id,
         fecha_generacion: fechaMySQL ?? new Date().toISOString(),
       });
     } catch (e: any) {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error al crear registro",
-        error: e?.message,
-      });
+      return reply.code(500).send({ ok: false, message: "Error al crear registro", error: e?.message });
     }
   });
 }

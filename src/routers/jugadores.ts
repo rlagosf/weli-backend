@@ -69,35 +69,68 @@ function getUserRolId(req: FastifyRequest): number {
   return Number.isFinite(r) ? r : 0;
 }
 
-function getEffectiveAcademiaId(req: FastifyRequest): number {
-  const rol = getUserRolId(req);
+function getTokenAcademiaId(req: FastifyRequest): number {
   const u: any = (req as any).user || {};
-
-  if (rol === 3) {
-    const hdr = req.headers["x-academia-id"];
-    const raw = Array.isArray(hdr) ? hdr[0] : hdr;
-    const n = Number(raw);
-    if (!Number.isFinite(n) || n <= 0) {
-      throw Object.assign(new Error("FORBIDDEN: falta x-academia-id para superadmin"), {
-        statusCode: 403,
-      });
-    }
-    return n;
-  }
-
   const raw =
     u?.academia_id ??
     u?.academy_id ??
     u?.academiaId ??
     u?.academyId ??
     u?.academia ??
-    u?.academy;
+    u?.academy ??
+    0;
 
   const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) {
+  return Number.isFinite(n) ? n : 0;
+}
+
+function getHeaderAcademiaId(req: FastifyRequest): number {
+  const hdr = req.headers["x-academia-id"];
+  const raw = Array.isArray(hdr) ? hdr[0] : hdr;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * ✅ Regla final (alineada con tu frontend):
+ * - Rol 3 (superadmin): x-academia-id ES obligatorio y define el tenant.
+ * - Rol 1/2 (admin/staff): se puede enviar x-academia-id, pero SOLO si coincide con el token.
+ *   (seguridad: evita saltos de tenant)
+ * - Si no viene header: usa academia_id del token.
+ */
+function getEffectiveAcademiaId(req: FastifyRequest): number {
+  const rol = getUserRolId(req);
+  const headerAcademia = getHeaderAcademiaId(req);
+  const tokenAcademia = getTokenAcademiaId(req);
+
+  // 1) Superadmin: header manda (obligatorio)
+  if (rol === 3) {
+    if (!headerAcademia || headerAcademia <= 0) {
+      throw Object.assign(new Error("FORBIDDEN: falta x-academia-id para superadmin"), {
+        statusCode: 403,
+      });
+    }
+    return headerAcademia;
+  }
+
+  // 2) Admin/Staff: si viene header, debe coincidir con token
+  if (headerAcademia && headerAcademia > 0) {
+    if (!tokenAcademia || tokenAcademia <= 0) {
+      throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
+    }
+    if (headerAcademia !== tokenAcademia) {
+      throw Object.assign(new Error("FORBIDDEN: x-academia-id no coincide con tu academia"), {
+        statusCode: 403,
+      });
+    }
+    return headerAcademia;
+  }
+
+  // 3) Fallback: token
+  if (!tokenAcademia || tokenAcademia <= 0) {
     throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
   }
-  return n;
+  return tokenAcademia;
 }
 
 async function resolveAcademiaContext(conn: any, academiaId: number) {
@@ -265,7 +298,10 @@ function coerceForDB(row: Record<string, any>) {
       const m = String(d.getUTCMonth() + 1).padStart(2, "0");
       const da = String(d.getUTCDate()).padStart(2, "0");
       out.fecha_nacimiento = `${y}-${m}-${da}`;
-    } else if (typeof out.fecha_nacimiento === "string" && /^\d{4}-\d{2}-\d{2}$/.test(out.fecha_nacimiento)) {
+    } else if (
+      typeof out.fecha_nacimiento === "string" &&
+      /^\d{4}-\d{2}-\d{2}$/.test(out.fecha_nacimiento)
+    ) {
       // ok
     } else {
       delete out.fecha_nacimiento;
@@ -282,7 +318,10 @@ function coerceForDB(row: Record<string, any>) {
   if (typeof out.contrato_prestacion === "string")
     out.contrato_prestacion = cleanBase64Payload(out.contrato_prestacion);
 
-  if (typeof out.contrato_prestacion_updated_at === "string" || out.contrato_prestacion_updated_at instanceof Date) {
+  if (
+    typeof out.contrato_prestacion_updated_at === "string" ||
+    out.contrato_prestacion_updated_at instanceof Date
+  ) {
     const d = new Date(out.contrato_prestacion_updated_at);
     if (!Number.isNaN(d.getTime())) out.contrato_prestacion_updated_at = d;
     else delete out.contrato_prestacion_updated_at;
@@ -362,12 +401,17 @@ function applyFotoRules(target: Record<string, any>) {
   const b64 = normalizeB64(cleanBase64Payload(String(b64Raw || "")));
   const mime = String(mimeRaw || "").toLowerCase().trim();
 
-  if (!mime || !isValidMime(mime)) throw Object.assign(new Error("foto_mime inválido"), { statusCode: 400 });
-  if (!b64 || !looksLikeBase64(b64)) throw Object.assign(new Error("foto_base64 inválido"), { statusCode: 400 });
+  if (!mime || !isValidMime(mime))
+    throw Object.assign(new Error("foto_mime inválido"), { statusCode: 400 });
+  if (!b64 || !looksLikeBase64(b64))
+    throw Object.assign(new Error("foto_base64 inválido"), { statusCode: 400 });
 
   const bytes = approxBytesFromBase64(b64);
   const MAX_BYTES = 350 * 1024;
-  if (bytes > MAX_BYTES) throw Object.assign(new Error(`Foto excede el máximo (${MAX_BYTES} bytes)`), { statusCode: 413 });
+  if (bytes > MAX_BYTES)
+    throw Object.assign(new Error(`Foto excede el máximo (${MAX_BYTES} bytes)`), {
+      statusCode: 413,
+    });
 
   target.foto_base64 = b64;
   target.foto_mime = mime;
@@ -375,7 +419,8 @@ function applyFotoRules(target: Record<string, any>) {
 }
 
 function applyContratoRules(target: Record<string, any>) {
-  const hasAny = target.contrato_prestacion != null || target.contrato_prestacion_mime != null;
+  const hasAny =
+    target.contrato_prestacion != null || target.contrato_prestacion_mime != null;
   if (!hasAny) return;
 
   const b64Raw = target.contrato_prestacion;
@@ -395,12 +440,20 @@ function applyContratoRules(target: Record<string, any>) {
   const b64 = normalizeB64(cleanBase64Payload(String(b64Raw || "")));
   const mime = String(mimeRaw || "application/pdf").toLowerCase().trim();
 
-  if (!isValidPdfMime(mime)) throw Object.assign(new Error("contrato_prestacion_mime inválido (application/pdf)"), { statusCode: 400 });
-  if (!b64 || !looksLikeBase64(b64)) throw Object.assign(new Error("contrato_prestacion inválido (base64)"), { statusCode: 400 });
+  if (!isValidPdfMime(mime))
+    throw Object.assign(new Error("contrato_prestacion_mime inválido (application/pdf)"), {
+      statusCode: 400,
+    });
+  if (!b64 || !looksLikeBase64(b64))
+    throw Object.assign(new Error("contrato_prestacion inválido (base64)"), { statusCode: 400 });
 
   const bytes = approxBytesFromBase64(b64);
   const MAX_PDF_BYTES = 3 * 1024 * 1024;
-  if (bytes > MAX_PDF_BYTES) throw Object.assign(new Error(`Contrato excede el máximo (${MAX_PDF_BYTES} bytes)`), { statusCode: 413 });
+  if (bytes > MAX_PDF_BYTES)
+    throw Object.assign(
+      new Error(`Contrato excede el máximo (${MAX_PDF_BYTES} bytes)`),
+      { statusCode: 413 }
+    );
 
   target.contrato_prestacion = b64;
   target.contrato_prestacion_mime = "application/pdf";
@@ -408,20 +461,44 @@ function applyContratoRules(target: Record<string, any>) {
 }
 
 async function ensureAuthIfRutApoderadoPresent(rut_apoderado: any) {
-  if (rut_apoderado === null || rut_apoderado === undefined || rut_apoderado === "") return;
+  if (rut_apoderado === null || rut_apoderado === undefined || rut_apoderado === "")
+    return;
 
   const ensured = await ensureApoderadoAuth({ rut_apoderado: String(rut_apoderado) });
-  if (!ensured.ok) throw Object.assign(new Error(ensured.message || "RUT_APODERADO_INVALID"), { statusCode: 400 });
+  if (!ensured.ok)
+    throw Object.assign(new Error(ensured.message || "RUT_APODERADO_INVALID"), {
+      statusCode: 400,
+    });
 }
 
 async function validateForeignKeys(conn: any, data: Record<string, any>) {
   const fkChecks: Array<{ field: string; sql: string; val: any }> = [
-    { field: "posicion_id", sql: "SELECT academia_id FROM posiciones WHERE id = ? LIMIT 1", val: data.posicion_id },
-    { field: "categoria_id", sql: "SELECT academia_id FROM categorias WHERE id = ? LIMIT 1", val: data.categoria_id },
+    {
+      field: "posicion_id",
+      sql: "SELECT academia_id FROM posiciones WHERE id = ? LIMIT 1",
+      val: data.posicion_id,
+    },
+    {
+      field: "categoria_id",
+      sql: "SELECT academia_id FROM categorias WHERE id = ? LIMIT 1",
+      val: data.categoria_id,
+    },
     { field: "estado_id", sql: "SELECT 1 FROM estado WHERE id = ? LIMIT 1", val: data.estado_id },
-    { field: "establec_educ_id", sql: "SELECT 1 FROM establec_educ WHERE id = ? LIMIT 1", val: data.establec_educ_id },
-    { field: "prevision_medica_id", sql: "SELECT 1 FROM prevision_medica WHERE id = ? LIMIT 1", val: data.prevision_medica_id },
-    { field: "sucursal_id", sql: "SELECT academia_id FROM sucursales_real WHERE id = ? LIMIT 1", val: data.sucursal_id },
+    {
+      field: "establec_educ_id",
+      sql: "SELECT 1 FROM establec_educ WHERE id = ? LIMIT 1",
+      val: data.establec_educ_id,
+    },
+    {
+      field: "prevision_medica_id",
+      sql: "SELECT 1 FROM prevision_medica WHERE id = ? LIMIT 1",
+      val: data.prevision_medica_id,
+    },
+    {
+      field: "sucursal_id",
+      sql: "SELECT academia_id FROM sucursales_real WHERE id = ? LIMIT 1",
+      val: data.sucursal_id,
+    },
     { field: "comuna_id", sql: "SELECT 1 FROM comunas WHERE id = ? LIMIT 1", val: data.comuna_id },
   ];
 
@@ -429,7 +506,10 @@ async function validateForeignKeys(conn: any, data: Record<string, any>) {
     if (fk.val != null) {
       const [r]: any = await conn.query(fk.sql, [fk.val]);
       if (!Array.isArray(r) || r.length === 0) {
-        throw Object.assign(new Error(`Violación de clave foránea: ${fk.field} no existe`), { statusCode: 409, field: fk.field });
+        throw Object.assign(new Error(`Violación de clave foránea: ${fk.field} no existe`), {
+          statusCode: 409,
+          field: fk.field,
+        });
       }
     }
   }
@@ -444,13 +524,22 @@ async function assertBelongsToAcademia(conn: any, academiaId: number, data: Reco
 
   for (const c of checks) {
     if (c.id == null) continue;
-    const [rows]: any = await conn.query(`SELECT academia_id FROM ${c.table} WHERE id = ? LIMIT 1`, [c.id]);
+    const [rows]: any = await conn.query(
+      `SELECT academia_id FROM ${c.table} WHERE id = ? LIMIT 1`,
+      [c.id]
+    );
     if (!rows?.length) {
-      throw Object.assign(new Error(`Violación de clave foránea: ${c.field} no existe`), { statusCode: 409, field: c.field });
+      throw Object.assign(new Error(`Violación de clave foránea: ${c.field} no existe`), {
+        statusCode: 409,
+        field: c.field,
+      });
     }
     const owner = Number(rows[0]?.academia_id ?? 0);
     if (!owner || owner !== academiaId) {
-      throw Object.assign(new Error(`Acceso denegado: ${c.field} no pertenece a tu academia`), { statusCode: 403, field: c.field });
+      throw Object.assign(new Error(`Acceso denegado: ${c.field} no pertenece a tu academia`), {
+        statusCode: 403,
+        field: c.field,
+      });
     }
   }
 }
@@ -519,7 +608,9 @@ export default async function jugadores(app: FastifyInstance) {
       });
     } catch (err: any) {
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
-      return reply.code(code).send({ ok: false, message: "Error al listar jugadores", detail: err?.message });
+      return reply
+        .code(code)
+        .send({ ok: false, message: "Error al listar jugadores", detail: err?.message });
     }
   });
 
@@ -571,7 +662,9 @@ export default async function jugadores(app: FastifyInstance) {
       });
     } catch (err: any) {
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
-      return reply.code(code).send({ ok: false, message: "Error al listar jugadores activos", detail: err?.message });
+      return reply
+        .code(code)
+        .send({ ok: false, message: "Error al listar jugadores activos", detail: err?.message });
     }
   });
 
@@ -579,7 +672,9 @@ export default async function jugadores(app: FastifyInstance) {
   app.get("/rut/:rut", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const pr = RutParam.safeParse(req.params);
     if (!pr.success) {
-      return reply.code(400).send({ ok: false, message: pr.error.issues[0]?.message || "RUT inválido" });
+      return reply
+        .code(400)
+        .send({ ok: false, message: pr.error.issues[0]?.message || "RUT inválido" });
     }
 
     const rut = pr.data.rut;
@@ -598,12 +693,15 @@ export default async function jugadores(app: FastifyInstance) {
 
       const [rows]: any = await db.query(sql, [academiaId, rut]);
 
-      if (!rows || rows.length === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
+      if (!rows || rows.length === 0)
+        return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       return reply.send({ ok: true, item: normalizeDetailOut(rows[0]) });
     } catch (err: any) {
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
-      return reply.code(code).send({ ok: false, message: "Error al buscar por RUT", detail: err?.message });
+      return reply
+        .code(code)
+        .send({ ok: false, message: "Error al buscar por RUT", detail: err?.message });
     }
   });
 
@@ -628,12 +726,15 @@ export default async function jugadores(app: FastifyInstance) {
 
       const [rows]: any = await db.query(sql, [academiaId, id]);
 
-      if (!rows || rows.length === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
+      if (!rows || rows.length === 0)
+        return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       return reply.send({ ok: true, item: normalizeDetailOut(rows[0]) });
     } catch (err: any) {
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
-      return reply.code(code).send({ ok: false, message: "Error al obtener jugador", detail: err?.message });
+      return reply
+        .code(code)
+        .send({ ok: false, message: "Error al obtener jugador", detail: err?.message });
     }
   });
 
@@ -647,11 +748,14 @@ export default async function jugadores(app: FastifyInstance) {
       const data = coerceForDB(pickAllowed(parsed));
 
       if (data.sucursal_id == null) {
-        return reply.code(400).send({ ok: false, field: "sucursal_id", message: "Sucursal es obligatoria." });
+        return reply
+          .code(400)
+          .send({ ok: false, field: "sucursal_id", message: "Sucursal es obligatoria." });
       }
 
       if ("foto_base64" in data || "foto_mime" in data) applyFotoRules(data);
-      if ("contrato_prestacion" in data || "contrato_prestacion_mime" in data) applyContratoRules(data);
+      if ("contrato_prestacion" in data || "contrato_prestacion_mime" in data)
+        applyContratoRules(data);
 
       await ensureAuthIfRutApoderadoPresent(data.rut_apoderado);
 
@@ -674,7 +778,11 @@ export default async function jugadores(app: FastifyInstance) {
           [data.academia_id, data.rut_jugador]
         );
         if (Array.isArray(r) && r.length > 0) {
-          return reply.code(409).send({ ok: false, field: "rut_jugador", message: "Duplicado: el RUT ya existe en tu academia" });
+          return reply.code(409).send({
+            ok: false,
+            field: "rut_jugador",
+            message: "Duplicado: el RUT ya existe en tu academia",
+          });
         }
       }
 
@@ -684,7 +792,11 @@ export default async function jugadores(app: FastifyInstance) {
           [data.academia_id, data.email]
         );
         if (Array.isArray(r2) && r2.length > 0) {
-          return reply.code(409).send({ ok: false, field: "email", message: "Duplicado: el email ya existe en tu academia" });
+          return reply.code(409).send({
+            ok: false,
+            field: "email",
+            message: "Duplicado: el email ya existe en tu academia",
+          });
         }
       }
 
@@ -710,11 +822,15 @@ export default async function jugadores(app: FastifyInstance) {
       });
     } catch (err: any) {
       if (conn) {
-        try { await conn.rollback(); } catch {}
+        try {
+          await conn.rollback();
+        } catch {}
       }
 
       if (err?.statusCode && typeof err?.message === "string") {
-        return reply.code(err.statusCode).send({ ok: false, field: err?.field, message: err.message });
+        return reply
+          .code(err.statusCode)
+          .send({ ok: false, field: err?.field, message: err.message });
       }
 
       if (err instanceof ZodError) {
@@ -725,20 +841,37 @@ export default async function jugadores(app: FastifyInstance) {
       if (err?.errno === 1062) {
         const msg = String(err?.sqlMessage || "").toLowerCase();
         const field = msg.includes("rut_jugador") ? "rut_jugador" : msg.includes("email") ? "email" : undefined;
-        return reply.code(409).send({ ok: false, message: field ? `Duplicado: ${field} ya existe` : "Duplicado: clave única violada", field, detail: err?.sqlMessage });
+        return reply.code(409).send({
+          ok: false,
+          message: field ? `Duplicado: ${field} ya existe` : "Duplicado: clave única violada",
+          field,
+          detail: err?.sqlMessage,
+        });
       }
 
       if (err?.errno === 1452) {
-        return reply.code(409).send({ ok: false, message: "Violación de clave foránea (revisa ids enviados)", detail: err?.sqlMessage ?? err?.message });
+        return reply.code(409).send({
+          ok: false,
+          message: "Violación de clave foránea (revisa ids enviados)",
+          detail: err?.sqlMessage ?? err?.message,
+        });
       }
 
       if (err?.errno === 1054) {
-        return reply.code(500).send({ ok: false, message: "Columna desconocida: revisa el esquema de tablas", detail: err?.sqlMessage ?? err?.message });
+        return reply.code(500).send({
+          ok: false,
+          message: "Columna desconocida: revisa el esquema de tablas",
+          detail: err?.sqlMessage ?? err?.message,
+        });
       }
 
-      return reply.code(500).send({ ok: false, message: "Error al crear jugador", detail: err?.sqlMessage ?? err?.message });
+      return reply
+        .code(500)
+        .send({ ok: false, message: "Error al crear jugador", detail: err?.sqlMessage ?? err?.message });
     } finally {
-      try { release(); } catch {}
+      try {
+        release();
+      } catch {}
     }
   });
 
@@ -757,11 +890,16 @@ export default async function jugadores(app: FastifyInstance) {
       delete (changes as any).estadistica_id;
 
       if ("sucursal_id" in changes && (changes.sucursal_id === null || changes.sucursal_id === undefined)) {
-        return reply.code(400).send({ ok: false, field: "sucursal_id", message: "No puedes dejar sucursal en blanco." });
+        return reply.code(400).send({
+          ok: false,
+          field: "sucursal_id",
+          message: "No puedes dejar sucursal en blanco.",
+        });
       }
 
       if ("foto_base64" in changes || "foto_mime" in changes) applyFotoRules(changes);
-      if ("contrato_prestacion" in changes || "contrato_prestacion_mime" in changes) applyContratoRules(changes);
+      if ("contrato_prestacion" in changes || "contrato_prestacion_mime" in changes)
+        applyContratoRules(changes);
 
       if ("rut_apoderado" in changes) await ensureAuthIfRutApoderadoPresent(changes.rut_apoderado);
 
@@ -794,20 +932,28 @@ export default async function jugadores(app: FastifyInstance) {
         return reply.code(400).send({ ok: false, message: "Payload inválido", detail });
       }
 
-      if (err?.errno === 1062) return reply.code(409).send({ ok: false, message: "Duplicado: el RUT (o email) ya existe" });
+      if (err?.errno === 1062)
+        return reply.code(409).send({ ok: false, message: "Duplicado: el RUT (o email) ya existe" });
 
       if (err?.errno === 1452) {
-        return reply.code(409).send({ ok: false, message: "Violación de clave foránea (revisa ids enviados)", detail: err?.sqlMessage ?? err?.message });
+        return reply.code(409).send({
+          ok: false,
+          message: "Violación de clave foránea (revisa ids enviados)",
+          detail: err?.sqlMessage ?? err?.message,
+        });
       }
 
-      return reply.code(500).send({ ok: false, message: "Error al actualizar jugador", detail: err?.message });
+      return reply
+        .code(500)
+        .send({ ok: false, message: "Error al actualizar jugador", detail: err?.message });
     }
   });
 
   // ───────── PATCH /jugadores/rut/:rut (write 1/3) ─────────
   app.patch("/rut/:rut", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const pr = RutParam.safeParse(req.params);
-    if (!pr.success) return reply.code(400).send({ ok: false, message: pr.error.issues[0]?.message || "RUT inválido" });
+    if (!pr.success)
+      return reply.code(400).send({ ok: false, message: pr.error.issues[0]?.message || "RUT inválido" });
 
     const rut = pr.data.rut;
 
@@ -819,11 +965,16 @@ export default async function jugadores(app: FastifyInstance) {
       delete (changes as any).estadistica_id;
 
       if ("sucursal_id" in changes && (changes.sucursal_id === null || changes.sucursal_id === undefined)) {
-        return reply.code(400).send({ ok: false, field: "sucursal_id", message: "No puedes dejar sucursal en blanco." });
+        return reply.code(400).send({
+          ok: false,
+          field: "sucursal_id",
+          message: "No puedes dejar sucursal en blanco.",
+        });
       }
 
       if ("foto_base64" in changes || "foto_mime" in changes) applyFotoRules(changes);
-      if ("contrato_prestacion" in changes || "contrato_prestacion_mime" in changes) applyContratoRules(changes);
+      if ("contrato_prestacion" in changes || "contrato_prestacion_mime" in changes)
+        applyContratoRules(changes);
 
       if ("rut_apoderado" in changes) await ensureAuthIfRutApoderadoPresent(changes.rut_apoderado);
 
@@ -856,13 +1007,20 @@ export default async function jugadores(app: FastifyInstance) {
         return reply.code(400).send({ ok: false, message: "Payload inválido", detail });
       }
 
-      if (err?.errno === 1062) return reply.code(409).send({ ok: false, message: "Duplicado: el RUT (o email) ya existe" });
+      if (err?.errno === 1062)
+        return reply.code(409).send({ ok: false, message: "Duplicado: el RUT (o email) ya existe" });
 
       if (err?.errno === 1452) {
-        return reply.code(409).send({ ok: false, message: "Violación de clave foránea (revisa ids enviados)", detail: err?.sqlMessage ?? err?.message });
+        return reply.code(409).send({
+          ok: false,
+          message: "Violación de clave foránea (revisa ids enviados)",
+          detail: err?.sqlMessage ?? err?.message,
+        });
       }
 
-      return reply.code(500).send({ ok: false, message: "Error al actualizar jugador por RUT", detail: err?.message });
+      return reply
+        .code(500)
+        .send({ ok: false, message: "Error al actualizar jugador por RUT", detail: err?.message });
     }
   });
 
@@ -886,9 +1044,15 @@ export default async function jugadores(app: FastifyInstance) {
       return reply.send({ ok: true, deleted: id });
     } catch (err: any) {
       if (err?.errno === 1451) {
-        return reply.code(409).send({ ok: false, message: "No se puede eliminar: hay referencias asociadas.", detail: err?.sqlMessage ?? err?.message });
+        return reply.code(409).send({
+          ok: false,
+          message: "No se puede eliminar: hay referencias asociadas.",
+          detail: err?.sqlMessage ?? err?.message,
+        });
       }
-      return reply.code(500).send({ ok: false, message: "Error al eliminar jugador", detail: err?.message });
+      return reply
+        .code(500)
+        .send({ ok: false, message: "Error al eliminar jugador", detail: err?.message });
     }
   });
 }
