@@ -1,3 +1,4 @@
+// src/routers/usuarios.ts
 import { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { z } from "zod";
 import * as argon2 from "@node-rs/argon2";
@@ -16,6 +17,11 @@ import { requireAuth, requireRoles } from "../middlewares/authz";
  *  - Scope academia:
  *      - rol 1: solo su academia_id (y al crear SIEMPRE se fuerza a su academia)
  *      - rol 3: bypass (puede ver/crear/editar en cualquier academia)
+ *
+ * Regla Platino (anti-escalamiento):
+ *  - Actor rol 1 (admin) NO puede crear/editar usuarios con rol_id = 3 (superadmin)
+ *  - Actor rol 1 solo puede asignar rol_id ∈ {1,2}
+ *  - Actor rol 1 NO puede editar/borrar cuentas cuyo rol_id actual sea 3
  */
 
 /* ──────────────────────────────
@@ -28,9 +34,17 @@ function getAuth(req: any) {
     | undefined;
 }
 
-function isSuper(req: any) {
+function getActorRol(req: any): number {
   const a = getAuth(req);
-  return a?.type === "user" && Number(a.rol_id) === 3;
+  return a?.type === "user" ? Number(a.rol_id ?? 0) : 0;
+}
+
+function isSuper(req: any) {
+  return getActorRol(req) === 3;
+}
+
+function isAdmin(req: any) {
+  return getActorRol(req) === 1;
 }
 
 function getAcademiaIdOr403(req: any, reply: FastifyReply): number | null {
@@ -52,14 +66,45 @@ function getAcademiaIdOr403(req: any, reply: FastifyReply): number | null {
 async function assertUserInAcademiaOr404(id: number, academia_id: number | null, reply: FastifyReply) {
   if (!academia_id) return true; // super bypass
 
-  const [rows]: any = await db.query(
-    `SELECT id FROM usuarios WHERE id = ? AND academia_id = ? LIMIT 1`,
-    [id, academia_id]
-  );
+  const [rows]: any = await db.query(`SELECT id FROM usuarios WHERE id = ? AND academia_id = ? LIMIT 1`, [
+    id,
+    academia_id,
+  ]);
 
   if (!rows?.length) {
     // 404 para no filtrar multi-tenant
     reply.code(404).send({ ok: false, message: "No encontrado" });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Regla Platino:
+ * - Si actor es admin (rol 1) => NO puede asignar rol 3, y solo puede asignar 1 o 2.
+ */
+function assertAdminCannotAssignSuperOr403(req: any, rol_id: any, reply: FastifyReply) {
+  if (!isAdmin(req) || isSuper(req)) return;
+
+  const rid = Number(rol_id);
+  if (rid === 3 || ![1, 2].includes(rid)) {
+    reply.code(403).send({ ok: false, message: "FORBIDDEN_ROLE_ASSIGNMENT" });
+    throw new Error("FORBIDDEN_ROLE_ASSIGNMENT");
+  }
+}
+
+/**
+ * Regla Platino:
+ * - Si actor es admin (rol 1) => NO puede editar/borrar usuarios cuyo rol_id actual sea 3.
+ */
+async function assertTargetNotSuperOr403(targetUserId: number, req: any, reply: FastifyReply) {
+  if (isSuper(req)) return true; // super puede
+
+  const [rows]: any = await db.query("SELECT rol_id FROM usuarios WHERE id = ? LIMIT 1", [targetUserId]);
+  const rid = Number(rows?.[0]?.rol_id ?? 0);
+
+  if (rid === 3) {
+    reply.code(403).send({ ok: false, message: "FORBIDDEN_TARGET_SUPERADMIN" });
     return false;
   }
   return true;
@@ -76,6 +121,11 @@ function duplicateFieldFromSqlMessage(msg?: string) {
   if (s.includes("nombre_usuario")) return "nombre_usuario";
   if (s.includes("academia")) return "academia_id";
   return undefined;
+}
+
+// escape mínimo para LIKE
+function escapeLike(s: string) {
+  return s.replace(/[\\%_]/g, (m) => `\\${m}`);
 }
 
 /* ──────────────────────────────
@@ -125,15 +175,7 @@ const UpdateSchema = z
   .strict();
 
 // whitelist
-const allowedKeys = new Set([
-  "academia_id",
-  "nombre_usuario",
-  "rut_usuario",
-  "email",
-  "password",
-  "rol_id",
-  "estado_id",
-]);
+const allowedKeys = new Set(["academia_id", "nombre_usuario", "rut_usuario", "email", "password", "rol_id", "estado_id"]);
 
 function pickAllowed(body: Record<string, unknown>) {
   const out: Record<string, unknown> = {};
@@ -199,8 +241,8 @@ export default async function usuarios(app: FastifyInstance) {
       }
 
       if (q) {
-        sql += " AND (nombre_usuario LIKE ? OR email LIKE ? OR CAST(rut_usuario AS CHAR) LIKE ?)";
-        const like = `%${q.replace(/[%_]/g, "\\$&")}%`;
+        sql += " AND (nombre_usuario LIKE ? ESCAPE '\\\\' OR email LIKE ? ESCAPE '\\\\' OR CAST(rut_usuario AS CHAR) LIKE ? ESCAPE '\\\\')";
+        const like = `%${escapeLike(q)}%`;
         args.push(like, like, like);
       }
 
@@ -297,7 +339,7 @@ export default async function usuarios(app: FastifyInstance) {
 
     const data: any = normalizeForDB(pickAllowed(parsed.data));
 
-    // regla: rol1 SIEMPRE fuerza su academia; rol3 debe indicar academia_id (o se lo pides en payload)
+    // regla: rol1 SIEMPRE fuerza su academia; rol3 debe indicar academia_id
     if (academia_id) {
       data.academia_id = academia_id;
     } else {
@@ -310,6 +352,14 @@ export default async function usuarios(app: FastifyInstance) {
     if (!data.nombre_usuario || !data.email || !data.password || !data.rut_usuario || !data.rol_id || !data.estado_id) {
       return reply.code(400).send({ ok: false, message: "Payload inválido (campos requeridos faltantes)" });
     }
+
+    // ✅ Regla Platino: admin NO puede crear superadmin ni roles fuera de {1,2}
+    try {
+      assertAdminCannotAssignSuperOr403(req, data.rol_id, reply);
+    } catch {
+      return;
+    }
+    if ((reply as any).sent) return;
 
     try {
       data.password = await argon2.hash(String(data.password));
@@ -371,6 +421,10 @@ export default async function usuarios(app: FastifyInstance) {
     const okRow = await assertUserInAcademiaOr404(id, academia_id, reply);
     if (!okRow) return;
 
+    // ✅ Regla Platino: admin NO puede editar cuentas superadmin
+    const okTarget = await assertTargetNotSuperOr403(id, req, reply);
+    if (!okTarget) return;
+
     const changes: any = normalizeForDB(pickAllowed(parsed.data));
     if (Object.keys(changes).length === 0) {
       return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
@@ -381,6 +435,16 @@ export default async function usuarios(app: FastifyInstance) {
       delete changes.academia_id;
     }
 
+    // ✅ Regla Platino: admin NO puede setear rol_id=3 ni roles fuera de {1,2}
+    if (changes.rol_id !== undefined) {
+      try {
+        assertAdminCannotAssignSuperOr403(req, changes.rol_id, reply);
+      } catch {
+        return;
+      }
+      if ((reply as any).sent) return;
+    }
+
     try {
       if (typeof changes.password === "string") {
         changes.password = await argon2.hash(String(changes.password));
@@ -389,13 +453,34 @@ export default async function usuarios(app: FastifyInstance) {
       const setClauses: string[] = [];
       const values: any[] = [];
 
-      if (changes.academia_id !== undefined) { setClauses.push("academia_id = ?"); values.push(changes.academia_id); }
-      if (changes.nombre_usuario !== undefined) { setClauses.push("nombre_usuario = ?"); values.push(changes.nombre_usuario); }
-      if (changes.rut_usuario !== undefined) { setClauses.push("rut_usuario = ?"); values.push(changes.rut_usuario); }
-      if (changes.email !== undefined) { setClauses.push("email = ?"); values.push(changes.email); }
-      if (changes.password !== undefined) { setClauses.push("password = ?"); values.push(changes.password); }
-      if (changes.rol_id !== undefined) { setClauses.push("rol_id = ?"); values.push(changes.rol_id); }
-      if (changes.estado_id !== undefined) { setClauses.push("estado_id = ?"); values.push(changes.estado_id); }
+      if (changes.academia_id !== undefined) {
+        setClauses.push("academia_id = ?");
+        values.push(changes.academia_id);
+      }
+      if (changes.nombre_usuario !== undefined) {
+        setClauses.push("nombre_usuario = ?");
+        values.push(changes.nombre_usuario);
+      }
+      if (changes.rut_usuario !== undefined) {
+        setClauses.push("rut_usuario = ?");
+        values.push(changes.rut_usuario);
+      }
+      if (changes.email !== undefined) {
+        setClauses.push("email = ?");
+        values.push(changes.email);
+      }
+      if (changes.password !== undefined) {
+        setClauses.push("password = ?");
+        values.push(changes.password);
+      }
+      if (changes.rol_id !== undefined) {
+        setClauses.push("rol_id = ?");
+        values.push(changes.rol_id);
+      }
+      if (changes.estado_id !== undefined) {
+        setClauses.push("estado_id = ?");
+        values.push(changes.estado_id);
+      }
 
       if (setClauses.length === 0) {
         return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
@@ -451,6 +536,10 @@ export default async function usuarios(app: FastifyInstance) {
     // rol1: no puede borrar fuera de su academia
     const okRow = await assertUserInAcademiaOr404(parsed.data.id, academia_id, reply);
     if (!okRow) return;
+
+    // ✅ Regla Platino: admin NO puede borrar cuentas superadmin
+    const okTarget = await assertTargetNotSuperOr403(parsed.data.id, req, reply);
+    if (!okTarget) return;
 
     try {
       const args: any[] = [parsed.data.id];

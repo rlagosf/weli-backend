@@ -1,3 +1,4 @@
+// src/routers/deportes.ts
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
 import { db } from "../db";
@@ -15,13 +16,13 @@ const IdParam = z.object({
 
 const CreateSchema = z
   .object({
-    nombre: z.string().trim().min(2, "Debe tener al menos 2 caracteres"),
+    nombre: z.string().trim().min(2, "Debe tener al menos 2 caracteres").max(120),
   })
   .strict();
 
 const UpdateSchema = z
   .object({
-    nombre: z.string().trim().min(2, "Debe tener al menos 2 caracteres").optional(),
+    nombre: z.string().trim().min(2, "Debe tener al menos 2 caracteres").max(120).optional(),
   })
   .strict();
 
@@ -32,22 +33,32 @@ function normalize(row: any) {
   };
 }
 
+function zodDetail(err: ZodError) {
+  return err.issues.map((i) => `${i.path.join(".") || "field"}: ${i.message}`).join("; ");
+}
+
 export default async function deportes(app: FastifyInstance) {
   // ✅ Solo SUPERADMIN (rol 3)
-  const canRead = [requireAuth, requireRoles([3])];
-  const canWrite = [requireAuth, requireRoles([3])];
+  const onlySuper = [requireAuth, requireRoles([3])];
 
   // ───────── Health (rol 3) ─────────
-  app.get("/health", { preHandler: canRead }, async () => ({
-    module: "deportes",
-    status: "ready",
-    timestamp: new Date().toISOString(),
-  }));
+  app.get("/health", { preHandler: onlySuper }, async (_req, reply) => {
+    reply.header("Cache-Control", "no-store");
+    return {
+      module: "deportes",
+      status: "ready",
+      timestamp: new Date().toISOString(),
+    };
+  });
 
   // ───────── GET all (rol 3) ─────────
-  app.get("/", { preHandler: canRead }, async (_req: FastifyRequest, reply: FastifyReply) => {
+  app.get("/", { preHandler: onlySuper }, async (_req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const [rows]: any = await db.query("SELECT id, nombre FROM deportes ORDER BY id ASC");
+      const [rows]: any = await db.query(
+        "SELECT id, nombre FROM deportes ORDER BY nombre ASC, id ASC"
+      );
+
+      reply.header("Cache-Control", "no-store");
       return reply.send({
         ok: true,
         count: rows?.length ?? 0,
@@ -63,7 +74,7 @@ export default async function deportes(app: FastifyInstance) {
   });
 
   // ───────── GET by ID (rol 3) ─────────
-  app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
+  app.get("/:id", { preHandler: onlySuper }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
@@ -71,6 +82,8 @@ export default async function deportes(app: FastifyInstance) {
 
     try {
       const [rows]: any = await db.query("SELECT id, nombre FROM deportes WHERE id = ? LIMIT 1", [id]);
+
+      reply.header("Cache-Control", "no-store");
       if (!rows?.length) return reply.code(404).send({ ok: false, message: "Deporte no encontrado" });
 
       return reply.send({ ok: true, item: normalize(rows[0]) });
@@ -84,22 +97,18 @@ export default async function deportes(app: FastifyInstance) {
   });
 
   // ───────── POST (rol 3) ─────────
-  app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
+  app.post("/", { preHandler: onlySuper }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const parsed = CreateSchema.parse(req.body);
-      const nombre = parsed.nombre.trim();
+      const body = CreateSchema.parse(req.body);
+      const nombre = body.nombre.trim();
 
       const [result]: any = await db.query("INSERT INTO deportes (nombre) VALUES (?)", [nombre]);
 
-      return reply.code(201).send({
-        ok: true,
-        id: result.insertId,
-        nombre,
-      });
+      reply.header("Cache-Control", "no-store");
+      return reply.code(201).send({ ok: true, id: result.insertId, nombre });
     } catch (err: any) {
       if (err instanceof ZodError) {
-        const issues = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-        return reply.code(400).send({ ok: false, message: issues });
+        return reply.code(400).send({ ok: false, message: "Payload inválido", detail: zodDetail(err) });
       }
 
       if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
@@ -115,33 +124,29 @@ export default async function deportes(app: FastifyInstance) {
   });
 
   // ───────── PUT (rol 3) ─────────
-  app.put("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
+  app.put("/:id", { preHandler: onlySuper }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsedID = IdParam.safeParse(req.params);
     if (!parsedID.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
     const id = parsedID.data.id;
 
     try {
-      const parsedBody = UpdateSchema.parse(req.body);
+      const body = UpdateSchema.parse(req.body);
 
-      if (!Object.keys(parsedBody).length) {
-        return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
-      }
-
-      const nombre = parsedBody.nombre?.trim();
+      const nombre = body.nombre?.trim();
       if (nombre === undefined) {
         return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
       }
 
-      const [result]: any = await db.query("UPDATE deportes SET nombre = ? WHERE id = ? LIMIT 1", [nombre, id]);
+      const [result]: any = await db.query("UPDATE deportes SET nombre = ? WHERE id = ?", [nombre, id]);
 
-      if (result.affectedRows === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
+      reply.header("Cache-Control", "no-store");
+      if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       return reply.send({ ok: true, updated: { id, nombre } });
     } catch (err: any) {
       if (err instanceof ZodError) {
-        const issues = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-        return reply.code(400).send({ ok: false, message: issues });
+        return reply.code(400).send({ ok: false, message: "Payload inválido", detail: zodDetail(err) });
       }
 
       if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
@@ -157,16 +162,17 @@ export default async function deportes(app: FastifyInstance) {
   });
 
   // ───────── DELETE (rol 3) ─────────
-  app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
+  app.delete("/:id", { preHandler: onlySuper }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
     const id = parsed.data.id;
 
     try {
-      const [result]: any = await db.query("DELETE FROM deportes WHERE id = ? LIMIT 1", [id]);
+      const [result]: any = await db.query("DELETE FROM deportes WHERE id = ?", [id]);
 
-      if (result.affectedRows === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
+      reply.header("Cache-Control", "no-store");
+      if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       return reply.send({ ok: true, deleted: id });
     } catch (err: any) {

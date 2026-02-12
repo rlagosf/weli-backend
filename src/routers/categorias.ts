@@ -2,17 +2,19 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
 import { db } from "../db";
-import { requireAuth, requireRoles } from "../middlewares/authz";
+import {
+  requireAuth,
+  requireRoles,
+  getEffectiveAcademiaId, // ✅ estándar único (opción 2)
+} from "../middlewares/authz";
 
 /**
  * Tabla: categorias
- * Campos esperados: id (PK), academia_id (INT), nombre (VARCHAR)
+ * Campos: id (PK), academia_id (INT), nombre (VARCHAR)
  * UNIQUE recomendado: (academia_id, nombre)
  */
 
-const IdParam = z.object({
-  id: z.coerce.number().int().positive(),
-});
+const IdParam = z.object({ id: z.coerce.number().int().positive() });
 
 const CreateSchema = z
   .object({
@@ -20,9 +22,17 @@ const CreateSchema = z
   })
   .strict();
 
-const UpdateSchema = z
+// ✅ PUT = reemplazo (nombre requerido)
+const PutSchema = z
   .object({
     nombre: z.string().trim().min(1, "nombre requerido").max(100),
+  })
+  .strict();
+
+// ✅ PATCH = parcial
+const PatchSchema = z
+  .object({
+    nombre: z.string().trim().min(1, "nombre requerido").max(100).optional(),
   })
   .strict();
 
@@ -34,64 +44,43 @@ function normalize(row: any) {
   };
 }
 
-/* ──────────────────────────────────────────────────────────────
-   Multi-academia helpers (WELI)
-   Regla:
-   - rol 1/2: academia_id desde token (req.user.academia_id)
-   - rol 3: academia_id desde header x-academia-id (obligatorio)
-────────────────────────────────────────────────────────────── */
-function getUserRolId(req: FastifyRequest): number {
-  const u: any = (req as any).user || {};
-  const r = Number(u?.rol_id ?? u?.role_id ?? u?.role ?? 0);
-  return Number.isFinite(r) ? r : 0;
+function zodDetail(err: ZodError) {
+  return err.issues.map((i) => `${i.path.join(".") || "field"}: ${i.message}`).join("; ");
 }
 
-function getEffectiveAcademiaId(req: FastifyRequest): number {
-  const rol = getUserRolId(req);
-  const u: any = (req as any).user || {};
+async function existsByNombreScoped(
+  academiaId: number,
+  nombre: string,
+  excludeId?: number
+) {
+  const n = String(nombre ?? "").trim();
+  if (!n) return false;
 
-  if (rol === 3) {
-    const hdr = req.headers["x-academia-id"];
-    const raw = Array.isArray(hdr) ? hdr[0] : hdr;
-    const n = Number(raw);
-    if (!Number.isFinite(n) || n <= 0) {
-      throw Object.assign(new Error("FORBIDDEN: falta x-academia-id para superadmin"), {
-        statusCode: 403,
-      });
-    }
-    return n;
+  if (excludeId) {
+    const [rows]: any = await db.query(
+      "SELECT id FROM categorias WHERE academia_id = ? AND LOWER(TRIM(nombre)) = LOWER(?) AND id <> ? LIMIT 1",
+      [academiaId, n, excludeId]
+    );
+    return Array.isArray(rows) && rows.length > 0;
   }
 
-  const raw =
-    u?.academia_id ??
-    u?.academy_id ??
-    u?.academiaId ??
-    u?.academyId ??
-    u?.academia ??
-    u?.academy;
-
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) {
-    throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
-  }
-  return n;
+  const [rows]: any = await db.query(
+    "SELECT id FROM categorias WHERE academia_id = ? AND LOWER(TRIM(nombre)) = LOWER(?) LIMIT 1",
+    [academiaId, n]
+  );
+  return Array.isArray(rows) && rows.length > 0;
 }
 
 export default async function categorias(app: FastifyInstance) {
-  // ✅ Regla de oro: catálogos
-  // - Read: admin(1) + staff(2) + superadmin(3)
-  // - Write: admin(1) + superadmin(3)
   const canRead = [requireAuth, requireRoles([1, 2, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  // Health (read)
-  app.get("/health", { preHandler: canRead }, async () => ({
-    module: "categorias",
-    status: "ready",
-    timestamp: new Date().toISOString(),
-  }));
+  app.get("/health", { preHandler: canRead }, async (_req, reply) => {
+    reply.header("Cache-Control", "no-store");
+    return { module: "categorias", status: "ready", timestamp: new Date().toISOString() };
+  });
 
-  // ───────────────────── GET /categorias (READ scoped) ─────────────────────
+  // GET /
   app.get("/", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const academiaId = getEffectiveAcademiaId(req);
@@ -101,22 +90,15 @@ export default async function categorias(app: FastifyInstance) {
         [academiaId]
       );
 
-      return reply.send({
-        ok: true,
-        count: rows?.length ?? 0,
-        items: (rows || []).map(normalize),
-      });
+      reply.header("Cache-Control", "no-store");
+      return reply.send({ ok: true, count: rows?.length ?? 0, items: (rows || []).map(normalize) });
     } catch (err: any) {
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
-      return reply.code(code).send({
-        ok: false,
-        message: "Error al consultar categorías",
-        detail: err?.message,
-      });
+      return reply.code(code).send({ ok: false, message: "Error al consultar categorías", detail: err?.message });
     }
   });
 
-  // ───────────────────── GET /categorias/:id (READ scoped) ─────────────────────
+  // GET /:id
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
@@ -130,30 +112,31 @@ export default async function categorias(app: FastifyInstance) {
         [id, academiaId]
       );
 
+      reply.header("Cache-Control", "no-store");
       if (!rows?.length) return reply.code(404).send({ ok: false, message: "No encontrada" });
       return reply.send({ ok: true, item: normalize(rows[0]) });
     } catch (err: any) {
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
-      return reply.code(code).send({
-        ok: false,
-        message: "Error al buscar categoría",
-        detail: err?.message,
-      });
+      return reply.code(code).send({ ok: false, message: "Error al buscar categoría", detail: err?.message });
     }
   });
 
-  // ───────────────────── POST /categorias (WRITE scoped) ─────────────────────
+  // POST /
   app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const body = CreateSchema.parse(req.body);
       const nombre = body.nombre.trim();
       const academiaId = getEffectiveAcademiaId(req);
 
+      const dup = await existsByNombreScoped(academiaId, nombre);
+      if (dup) return reply.code(409).send({ ok: false, message: "La categoría ya existe en esta academia" });
+
       const [result]: any = await db.query(
         "INSERT INTO categorias (academia_id, nombre) VALUES (?, ?)",
         [academiaId, nombre]
       );
 
+      reply.header("Cache-Control", "no-store");
       return reply.code(201).send({
         ok: true,
         id: result.insertId,
@@ -161,20 +144,17 @@ export default async function categorias(app: FastifyInstance) {
       });
     } catch (err: any) {
       if (err instanceof ZodError) {
-        const detail = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-        return reply.code(400).send({ ok: false, message: "Payload inválido", detail });
+        return reply.code(400).send({ ok: false, message: "Payload inválido", detail: zodDetail(err) });
       }
-
       if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
         return reply.code(409).send({ ok: false, message: "La categoría ya existe en esta academia" });
       }
-
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
       return reply.code(code).send({ ok: false, message: "Error al crear categoría", detail: err?.message });
     }
   });
 
-  // ───────────────────── PUT /categorias/:id (WRITE scoped) ─────────────────────
+  // PUT /:id (reemplazo)
   app.put("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const idParsed = IdParam.safeParse(req.params);
     if (!idParsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
@@ -183,37 +163,78 @@ export default async function categorias(app: FastifyInstance) {
       const academiaId = getEffectiveAcademiaId(req);
       const id = idParsed.data.id;
 
-      const body = UpdateSchema.parse(req.body);
+      const body = PutSchema.parse(req.body);
       const nombre = body.nombre.trim();
-      if (!nombre) return reply.code(400).send({ ok: false, field: "nombre", message: "Nombre no puede ser vacío" });
 
-      // ✅ update scoped: si no pertenece, affectedRows=0 -> 404
+      const dup = await existsByNombreScoped(academiaId, nombre, id);
+      if (dup) return reply.code(409).send({ ok: false, message: "La categoría ya existe en esta academia" });
+
       const [result]: any = await db.query(
         "UPDATE categorias SET nombre = ? WHERE id = ? AND academia_id = ?",
         [nombre, id, academiaId]
       );
 
-      if (Number(result?.affectedRows ?? 0) === 0) {
-        return reply.code(404).send({ ok: false, message: "No encontrada" });
-      }
+      reply.header("Cache-Control", "no-store");
+      if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrada" });
 
       return reply.send({ ok: true, updated: { id, nombre } });
     } catch (err: any) {
       if (err instanceof ZodError) {
-        const detail = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-        return reply.code(400).send({ ok: false, message: "Payload inválido", detail });
+        return reply.code(400).send({ ok: false, message: "Payload inválido", detail: zodDetail(err) });
       }
-
       if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
         return reply.code(409).send({ ok: false, message: "La categoría ya existe en esta academia" });
       }
-
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
       return reply.code(code).send({ ok: false, message: "Error al actualizar categoría", detail: err?.message });
     }
   });
 
-  // ───────────────────── DELETE /categorias/:id (WRITE scoped) ─────────────────────
+  // PATCH /:id (parcial)
+  app.patch("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
+    const idParsed = IdParam.safeParse(req.params);
+    if (!idParsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
+
+    try {
+      const academiaId = getEffectiveAcademiaId(req);
+      const id = idParsed.data.id;
+
+      const body = PatchSchema.parse(req.body);
+      if (Object.keys(body).length === 0) {
+        return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
+      }
+
+      if (body.nombre !== undefined) {
+        const nombre = body.nombre.trim();
+
+        const dup = await existsByNombreScoped(academiaId, nombre, id);
+        if (dup) return reply.code(409).send({ ok: false, message: "La categoría ya existe en esta academia" });
+
+        const [result]: any = await db.query(
+          "UPDATE categorias SET nombre = ? WHERE id = ? AND academia_id = ?",
+          [nombre, id, academiaId]
+        );
+
+        reply.header("Cache-Control", "no-store");
+        if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrada" });
+
+        return reply.send({ ok: true, updated: { id, nombre } });
+      }
+
+      return reply.code(400).send({ ok: false, message: "No hay campos válidos para actualizar" });
+    } catch (err: any) {
+      if (err instanceof ZodError) {
+        return reply.code(400).send({ ok: false, message: "Payload inválido", detail: zodDetail(err) });
+      }
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
+        return reply.code(409).send({ ok: false, message: "La categoría ya existe en esta academia" });
+      }
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      return reply.code(code).send({ ok: false, message: "Error al actualizar categoría", detail: err?.message });
+    }
+  });
+
+  // DELETE /:id
   app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
@@ -227,9 +248,8 @@ export default async function categorias(app: FastifyInstance) {
         [id, academiaId]
       );
 
-      if (Number(result?.affectedRows ?? 0) === 0) {
-        return reply.code(404).send({ ok: false, message: "No encontrada" });
-      }
+      reply.header("Cache-Control", "no-store");
+      if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrada" });
 
       return reply.send({ ok: true, deleted: id });
     } catch (err: any) {
@@ -240,7 +260,6 @@ export default async function categorias(app: FastifyInstance) {
           detail: err?.sqlMessage ?? err?.message,
         });
       }
-
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
       return reply.code(code).send({ ok: false, message: "Error al eliminar categoría", detail: err?.message });
     }

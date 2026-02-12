@@ -2,7 +2,12 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db";
-import { requireAuth, requireRoles } from "../middlewares/authz";
+import {
+  requireAuth,
+  requireRoles,
+  // ✅ opción 2 exportada (estándar WELI)
+  getEffectiveAcademiaId,
+} from "../middlewares/authz";
 
 /* ─────────────────── Schemas ─────────────────── */
 
@@ -19,16 +24,21 @@ const JugadorIdParam = z.object({
 const PageQuery = z.object({
   limit: z.coerce.number().int().positive().max(200).optional().default(50),
   offset: z.coerce.number().int().nonnegative().optional().default(0),
+
+  // ✅ se acepta por compat, pero se valida contra effectiveAcademiaId
   academia_id: z.coerce.number().int().positive().optional(),
+
   deporte_id: z.coerce.number().int().positive().optional(),
   jugador_id: z.coerce.number().int().positive().optional(),
 });
 
-// ✅ agregado global (SUM) por deporte, opcional academia, opcional partido
+// ✅ agregado global (SUM) por deporte, opcional partido
 const AggregateQuery = z.object({
+  // ✅ se acepta por compat, pero se valida contra effectiveAcademiaId
   academia_id: z.coerce.number().int().positive().optional(),
-  deporte_id: z.coerce.number().int().positive(), // 🔥 requerido
-  // si no viene => acumulado (NULL). Si viene número => por partido específico. Si viene "null" => acumulado
+
+  deporte_id: z.coerce.number().int().positive(), // requerido
+
   partido_id: z
     .union([z.coerce.number().int().positive(), z.literal("null"), z.null()])
     .optional(),
@@ -36,6 +46,7 @@ const AggregateQuery = z.object({
 
 const CreateSchema = z
   .object({
+    // ✅ se acepta por compat, pero se valida contra effectiveAcademiaId
     academia_id: z.coerce.number().int().positive(),
     deporte_id: z.coerce.number().int().positive(),
     jugador_id: z.coerce.number().int().positive(),
@@ -242,10 +253,32 @@ function pickBaseAndSport(
   return { base, sport, rejected };
 }
 
-async function getJugadorScope(jugador_id: number) {
+function normalizePartidoId(v: any): number | null | undefined {
+  // undefined => no viene (default acumulado)
+  // null => acumulado
+  // number => partido específico
+  if (v === undefined) return undefined;
+  if (v === null || v === "null") return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+function assertQueryAcademiaMatchesEffectiveOr403(
+  academia_id: number | undefined,
+  effective: number,
+  reply: any
+) {
+  if (academia_id !== undefined && Number(academia_id) !== Number(effective)) {
+    reply.code(403).send({ ok: false, message: "ACADEMIA_SCOPE_MISMATCH" });
+    return false;
+  }
+  return true;
+}
+
+async function getJugadorScopeInAcademia(jugador_id: number, academia_id: number) {
   const [rows]: any = await db.query(
-    "SELECT id, academia_id, deporte_id FROM jugadores WHERE id = ? LIMIT 1",
-    [jugador_id]
+    "SELECT id, academia_id, deporte_id FROM jugadores WHERE id = ? AND academia_id = ? LIMIT 1",
+    [jugador_id, academia_id]
   );
   const j = rows?.[0];
   if (!j) return null;
@@ -301,10 +334,10 @@ async function ensureSportRow(deporte_id: number, stats_id: number) {
   );
 }
 
-async function getJoinedStatsByStatsId(stats_id: number) {
+async function getJoinedStatsByStatsIdScoped(stats_id: number, academia_id: number) {
   const [baseRows]: any = await db.query(
-    "SELECT * FROM stats_base WHERE id = ? LIMIT 1",
-    [stats_id]
+    "SELECT * FROM stats_base WHERE id = ? AND academia_id = ? LIMIT 1",
+    [stats_id, academia_id]
   );
   const base = baseRows?.[0];
   if (!base) return null;
@@ -313,38 +346,27 @@ async function getJoinedStatsByStatsId(stats_id: number) {
   const table = SPORT_TABLE[deporte_id];
   if (!table) return { base, sport: null };
 
-  const [sportRows]: any = await db.query(
-    `SELECT * FROM \`${table}\` WHERE stats_id = ? LIMIT 1`,
-    [stats_id]
-  );
+  const [sportRows]: any = await db.query(`SELECT * FROM \`${table}\` WHERE stats_id = ? LIMIT 1`, [stats_id]);
   return { base, sport: sportRows?.[0] ?? null };
 }
 
-async function getJoinedStatsByJugadorId(jugador_id: number) {
-  const scope = await getJugadorScope(jugador_id);
+async function getJoinedStatsByJugadorIdScoped(jugador_id: number, academia_id: number) {
+  const scope = await getJugadorScopeInAcademia(jugador_id, academia_id);
   if (!scope) return null;
 
-  const stats_id = await ensureStatsBase(
-    scope.academia_id,
-    scope.deporte_id,
-    scope.jugador_id,
-    null
-  );
+  const stats_id = await ensureStatsBase(scope.academia_id, scope.deporte_id, scope.jugador_id, null);
   await ensureSportRow(scope.deporte_id, stats_id);
 
-  return await getJoinedStatsByStatsId(stats_id);
+  return await getJoinedStatsByStatsIdScoped(stats_id, academia_id);
 }
 
 function buildSportJoinAndSelect(deporte_id?: number) {
-  if (!deporte_id || !SPORT_TABLE[deporte_id]) {
-    return { joinSql: "", selectColsSql: "" };
-  }
+  if (!deporte_id || !SPORT_TABLE[deporte_id]) return { joinSql: "", selectColsSql: "" };
 
   const table = SPORT_TABLE[deporte_id];
   const sportKeys = allowedSportKeys[deporte_id] ?? new Set<string>();
 
   const joinSql = `LEFT JOIN \`${table}\` sd ON sd.stats_id = sb.id`;
-
   const cols = [...sportKeys].map((k) => `sd.\`${k}\` AS \`${k}\``).join(", ");
   const selectColsSql = cols ? `, ${cols}` : "";
 
@@ -355,92 +377,63 @@ function buildSportJoinAndSelect(deporte_id?: number) {
 
 export default async function estadisticas(app: FastifyInstance) {
   /**
-   * ✅ ESTÁNDAR WELI:
-   * - READ: roles 1/2/3
-   * - WRITE: roles 1 y 3
+   * ✅ Mantener matriz:
+   * - READ: 1/2/3
+   * - WRITE: 1/3
    */
   const canRead = [requireAuth, requireRoles([1, 2, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  // Health
-  app.get("/health", { preHandler: canRead }, async () => ({
-    module: "estadisticas",
-    status: "ready",
-    timestamp: new Date().toISOString(),
-  }));
+  app.get("/health", { preHandler: canRead }, async (_req, reply) => {
+    reply.header("Cache-Control", "no-store");
+    return { module: "estadisticas", status: "ready", timestamp: new Date().toISOString() };
+  });
 
-  // Debug auth
+  // (Opcional) Debug auth — se mantiene, pero cuidado en prod
   app.get("/debug/whoami", { preHandler: canRead }, async (req: any, reply) => {
-    return reply.send({ ok: true, user: req.user ?? null });
+    return reply.send({ ok: true, user: req.user ?? null, auth: req.auth ?? null });
   });
 
   /**
-   * ✅ AGGREGATE (SUM) — lo que necesitas para Estadísticas Globales
-   * GET /estadisticas/aggregate?deporte_id=1&academia_id=123
-   * - deporte_id requerido
-   * - academia_id opcional
-   * - partido_id opcional:
-   *   - omitido => acumulado (sb.partido_id IS NULL)
-   *   - partido_id=99 => por ese partido
-   *   - partido_id=null => acumulado
+   * ✅ AGGREGATE (SUM) — SIEMPRE scope por academia efectiva
    */
   app.get("/aggregate", { preHandler: canRead }, async (req, reply) => {
     const parsed = AggregateQuery.safeParse((req as any).query);
     if (!parsed.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: "Query inválida",
-        errors: parsed.error.flatten(),
-      });
+      return reply.code(400).send({ ok: false, message: "Query inválida", errors: parsed.error.flatten() });
     }
 
-    const { academia_id, deporte_id } = parsed.data;
+    let academiaId: number;
+    try {
+      academiaId = getEffectiveAcademiaId(req as any);
+    } catch (e: any) {
+      return reply.code(e?.statusCode ?? 403).send({ ok: false, message: e?.message ?? "FORBIDDEN" });
+    }
 
+    if (!assertQueryAcademiaMatchesEffectiveOr403(parsed.data.academia_id, academiaId, reply)) return;
+
+    const { deporte_id } = parsed.data;
     const table = SPORT_TABLE[deporte_id];
-    if (!table) {
-      return reply.code(400).send({ ok: false, message: "DEPORTE_NO_SOPORTADO" });
-    }
+    if (!table) return reply.code(400).send({ ok: false, message: "DEPORTE_NO_SOPORTADO" });
 
-    // partido_id normalizado
-    let partido_id: number | null | undefined = undefined;
-    if ("partido_id" in parsed.data) {
-      const v: any = (parsed.data as any).partido_id;
-      if (v === "null" || v === null) partido_id = null;
-      else if (typeof v === "number") partido_id = v;
-      else partido_id = undefined;
-    }
+    const partido_id = normalizePartidoId((parsed.data as any).partido_id);
 
-    const where: string[] = ["sb.deporte_id = ?"];
-    const params: any[] = [deporte_id];
+    const where: string[] = ["sb.deporte_id = ?", "sb.academia_id = ?"];
+    const params: any[] = [deporte_id, academiaId];
 
-    if (academia_id) {
-      where.push("sb.academia_id = ?");
-      params.push(academia_id);
-    }
-
-    // ✅ default acumulado si no mandan partido_id
-    if (partido_id === undefined || partido_id === null) {
-      where.push("sb.partido_id IS NULL");
-    } else {
+    // default acumulado si no mandan partido_id
+    if (partido_id === undefined || partido_id === null) where.push("sb.partido_id IS NULL");
+    else {
       where.push("sb.partido_id = ?");
       params.push(partido_id);
     }
 
     const whereSql = `WHERE ${where.join(" AND ")}`;
-
     const sportKeys = allowedSportKeys[deporte_id] ?? new Set<string>();
 
-    // SUM base
-    const baseSumCols = [...baseKeys]
-      .map((k) => `SUM(COALESCE(sb.\`${k}\`,0)) AS \`${k}\``)
-      .join(", ");
+    const baseSumCols = [...baseKeys].map((k) => `SUM(COALESCE(sb.\`${k}\`,0)) AS \`${k}\``).join(", ");
+    const sportSumCols = [...sportKeys].map((k) => `SUM(COALESCE(sd.\`${k}\`,0)) AS \`${k}\``).join(", ");
 
-    // SUM sport
-    const sportSumCols = [...sportKeys]
-      .map((k) => `SUM(COALESCE(sd.\`${k}\`,0)) AS \`${k}\``)
-      .join(", ");
-
-    // métricas extra: cuántas filas base y cuántas faltan en detalle
     try {
       const [rows]: any = await db.query(
         `
@@ -459,18 +452,16 @@ export default async function estadisticas(app: FastifyInstance) {
       const r = rows?.[0] ?? {};
       const totals: Record<string, number> = {};
 
-      // normaliza numeritos
       for (const k of [...baseKeys, ...sportKeys]) {
-        const val = r?.[k];
-        const n = Number(val ?? 0);
+        const n = Number(r?.[k] ?? 0);
         totals[k] = Number.isFinite(n) ? n : 0;
       }
 
       return reply.send({
         ok: true,
         scope: {
+          academia_id: academiaId,
           deporte_id,
-          academia_id: academia_id ?? null,
           partido_id: partido_id ?? null,
           table,
         },
@@ -481,43 +472,37 @@ export default async function estadisticas(app: FastifyInstance) {
         totals,
       });
     } catch (err: any) {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error al agregar estadísticas",
-        error: sqlErr(err),
-      });
+      return reply.code(500).send({ ok: false, message: "Error al agregar estadísticas", error: sqlErr(err) });
     }
   });
 
   /**
-   * ✅ REPAIR faltantes (crea filas de detalle que falten)
-   * Útil para arreglar ese "faltantes = 1"
-   * GET /estadisticas/repair-missing?deporte_id=1&academia_id=123
+   * ✅ REPAIR faltantes — SIEMPRE scope por academia efectiva
    */
   app.get("/repair-missing", { preHandler: canWrite }, async (req, reply) => {
     const parsed = AggregateQuery.safeParse((req as any).query);
     if (!parsed.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: "Query inválida",
-        errors: parsed.error.flatten(),
-      });
+      return reply.code(400).send({ ok: false, message: "Query inválida", errors: parsed.error.flatten() });
     }
 
-    const { academia_id, deporte_id } = parsed.data;
+    let academiaId: number;
+    try {
+      academiaId = getEffectiveAcademiaId(req as any);
+    } catch (e: any) {
+      return reply.code(e?.statusCode ?? 403).send({ ok: false, message: e?.message ?? "FORBIDDEN" });
+    }
+
+    if (!assertQueryAcademiaMatchesEffectiveOr403(parsed.data.academia_id, academiaId, reply)) return;
+
+    const { deporte_id } = parsed.data;
     const table = SPORT_TABLE[deporte_id];
     if (!table) return reply.code(400).send({ ok: false, message: "DEPORTE_NO_SOPORTADO" });
 
-    const where: string[] = ["sb.deporte_id = ?", "sb.partido_id IS NULL"];
-    const params: any[] = [deporte_id];
-    if (academia_id) {
-      where.push("sb.academia_id = ?");
-      params.push(academia_id);
-    }
+    const where: string[] = ["sb.deporte_id = ?", "sb.academia_id = ?", "sb.partido_id IS NULL"];
+    const params: any[] = [deporte_id, academiaId];
     const whereSql = `WHERE ${where.join(" AND ")}`;
 
     try {
-      // toma stats_base que no tengan detalle
       const [missing]: any = await db.query(
         `
         SELECT sb.id AS stats_id
@@ -530,49 +515,42 @@ export default async function estadisticas(app: FastifyInstance) {
         params
       );
 
-      const ids = (missing || []).map((x: any) => Number(x.stats_id)).filter((n: number) => Number.isFinite(n) && n > 0);
+      const ids = (missing || [])
+        .map((x: any) => Number(x.stats_id))
+        .filter((n: number) => Number.isFinite(n) && n > 0);
 
-      for (const id of ids) {
-        await ensureSportRow(deporte_id, id);
-      }
+      for (const id of ids) await ensureSportRow(deporte_id, id);
 
-      return reply.send({
-        ok: true,
-        deporte_id,
-        academia_id: academia_id ?? null,
-        repaired: ids.length,
-      });
+      return reply.send({ ok: true, deporte_id, academia_id: academiaId, repaired: ids.length });
     } catch (err: any) {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error al reparar faltantes",
-        error: sqlErr(err),
-      });
+      return reply.code(500).send({ ok: false, message: "Error al reparar faltantes", error: sqlErr(err) });
     }
   });
 
   /**
    * ✅ LISTADO (paginado) desde stats_base (acumulado por defecto: partido_id NULL)
+   * SIEMPRE scope por academia efectiva
    */
   app.get("/", { preHandler: canRead }, async (req, reply) => {
     const parsed = PageQuery.safeParse((req as any).query);
     if (!parsed.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: "Query inválida",
-        errors: parsed.error.flatten(),
-      });
+      return reply.code(400).send({ ok: false, message: "Query inválida", errors: parsed.error.flatten() });
     }
 
-    const { limit, offset, academia_id, deporte_id, jugador_id } = parsed.data;
-
-    const where: string[] = ["sb.partido_id IS NULL"];
-    const params: any[] = [];
-
-    if (academia_id) {
-      where.push("sb.academia_id = ?");
-      params.push(academia_id);
+    let academiaId: number;
+    try {
+      academiaId = getEffectiveAcademiaId(req as any);
+    } catch (e: any) {
+      return reply.code(e?.statusCode ?? 403).send({ ok: false, message: e?.message ?? "FORBIDDEN" });
     }
+
+    if (!assertQueryAcademiaMatchesEffectiveOr403(parsed.data.academia_id, academiaId, reply)) return;
+
+    const { limit, offset, deporte_id, jugador_id } = parsed.data;
+
+    const where: string[] = ["sb.partido_id IS NULL", "sb.academia_id = ?"];
+    const params: any[] = [academiaId];
+
     if (deporte_id) {
       where.push("sb.deporte_id = ?");
       params.push(deporte_id);
@@ -602,7 +580,7 @@ export default async function estadisticas(app: FastifyInstance) {
           j.rut_jugador
           ${selectColsSql}
         FROM stats_base sb
-        JOIN jugadores j ON j.id = sb.jugador_id
+        JOIN jugadores j ON j.id = sb.jugador_id AND j.academia_id = sb.academia_id
         ${joinSql}
         ${whereSql}
         ORDER BY sb.id DESC
@@ -617,47 +595,37 @@ export default async function estadisticas(app: FastifyInstance) {
         limit,
         offset,
         joined_sport: Boolean(deporte_id && SPORT_TABLE[deporte_id]),
-        note: deporte_id
-          ? undefined
-          : "Para incluir métricas del deporte, envía deporte_id (1..6).",
+        note: deporte_id ? undefined : "Para incluir métricas del deporte, envía deporte_id (1..6).",
       });
     } catch (err: any) {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error al listar",
-        error: sqlErr(err),
-      });
+      return reply.code(500).send({ ok: false, message: "Error al listar", error: sqlErr(err) });
     }
   });
 
   /**
-   * ✅ Alias: /estadisticas/joined -> usa el mismo handler que "/"
-   * (para compat con front que insista con /joined)
+   * ✅ Alias /joined (misma lógica que "/")
    */
   app.get("/joined", { preHandler: canRead }, async (req, reply) => {
-    // reusa exactamente la misma lógica: simplemente redirige internamente
-    // (sin 302 para no romper CORS/clients)
-    (req as any).url = "/";
-    // Llamamos manualmente al handler de "/"
-    // Fastify no expone fácil el handler ya registrado, así que duplicamos por pragmatismo:
+    // simplemente reusa el handler de arriba duplicando lo mínimo (Fastify no expone fácil el handler)
     const parsed = PageQuery.safeParse((req as any).query);
     if (!parsed.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: "Query inválida",
-        errors: parsed.error.flatten(),
-      });
+      return reply.code(400).send({ ok: false, message: "Query inválida", errors: parsed.error.flatten() });
     }
 
-    const { limit, offset, academia_id, deporte_id, jugador_id } = parsed.data;
-
-    const where: string[] = ["sb.partido_id IS NULL"];
-    const params: any[] = [];
-
-    if (academia_id) {
-      where.push("sb.academia_id = ?");
-      params.push(academia_id);
+    let academiaId: number;
+    try {
+      academiaId = getEffectiveAcademiaId(req as any);
+    } catch (e: any) {
+      return reply.code(e?.statusCode ?? 403).send({ ok: false, message: e?.message ?? "FORBIDDEN" });
     }
+
+    if (!assertQueryAcademiaMatchesEffectiveOr403(parsed.data.academia_id, academiaId, reply)) return;
+
+    const { limit, offset, deporte_id, jugador_id } = parsed.data;
+
+    const where: string[] = ["sb.partido_id IS NULL", "sb.academia_id = ?"];
+    const params: any[] = [academiaId];
+
     if (deporte_id) {
       where.push("sb.deporte_id = ?");
       params.push(deporte_id);
@@ -687,7 +655,7 @@ export default async function estadisticas(app: FastifyInstance) {
           j.rut_jugador
           ${selectColsSql}
         FROM stats_base sb
-        JOIN jugadores j ON j.id = sb.jugador_id
+        JOIN jugadores j ON j.id = sb.jugador_id AND j.academia_id = sb.academia_id
         ${joinSql}
         ${whereSql}
         ORDER BY sb.id DESC
@@ -696,33 +664,30 @@ export default async function estadisticas(app: FastifyInstance) {
         [...params, limit, offset]
       );
 
-      return reply.send({
-        ok: true,
-        items: rows,
-        limit,
-        offset,
-        joined_sport: Boolean(deporte_id && SPORT_TABLE[deporte_id]),
-      });
+      return reply.send({ ok: true, items: rows, limit, offset, joined_sport: Boolean(deporte_id && SPORT_TABLE[deporte_id]) });
     } catch (err: any) {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error al listar (joined)",
-        error: sqlErr(err),
-      });
+      return reply.code(500).send({ ok: false, message: "Error al listar (joined)", error: sqlErr(err) });
     }
   });
 
   /**
-   * ✅ Conveniencia por jugador_id
+   * ✅ Conveniencia por jugador_id (SIEMPRE scope por academia efectiva)
    */
   app.get("/by-jugador/:jugador_id", { preHandler: canRead }, async (req, reply) => {
     const p = JugadorIdParam.safeParse((req as any).params);
     if (!p.success) return reply.code(400).send({ ok: false, message: "jugador_id inválido" });
 
+    let academiaId: number;
+    try {
+      academiaId = getEffectiveAcademiaId(req as any);
+    } catch (e: any) {
+      return reply.code(e?.statusCode ?? 403).send({ ok: false, message: e?.message ?? "FORBIDDEN" });
+    }
+
     const jugador_id = Number(p.data.jugador_id);
 
     try {
-      const joined = await getJoinedStatsByJugadorId(jugador_id);
+      const joined = await getJoinedStatsByJugadorIdScoped(jugador_id, academiaId);
       if (!joined) return reply.code(404).send({ ok: false, message: "Jugador no encontrado" });
 
       return reply.send({ ok: true, item: joined });
@@ -732,23 +697,31 @@ export default async function estadisticas(app: FastifyInstance) {
   });
 
   /**
-   * ✅ Conveniencia por RUT
+   * ✅ Conveniencia por RUT (SIEMPRE scope por academia efectiva)
    */
   app.get("/by-rut/:rut", { preHandler: canRead }, async (req, reply) => {
     const parsed = RutParam.safeParse((req as any).params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: parsed.error.issues[0]?.message });
 
+    let academiaId: number;
+    try {
+      academiaId = getEffectiveAcademiaId(req as any);
+    } catch (e: any) {
+      return reply.code(e?.statusCode ?? 403).send({ ok: false, message: e?.message ?? "FORBIDDEN" });
+    }
+
     const rut = parsed.data.rut;
 
     try {
       const [rows]: any = await db.query(
-        "SELECT id AS jugador_id FROM jugadores WHERE rut_jugador = ? LIMIT 1",
-        [rut]
+        "SELECT id AS jugador_id FROM jugadores WHERE rut_jugador = ? AND academia_id = ? LIMIT 1",
+        [rut, academiaId]
       );
+
       const jugador_id = rows?.[0]?.jugador_id ? Number(rows[0].jugador_id) : null;
       if (!jugador_id) return reply.code(404).send({ ok: false, message: "Jugador no encontrado" });
 
-      const joined = await getJoinedStatsByJugadorId(jugador_id);
+      const joined = await getJoinedStatsByJugadorIdScoped(jugador_id, academiaId);
       return reply.send({ ok: true, item: joined });
     } catch (err: any) {
       return reply.code(500).send({ ok: false, message: "Error al obtener por RUT", error: sqlErr(err) });
@@ -756,7 +729,7 @@ export default async function estadisticas(app: FastifyInstance) {
   });
 
   /**
-   * ✅ POST /estadisticas
+   * ✅ POST /estadisticas (WRITE: 1/3) — SIEMPRE scope por academia efectiva
    */
   app.post("/", { preHandler: canWrite }, async (req, reply) => {
     const parsed = CreateSchema.safeParse((req as any).body);
@@ -764,10 +737,21 @@ export default async function estadisticas(app: FastifyInstance) {
       return reply.code(400).send({ ok: false, message: "Payload inválido", errors: parsed.error.flatten() });
     }
 
+    let academiaId: number;
+    try {
+      academiaId = getEffectiveAcademiaId(req as any);
+    } catch (e: any) {
+      return reply.code(e?.statusCode ?? 403).send({ ok: false, message: e?.message ?? "FORBIDDEN" });
+    }
+
+    // ✅ NO confiar en academia_id del body: validar que calce
+    if (Number(parsed.data.academia_id) !== Number(academiaId)) {
+      return reply.code(403).send({ ok: false, message: "ACADEMIA_SCOPE_MISMATCH" });
+    }
+
     const body = (req as any).body || {};
     const raw = coerceNumbers(body);
 
-    const academia_id = Number(parsed.data.academia_id);
     const deporte_id = Number(parsed.data.deporte_id);
     const jugador_id = Number(parsed.data.jugador_id);
     const partido_id = parsed.data.partido_id ?? null;
@@ -775,15 +759,17 @@ export default async function estadisticas(app: FastifyInstance) {
     const table = SPORT_TABLE[deporte_id];
     if (!table) return reply.code(400).send({ ok: false, message: "DEPORTE_NO_SOPORTADO" });
 
-    const scope = await getJugadorScope(jugador_id);
+    // ✅ jugador debe pertenecer a academia efectiva
+    const scope = await getJugadorScopeInAcademia(jugador_id, academiaId);
     if (!scope) return reply.code(404).send({ ok: false, message: "Jugador no encontrado" });
 
-    if (scope.academia_id !== academia_id || scope.deporte_id !== deporte_id) {
+    // ✅ deporte debe calzar con el jugador
+    if (scope.deporte_id !== deporte_id) {
       return reply.code(409).send({
         ok: false,
-        message: "SCOPE_MISMATCH: jugador no coincide con academia_id/deporte_id enviados",
+        message: "SCOPE_MISMATCH: jugador no coincide con deporte_id enviado",
         scope,
-        requested: { academia_id, deporte_id, jugador_id },
+        requested: { academia_id: academiaId, deporte_id, jugador_id },
       });
     }
 
@@ -795,13 +781,13 @@ export default async function estadisticas(app: FastifyInstance) {
     }
 
     try {
-      const stats_id = await ensureStatsBase(academia_id, deporte_id, jugador_id, partido_id);
+      const stats_id = await ensureStatsBase(academiaId, deporte_id, jugador_id, partido_id);
       await ensureSportRow(deporte_id, stats_id);
 
-      if (Object.keys(base).length) await db.query("UPDATE stats_base SET ? WHERE id = ?", [base, stats_id]);
+      if (Object.keys(base).length) await db.query("UPDATE stats_base SET ? WHERE id = ? AND academia_id = ?", [base, stats_id, academiaId]);
       if (Object.keys(sport).length) await db.query(`UPDATE \`${table}\` SET ? WHERE stats_id = ?`, [sport, stats_id]);
 
-      const joined = await getJoinedStatsByStatsId(stats_id);
+      const joined = await getJoinedStatsByStatsIdScoped(stats_id, academiaId);
       return reply.code(201).send({ ok: true, stats_id, item: joined, rejected_keys: rejected });
     } catch (err: any) {
       return reply.code(500).send({ ok: false, message: "Error al crear/actualizar", error: sqlErr(err) });
@@ -809,22 +795,33 @@ export default async function estadisticas(app: FastifyInstance) {
   });
 
   /**
-   * ✅ PUT /estadisticas/:id
+   * ✅ PUT /estadisticas/:id (WRITE: 1/3) — SIEMPRE scope por academia efectiva
    */
   app.put("/:id", { preHandler: canWrite }, async (req, reply) => {
     const pid = IdParam.safeParse((req as any).params);
     if (!pid.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
     const stats_id = Number(pid.data.id);
+
     const parsedBody = UpdateSchema.safeParse((req as any).body ?? {});
     if (!parsedBody.success) {
       return reply.code(400).send({ ok: false, message: "Payload inválido", errors: parsedBody.error.flatten() });
     }
 
+    let academiaId: number;
+    try {
+      academiaId = getEffectiveAcademiaId(req as any);
+    } catch (e: any) {
+      return reply.code(e?.statusCode ?? 403).send({ ok: false, message: e?.message ?? "FORBIDDEN" });
+    }
+
     const raw = coerceNumbers((req as any).body || {});
 
     try {
-      const [rows]: any = await db.query("SELECT deporte_id FROM stats_base WHERE id = ? LIMIT 1", [stats_id]);
+      const [rows]: any = await db.query(
+        "SELECT deporte_id FROM stats_base WHERE id = ? AND academia_id = ? LIMIT 1",
+        [stats_id, academiaId]
+      );
       const baseRow = rows?.[0];
       if (!baseRow) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
@@ -849,10 +846,14 @@ export default async function estadisticas(app: FastifyInstance) {
 
       await ensureSportRow(deporte_id, stats_id);
 
-      if (Object.keys(base).length) await db.query("UPDATE stats_base SET ? WHERE id = ?", [base, stats_id]);
-      if (Object.keys(sport).length) await db.query(`UPDATE \`${table}\` SET ? WHERE stats_id = ?`, [sport, stats_id]);
+      if (Object.keys(base).length) {
+        await db.query("UPDATE stats_base SET ? WHERE id = ? AND academia_id = ?", [base, stats_id, academiaId]);
+      }
+      if (Object.keys(sport).length) {
+        await db.query(`UPDATE \`${table}\` SET ? WHERE stats_id = ?`, [sport, stats_id]);
+      }
 
-      const joined = await getJoinedStatsByStatsId(stats_id);
+      const joined = await getJoinedStatsByStatsIdScoped(stats_id, academiaId);
       return reply.send({ ok: true, stats_id, item: joined, rejected_keys: rejected });
     } catch (err: any) {
       return reply.code(500).send({ ok: false, message: "Error al actualizar", error: sqlErr(err) });
@@ -860,7 +861,7 @@ export default async function estadisticas(app: FastifyInstance) {
   });
 
   /**
-   * ✅ DELETE /estadisticas/:id
+   * ✅ DELETE /estadisticas/:id (WRITE: 1/3) — SIEMPRE scope por academia efectiva
    */
   app.delete("/:id", { preHandler: canWrite }, async (req, reply) => {
     const parsed = IdParam.safeParse((req as any).params);
@@ -868,9 +869,16 @@ export default async function estadisticas(app: FastifyInstance) {
 
     const stats_id = Number(parsed.data.id);
 
+    let academiaId: number;
     try {
-      const [result]: any = await db.query("DELETE FROM stats_base WHERE id = ?", [stats_id]);
-      if (result.affectedRows === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
+      academiaId = getEffectiveAcademiaId(req as any);
+    } catch (e: any) {
+      return reply.code(e?.statusCode ?? 403).send({ ok: false, message: e?.message ?? "FORBIDDEN" });
+    }
+
+    try {
+      const [result]: any = await db.query("DELETE FROM stats_base WHERE id = ? AND academia_id = ?", [stats_id, academiaId]);
+      if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       return reply.send({ ok: true, deleted: stats_id });
     } catch (err: any) {
@@ -879,7 +887,7 @@ export default async function estadisticas(app: FastifyInstance) {
   });
 
   /**
-   * ✅ GET /estadisticas/:id
+   * ✅ GET /estadisticas/:id (READ: 1/2/3) — SIEMPRE scope por academia efectiva
    * (al final para no pisar /aggregate, /joined, /by-*)
    */
   app.get("/:id", { preHandler: canRead }, async (req, reply) => {
@@ -888,8 +896,15 @@ export default async function estadisticas(app: FastifyInstance) {
 
     const stats_id = Number(parsed.data.id);
 
+    let academiaId: number;
     try {
-      const joined = await getJoinedStatsByStatsId(stats_id);
+      academiaId = getEffectiveAcademiaId(req as any);
+    } catch (e: any) {
+      return reply.code(e?.statusCode ?? 403).send({ ok: false, message: e?.message ?? "FORBIDDEN" });
+    }
+
+    try {
+      const joined = await getJoinedStatsByStatsIdScoped(stats_id, academiaId);
       if (!joined) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       return reply.send({ ok: true, item: joined });

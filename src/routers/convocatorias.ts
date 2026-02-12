@@ -2,9 +2,11 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { z } from "zod";
 import { db } from "../db";
-import { requireAuth, requireRoles } from "../middlewares/authz";
-
-const ACADEMIA_HEADER = "x-academia-id";
+import {
+  requireAuth,
+  requireRoles,
+  getEffectiveAcademiaId, // ✅ estándar único
+} from "../middlewares/authz";
 
 // Helpers
 const b2i = (v: boolean | number | undefined | null) => (v ? 1 : 0);
@@ -35,52 +37,6 @@ const PaginationQuery = z.object({
   pageSize: z.coerce.number().int().positive().optional(),
 });
 
-/* ───────── Auth / scope helpers (multi-academia) ───────── */
-
-type ReqUser = { rol_id?: number; academia_id?: number | null };
-
-function getUser(req: FastifyRequest): ReqUser {
-  return ((req as any).user ?? {}) as any;
-}
-
-function getRol(req: FastifyRequest): number {
-  const u = getUser(req);
-  const r = Number((u as any).rol_id ?? 0);
-  return Number.isFinite(r) ? r : 0;
-}
-
-/**
- * Scope multi-academia para CONVOCATORIAS:
- * - rol 1 (admin academia): academia desde token (req.user.academia_id)
- * - rol 3 (superadmin): solo lectura, pero debe indicar x-academia-id (para no mezclar tenants)
- */
-function getAcademiaScopeOrReply(req: FastifyRequest, reply: FastifyReply): number | null {
-  const rol = getRol(req);
-
-  if (rol === 1) {
-    const a = Number(getUser(req)?.academia_id ?? 0);
-    if (!Number.isFinite(a) || a <= 0) {
-      reply.code(403).send({ ok: false, message: "ACADEMIA_REQUIRED" });
-      return null;
-    }
-    return a;
-  }
-
-  if (rol === 3) {
-    const raw = (req.headers as any)?.[ACADEMIA_HEADER];
-    const v = Array.isArray(raw) ? raw[0] : raw;
-    const a = Number(v);
-    if (!Number.isFinite(a) || a <= 0) {
-      reply.code(403).send({ ok: false, message: "Debes seleccionar una academia." });
-      return null;
-    }
-    return a;
-  }
-
-  reply.code(403).send({ ok: false, message: "FORBIDDEN" });
-  return null;
-}
-
 async function assertEventoInAcademiaOrReply(
   evento_id: number,
   academia_id: number,
@@ -105,10 +61,11 @@ async function assertConvocatoriaIdInAcademiaOrReply(
   const [rows]: any = await db.query(
     `
     SELECT c.id
-    FROM convocatorias c
-    JOIN eventos e ON e.id = c.evento_id
-    WHERE c.id = ? AND e.academia_id = ?
-    LIMIT 1
+      FROM convocatorias c
+      JOIN eventos e ON e.id = c.evento_id
+     WHERE c.id = ?
+       AND e.academia_id = ?
+     LIMIT 1
     `,
     [id, academia_id]
   );
@@ -126,17 +83,17 @@ async function assertConvocatoriaIdInAcademiaOrReply(
 export default async function convocatorias(app: FastifyInstance) {
   // ✅ Read: rol 1 y 3
   const canRead = [requireAuth, requireRoles([1, 3])];
-  // ✅ Write: solo rol 1
-  const canWrite = [requireAuth, requireRoles([1])];
+  // ✅ Write: rol 1 y 3 (regla platino: superadmin también crea/edita/borrar dentro de academia objetivo)
+  const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  // ================= HEALTH (READ) =================
+  // ================= HEALTH =================
   app.get("/health", { preHandler: canRead }, async () => ({
     module: "convocatorias",
     status: "ready",
     timestamp: new Date().toISOString(),
   }));
 
-  // ================= GET TODOS (READ) =================
+  // ================= GET TODOS =================
   app.get("/", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const q = PaginationQuery.safeParse(req.query);
@@ -147,8 +104,7 @@ export default async function convocatorias(app: FastifyInstance) {
       const limit = Math.min(Math.max(pageSize, 1), 200);
       const offset = (safePage - 1) * limit;
 
-      const academia_id = getAcademiaScopeOrReply(req, reply);
-      if (!academia_id) return;
+      const academia_id = getEffectiveAcademiaId(req);
 
       const [rows] = await db.query(
         `
@@ -169,13 +125,14 @@ export default async function convocatorias(app: FastifyInstance) {
         titular: i2b(r.titular),
       }));
 
-      return reply.send({ ok: true, items, page: safePage, pageSize: limit });
+      return reply.send({ ok: true, items, page: safePage, pageSize: limit, academia_id });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al listar convocatorias", error: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? Number(err.statusCode) : 500;
+      return reply.code(code).send({ ok: false, message: "Error al listar convocatorias", error: err?.message });
     }
   });
 
-  // ================= GET POR EVENTO (READ) =================
+  // ================= GET POR EVENTO =================
   app.get("/evento/:evento_id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const p = EventoParam.safeParse(req.params);
     if (!p.success) return reply.code(400).send({ ok: false, message: "evento_id inválido" });
@@ -190,13 +147,12 @@ export default async function convocatorias(app: FastifyInstance) {
 
     const evento_id = p.data.evento_id;
 
-    const academia_id = getAcademiaScopeOrReply(req, reply);
-    if (!academia_id) return;
-
-    const okEvento = await assertEventoInAcademiaOrReply(evento_id, academia_id, reply);
-    if (!okEvento) return;
-
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
+      const okEvento = await assertEventoInAcademiaOrReply(evento_id, academia_id, reply);
+      if (!okEvento) return;
+
       const [rows] = await db.query(
         `
         SELECT c.id, c.jugador_rut, c.fecha_partido, c.evento_id, c.convocatoria_id,
@@ -217,13 +173,14 @@ export default async function convocatorias(app: FastifyInstance) {
         titular: i2b(r.titular),
       }));
 
-      return reply.send({ ok: true, items, page: safePage, pageSize: limit });
+      return reply.send({ ok: true, items, page: safePage, pageSize: limit, academia_id });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al listar por evento", error: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? Number(err.statusCode) : 500;
+      return reply.code(code).send({ ok: false, message: "Error al listar por evento", error: err?.message });
     }
   });
 
-  // ================= GET por evento + convocatoria_id (READ) =================
+  // ================= GET por evento + convocatoria_id =================
   app.get(
     "/evento/:evento_id/convocatoria/:convocatoria_id",
     { preHandler: canRead },
@@ -233,13 +190,12 @@ export default async function convocatorias(app: FastifyInstance) {
 
       const { evento_id, convocatoria_id } = p.data;
 
-      const academia_id = getAcademiaScopeOrReply(req, reply);
-      if (!academia_id) return;
-
-      const okEvento = await assertEventoInAcademiaOrReply(evento_id, academia_id, reply);
-      if (!okEvento) return;
-
       try {
+        const academia_id = getEffectiveAcademiaId(req);
+
+        const okEvento = await assertEventoInAcademiaOrReply(evento_id, academia_id, reply);
+        if (!okEvento) return;
+
         const [rows]: any = await db.query(
           `
           SELECT c.id, c.jugador_rut, c.fecha_partido, c.evento_id, c.convocatoria_id,
@@ -260,9 +216,10 @@ export default async function convocatorias(app: FastifyInstance) {
           titular: i2b(r.titular),
         }));
 
-        return reply.send({ ok: true, items });
+        return reply.send({ ok: true, items, academia_id });
       } catch (err: any) {
-        return reply.code(500).send({
+        const code = err?.statusCode && Number.isFinite(err.statusCode) ? Number(err.statusCode) : 500;
+        return reply.code(code).send({
           ok: false,
           message: "Error al obtener jugadores de la convocatoria",
           error: err?.message,
@@ -271,17 +228,16 @@ export default async function convocatorias(app: FastifyInstance) {
     }
   );
 
-  // ================= GET por ID (READ) =================
+  // ================= GET por ID =================
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const p = IdParam.safeParse(req.params);
     if (!p.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
     const id = p.data.id;
 
-    const academia_id = getAcademiaScopeOrReply(req, reply);
-    if (!academia_id) return;
-
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
       const [rows]: any = await db.query(
         `
         SELECT c.id, c.jugador_rut, c.fecha_partido, c.evento_id, c.convocatoria_id,
@@ -298,13 +254,18 @@ export default async function convocatorias(app: FastifyInstance) {
       if (!rows?.length) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       const r = rows[0];
-      return reply.send({ ok: true, item: { ...r, asistio: i2b(r.asistio), titular: i2b(r.titular) } });
+      return reply.send({
+        ok: true,
+        item: { ...r, asistio: i2b(r.asistio), titular: i2b(r.titular) },
+        academia_id,
+      });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al obtener convocatoria", error: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? Number(err.statusCode) : 500;
+      return reply.code(code).send({ ok: false, message: "Error al obtener convocatoria", error: err?.message });
     }
   });
 
-  // ================= POST (WRITE solo rol 1) =================
+  // ================= POST (WRITE) =================
   app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     // Validar tamaño (1 MB)
     const sizeBytes = Buffer.byteLength(JSON.stringify(req.body ?? {}));
@@ -329,16 +290,21 @@ export default async function convocatorias(app: FastifyInstance) {
 
     const evento_id = eventoIds[0];
 
-    const academia_id = getAcademiaScopeOrReply(req, reply); // rol 1 toma del token
-    if (!academia_id) return;
-
-    const okEvento = await assertEventoInAcademiaOrReply(evento_id, academia_id, reply);
-    if (!okEvento) return;
-
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
+      const okEvento = await assertEventoInAcademiaOrReply(evento_id, academia_id, reply);
+      if (!okEvento) return;
+
       const [rowsMax]: any = await db.query(
-        "SELECT COALESCE(MAX(convocatoria_id), 0) AS maxConv FROM convocatorias WHERE evento_id = ?",
-        [evento_id]
+        `
+        SELECT COALESCE(MAX(c.convocatoria_id), 0) AS maxConv
+          FROM convocatorias c
+          JOIN eventos e ON e.id = c.evento_id
+         WHERE c.evento_id = ?
+           AND e.academia_id = ?
+        `,
+        [evento_id, academia_id]
       );
 
       const nextConvId = (rowsMax?.[0]?.maxConv || 0) + 1;
@@ -362,13 +328,20 @@ export default async function convocatorias(app: FastifyInstance) {
         [values]
       );
 
-      return reply.code(201).send({ ok: true, evento_id, convocatoria_id: nextConvId, inserted: values.length });
+      return reply.code(201).send({
+        ok: true,
+        evento_id,
+        convocatoria_id: nextConvId,
+        inserted: values.length,
+        academia_id,
+      });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al crear convocatoria(s)", error: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? Number(err.statusCode) : 500;
+      return reply.code(code).send({ ok: false, message: "Error al crear convocatoria(s)", error: err?.message });
     }
   });
 
-  // ================= PUT (WRITE solo rol 1) =================
+  // ================= PUT (WRITE) =================
   app.put("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const idParsed = IdParam.safeParse(req.params);
     if (!idParsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
@@ -381,30 +354,29 @@ export default async function convocatorias(app: FastifyInstance) {
     const id = idParsed.data.id;
     const data = bodyParsed.data;
 
-    const academia_id = getAcademiaScopeOrReply(req, reply);
-    if (!academia_id) return;
-
-    const okRow = await assertConvocatoriaIdInAcademiaOrReply(id, academia_id, reply);
-    if (!okRow) return;
-
-    if (data.evento_id !== undefined) {
-      const okEvento = await assertEventoInAcademiaOrReply(Number(data.evento_id), academia_id, reply);
-      if (!okEvento) return;
-    }
-
-    const fields: string[] = [];
-    const values: any[] = [];
-
-    if (data.jugador_rut !== undefined) { fields.push("jugador_rut = ?"); values.push(data.jugador_rut); }
-    if (data.fecha_partido !== undefined) { fields.push("fecha_partido = ?"); values.push(data.fecha_partido); }
-    if (data.evento_id !== undefined) { fields.push("evento_id = ?"); values.push(data.evento_id); }
-    if (data.asistio !== undefined) { fields.push("asistio = ?"); values.push(b2i(data.asistio)); }
-    if (data.titular !== undefined) { fields.push("titular = ?"); values.push(b2i(data.titular)); }
-    if (data.observaciones !== undefined) { fields.push("observaciones = ?"); values.push(data.observaciones ?? null); }
-
-    if (fields.length === 0) return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
-
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
+      const okRow = await assertConvocatoriaIdInAcademiaOrReply(id, academia_id, reply);
+      if (!okRow) return;
+
+      if (data.evento_id !== undefined) {
+        const okEvento = await assertEventoInAcademiaOrReply(Number(data.evento_id), academia_id, reply);
+        if (!okEvento) return;
+      }
+
+      const fields: string[] = [];
+      const values: any[] = [];
+
+      if (data.jugador_rut !== undefined) { fields.push("jugador_rut = ?"); values.push(data.jugador_rut); }
+      if (data.fecha_partido !== undefined) { fields.push("fecha_partido = ?"); values.push(data.fecha_partido); }
+      if (data.evento_id !== undefined) { fields.push("evento_id = ?"); values.push(data.evento_id); }
+      if (data.asistio !== undefined) { fields.push("asistio = ?"); values.push(b2i(data.asistio)); }
+      if (data.titular !== undefined) { fields.push("titular = ?"); values.push(b2i(data.titular)); }
+      if (data.observaciones !== undefined) { fields.push("observaciones = ?"); values.push(data.observaciones ?? null); }
+
+      if (fields.length === 0) return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
+
       const [result]: any = await db.query(
         `UPDATE convocatorias SET ${fields.join(", ")} WHERE id = ?`,
         [...values, id]
@@ -414,32 +386,33 @@ export default async function convocatorias(app: FastifyInstance) {
         return reply.code(404).send({ ok: false, message: "No encontrado" });
       }
 
-      return reply.send({ ok: true, updated: { id, ...data } });
+      return reply.send({ ok: true, updated: { id, ...data }, academia_id });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al actualizar", error: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? Number(err.statusCode) : 500;
+      return reply.code(code).send({ ok: false, message: "Error al actualizar", error: err?.message });
     }
   });
 
-  // ================= DELETE (WRITE solo rol 1) =================
+  // ================= DELETE (WRITE) =================
   app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const p = IdParam.safeParse(req.params);
     if (!p.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
     const id = p.data.id;
 
-    const academia_id = getAcademiaScopeOrReply(req, reply);
-    if (!academia_id) return;
-
-    const okRow = await assertConvocatoriaIdInAcademiaOrReply(id, academia_id, reply);
-    if (!okRow) return;
-
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
+      const okRow = await assertConvocatoriaIdInAcademiaOrReply(id, academia_id, reply);
+      if (!okRow) return;
+
       const [result]: any = await db.query("DELETE FROM convocatorias WHERE id = ?", [id]);
       if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
-      return reply.send({ ok: true, deleted: id });
+      return reply.send({ ok: true, deleted: id, academia_id });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al eliminar", error: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? Number(err.statusCode) : 500;
+      return reply.code(code).send({ ok: false, message: "Error al eliminar", error: err?.message });
     }
   });
 }

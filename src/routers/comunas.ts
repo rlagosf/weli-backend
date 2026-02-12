@@ -18,7 +18,7 @@ const CreateSchema = z
 
 const UpdateSchema = z
   .object({
-    nombre: z.string().trim().min(1).max(100).optional(),
+    nombre: z.string().trim().min(1, "El nombre es obligatorio").max(100).optional(),
   })
   .strict();
 
@@ -32,20 +32,24 @@ function normalizeOut(row: any) {
   };
 }
 
+function zodDetail(err: ZodError) {
+  return err.issues.map((i) => `${i.path.join(".") || "field"}: ${i.message}`).join("; ");
+}
+
 async function existsByNombre(nombre: string, excludeId?: number) {
-  const n = nombre.trim();
+  const n = String(nombre ?? "").trim();
   if (!n) return false;
 
   if (excludeId) {
     const [rows]: any = await db.query(
-      "SELECT id FROM comunas WHERE LOWER(nombre) = LOWER(?) AND id <> ? LIMIT 1",
+      "SELECT id FROM comunas WHERE LOWER(TRIM(nombre)) = LOWER(?) AND id <> ? LIMIT 1",
       [n, excludeId]
     );
     return Array.isArray(rows) && rows.length > 0;
   }
 
   const [rows]: any = await db.query(
-    "SELECT id FROM comunas WHERE LOWER(nombre) = LOWER(?) LIMIT 1",
+    "SELECT id FROM comunas WHERE LOWER(TRIM(nombre)) = LOWER(?) LIMIT 1",
     [n]
   );
   return Array.isArray(rows) && rows.length > 0;
@@ -56,22 +60,24 @@ async function existsByNombre(nombre: string, excludeId?: number) {
 export default async function comunas(app: FastifyInstance) {
   // ✅ Catálogo global
   // - Read: roles 1/2/3
-  // - Write: roles 1/3 (admin + superadmin)
+  // - Write: roles 1/3
   const canRead = [requireAuth, requireRoles([1, 2, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
   // Health
-  app.get("/health", { preHandler: canRead }, async () => ({
-    module: "comunas",
-    status: "ready",
-    timestamp: new Date().toISOString(),
-  }));
+  app.get("/health", { preHandler: canRead }, async (_req, reply) => {
+    reply.header("Cache-Control", "no-store");
+    return { module: "comunas", status: "ready", timestamp: new Date().toISOString() };
+  });
 
-  // GET /comunas
+  // GET /
   app.get("/", { preHandler: canRead }, async (_req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const [rows]: any = await db.query("SELECT id, nombre FROM comunas ORDER BY nombre ASC");
+      const [rows]: any = await db.query(
+        "SELECT id, nombre FROM comunas ORDER BY nombre ASC, id ASC"
+      );
 
+      reply.header("Cache-Control", "no-store");
       return reply.send({
         ok: true,
         items: (rows || []).map(normalizeOut),
@@ -86,23 +92,21 @@ export default async function comunas(app: FastifyInstance) {
     }
   });
 
-  // GET /comunas/:id
+  // GET /:id
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const pid = IdParam.safeParse(req.params);
-    if (!pid.success) {
-      return reply.code(400).send({ ok: false, message: "ID inválido" });
-    }
+    if (!pid.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
     const { id } = pid.data;
 
     try {
-      const [rows]: any = await db.query("SELECT id, nombre FROM comunas WHERE id = ? LIMIT 1", [
-        id,
-      ]);
+      const [rows]: any = await db.query(
+        "SELECT id, nombre FROM comunas WHERE id = ? LIMIT 1",
+        [id]
+      );
 
-      if (!rows || rows.length === 0) {
-        return reply.code(404).send({ ok: false, message: "No encontrado" });
-      }
+      reply.header("Cache-Control", "no-store");
+      if (!rows?.length) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       return reply.send({ ok: true, item: normalizeOut(rows[0]) });
     } catch (err: any) {
@@ -114,7 +118,7 @@ export default async function comunas(app: FastifyInstance) {
     }
   });
 
-  // POST /comunas
+  // POST /
   app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const parsed = CreateSchema.parse(req.body);
@@ -131,6 +135,7 @@ export default async function comunas(app: FastifyInstance) {
 
       const [result]: any = await db.query("INSERT INTO comunas (nombre) VALUES (?)", [nombre]);
 
+      reply.header("Cache-Control", "no-store");
       return reply.code(201).send({
         ok: true,
         id: result.insertId,
@@ -141,11 +146,11 @@ export default async function comunas(app: FastifyInstance) {
         return reply.code(400).send({
           ok: false,
           message: "Payload inválido",
-          detail: err.issues.map((i) => i.message).join("; "),
+          detail: zodDetail(err),
         });
       }
 
-      if (err?.errno === 1062) {
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
         return reply.code(409).send({ ok: false, message: "Duplicado: la comuna ya existe" });
       }
 
@@ -157,22 +162,20 @@ export default async function comunas(app: FastifyInstance) {
     }
   });
 
-  // PATCH /comunas/:id
+  // PATCH /:id
   app.patch("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const pid = IdParam.safeParse(req.params);
-    if (!pid.success) {
-      return reply.code(400).send({ ok: false, message: "ID inválido" });
-    }
+    if (!pid.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
     const { id } = pid.data;
 
     try {
       const parsed = UpdateSchema.parse(req.body);
-      if (!parsed.nombre) {
+      const nombre = parsed.nombre?.trim();
+
+      if (!nombre) {
         return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
       }
-
-      const nombre = parsed.nombre.trim();
 
       const dup = await existsByNombre(nombre, id);
       if (dup) {
@@ -188,6 +191,7 @@ export default async function comunas(app: FastifyInstance) {
         id,
       ]);
 
+      reply.header("Cache-Control", "no-store");
       if (Number(result?.affectedRows ?? 0) === 0) {
         return reply.code(404).send({ ok: false, message: "No encontrado" });
       }
@@ -198,11 +202,11 @@ export default async function comunas(app: FastifyInstance) {
         return reply.code(400).send({
           ok: false,
           message: "Payload inválido",
-          detail: err.issues.map((i) => i.message).join("; "),
+          detail: zodDetail(err),
         });
       }
 
-      if (err?.errno === 1062) {
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
         return reply.code(409).send({ ok: false, message: "Duplicado: la comuna ya existe" });
       }
 
@@ -214,28 +218,32 @@ export default async function comunas(app: FastifyInstance) {
     }
   });
 
-  // DELETE /comunas/:id
+  // DELETE /:id
   app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const pid = IdParam.safeParse(req.params);
-    if (!pid.success) {
-      return reply.code(400).send({ ok: false, message: "ID inválido" });
-    }
+    if (!pid.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
     const { id } = pid.data;
 
     try {
       const [result]: any = await db.query("DELETE FROM comunas WHERE id = ?", [id]);
 
+      reply.header("Cache-Control", "no-store");
       if (Number(result?.affectedRows ?? 0) === 0) {
         return reply.code(404).send({ ok: false, message: "No encontrado" });
       }
 
       return reply.send({ ok: true, deleted: id });
     } catch (err: any) {
-      if (err?.errno === 1451) {
+      const isFk =
+        err?.errno === 1451 ||
+        err?.code === "ER_ROW_IS_REFERENCED_2" ||
+        String(err?.code || "").includes("ER_ROW_IS_REFERENCED");
+
+      if (isFk) {
         return reply.code(409).send({
           ok: false,
-          message: "No se puede eliminar: hay jugadores asociados a esta comuna",
+          message: "No se puede eliminar: hay entidades asociadas a esta comuna",
           detail: err?.sqlMessage ?? err?.message,
         });
       }

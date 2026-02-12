@@ -1,21 +1,15 @@
 // src/routers/eventos.ts
-import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { db } from "../db";
 import { requireAuth, requireRoles } from "../middlewares/authz";
-
-const ACADEMIA_HEADER = "x-academia-id";
 
 /**
  * Tabla: eventos
  *  id, academia_id, titulo, descripcion, fecha_inicio, fecha_fin, creado_en, actualizado_en
  */
 
-type ReqUser = {
-  id?: number;
-  rol_id?: number;
-  academia_id?: number | null;
-};
+/* ───────────────────────── ZOD ───────────────────────── */
 
 const IdParam = z.object({
   id: z.coerce.number().int().positive(),
@@ -40,6 +34,8 @@ const PageQuery = z.object({
   offset: z.coerce.number().int().nonnegative().default(0),
 });
 
+/* ───────────────────────── Helpers ───────────────────────── */
+
 // Normaliza fecha de ISO o 'YYYY-MM-DD HH:MM:SS' a 'YYYY-MM-DD HH:MM:SS'
 function toSQLDateTime(input: string): string | null {
   if (!input) return null;
@@ -61,16 +57,8 @@ function toSQLDateTime(input: string): string | null {
   return `${yyyy}-${mm}-${dd} ${HH}:${MM}:${SS}`;
 }
 
-// Comparación segura: convertimos a ISO para Date.parse
-function sqlToIso(sql: string): string {
-  // "YYYY-MM-DD HH:MM:SS" -> "YYYY-MM-DDTHH:MM:SSZ"? ojo tz:
-  // Usaremos sin Z para que Date lo tome como local. Alternativa: comparar strings (ya vienen padding).
-  // Para regla "fin > inicio" basta comparar strings SQL bien formateadas.
-  return sql.replace(" ", "T");
-}
-
+// En formato fijo "YYYY-MM-DD HH:MM:SS", comparación lexicográfica funciona
 function isEndAfterStart(sqlStart: string, sqlEnd: string): boolean {
-  // Como están en formato fijo "YYYY-MM-DD HH:MM:SS", comparación lexicográfica funciona.
   return sqlEnd > sqlStart;
 }
 
@@ -84,43 +72,75 @@ function sendDbError(reply: FastifyReply, message: string, err: any) {
   });
 }
 
-/**
- * ✅ Scope multi-academia:
- * - rol 1/2: usa req.user.academia_id
- * - rol 3: usa header x-academia-id
- */
-function getAcademiaScope(req: FastifyRequest, reply: FastifyReply): number | null {
-  const user = (req as any).user as ReqUser | undefined;
-  const rol = Number(user?.rol_id ?? 0);
+/* ──────────────────────────────────────────────────────────────
+   Multi-academia helpers (WELI) — REGLA PLATINO (igual a categorias/histórico)
+   - rol 1/2: academia desde token (req.auth o req.user)
+   - rol 3: academia desde header x-academia-id (OBLIGATORIO)
+────────────────────────────────────────────────────────────── */
 
-  // Admin/Staff: academia amarrada al usuario
-  if (rol === 1 || rol === 2) {
-    const a = Number(user?.academia_id ?? 0);
-    if (!Number.isFinite(a) || a <= 0) {
-      reply.code(403).send({ ok: false, message: "Academia no asignada al usuario." });
-      return null;
-    }
-    return a;
-  }
+type AuthLike = {
+  rol_id?: number;
+  role_id?: number;
+  role?: number;
+  academia_id?: number;
+  academy_id?: number;
+  academiaId?: number;
+  academyId?: number;
+  academia?: number;
+  academy?: number;
+};
 
-  // Superadmin: academia por header
-  if (rol === 3) {
-    const raw = (req.headers as any)?.[ACADEMIA_HEADER];
-    const v = Array.isArray(raw) ? raw[0] : raw;
-    const a = Number(v);
-    if (!Number.isFinite(a) || a <= 0) {
-      reply.code(403).send({ ok: false, message: "Debes seleccionar una academia." });
-      return null;
-    }
-    return a;
-  }
-
-  reply.code(403).send({ ok: false, message: "No autorizado." });
-  return null;
+function getAuthLike(req: FastifyRequest): AuthLike {
+  const a: any = (req as any).auth;
+  const u: any = (req as any).user;
+  return (a && typeof a === "object" ? a : u && typeof u === "object" ? u : {}) as AuthLike;
 }
 
+function getRolId(req: FastifyRequest): number {
+  const ctx = getAuthLike(req);
+  const raw = ctx.rol_id ?? ctx.role_id ?? ctx.role ?? 0;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function getEffectiveAcademiaId(req: FastifyRequest): number {
+  const rol = getRolId(req);
+
+  // rol 3 => header obligatorio
+  if (rol === 3) {
+    const hdr = (req.headers as any)["x-academia-id"];
+    const raw = Array.isArray(hdr) ? hdr[0] : hdr;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw Object.assign(new Error("FORBIDDEN: falta x-academia-id para superadmin"), {
+        statusCode: 403,
+      });
+    }
+    return n;
+  }
+
+  // rol 1/2 => token
+  const ctx = getAuthLike(req);
+  const raw =
+    ctx.academia_id ??
+    ctx.academy_id ??
+    ctx.academiaId ??
+    ctx.academyId ??
+    ctx.academia ??
+    ctx.academy ??
+    0;
+
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
+  }
+  return n;
+}
+
+/* ───────────────────────── Router ───────────────────────── */
+
 export default async function eventos(app: FastifyInstance) {
-  // ✅ Permisos normalizados
+  // ✅ Mantener roles como están
   const canRead = [requireAuth, requireRoles([1, 2, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
@@ -130,7 +150,7 @@ export default async function eventos(app: FastifyInstance) {
     timestamp: new Date().toISOString(),
   }));
 
-  // ✅ Público (solo lectura): próximos eventos (GLOBAL)
+  // ✅ Público (solo lectura): próximos eventos (GLOBAL, sin academia)
   app.get("/public", async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = PageQuery.safeParse(req.query);
     const { limit, offset } = parsed.success ? parsed.data : { limit: 50, offset: 0 };
@@ -153,15 +173,14 @@ export default async function eventos(app: FastifyInstance) {
     }
   });
 
-  // GET /eventos (read 1/2/3, filtrado por academia)
+  // GET /eventos (scoped por academia efectiva)
   app.get("/", { preHandler: canRead }, async (req, reply) => {
-    const academiaId = getAcademiaScope(req, reply);
-    if (!academiaId) return;
-
-    const parsed = PageQuery.safeParse(req.query);
-    const { limit, offset } = parsed.success ? parsed.data : { limit: 50, offset: 0 };
-
     try {
+      const academiaId = getEffectiveAcademiaId(req);
+
+      const parsed = PageQuery.safeParse(req.query);
+      const { limit, offset } = parsed.success ? parsed.data : { limit: 50, offset: 0 };
+
       const [rows]: any = await db.query(
         `SELECT id, academia_id, titulo, descripcion, fecha_inicio, fecha_fin, creado_en, actualizado_en
            FROM eventos
@@ -172,24 +191,25 @@ export default async function eventos(app: FastifyInstance) {
       );
 
       reply.header("Cache-Control", "no-store");
-      return reply.send({ ok: true, items: rows ?? [], limit, offset });
+      return reply.send({ ok: true, items: rows ?? [], limit, offset, academia_id: academiaId });
     } catch (err: any) {
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      if (code !== 500) return reply.code(code).send({ ok: false, message: err?.message });
       req.log.error({ err }, "GET /eventos failed");
       return sendDbError(reply, "Error al listar eventos", err);
     }
   });
 
-  // GET /eventos/:id (read 1/2/3, filtrado por academia)
+  // GET /eventos/:id (scoped por academia efectiva)
   app.get("/:id", { preHandler: canRead }, async (req, reply) => {
-    const academiaId = getAcademiaScope(req, reply);
-    if (!academiaId) return;
-
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
 
     const { id } = parsed.data;
 
     try {
+      const academiaId = getEffectiveAcademiaId(req);
+
       const [rows]: any = await db.query(
         `SELECT id, academia_id, titulo, descripcion, fecha_inicio, fecha_fin, creado_en, actualizado_en
            FROM eventos
@@ -199,27 +219,22 @@ export default async function eventos(app: FastifyInstance) {
       );
 
       reply.header("Cache-Control", "no-store");
-
       if (!rows?.length) return reply.code(404).send({ ok: false, message: "No encontrado" });
-      return reply.send({ ok: true, item: rows[0] });
+
+      return reply.send({ ok: true, item: rows[0], academia_id: academiaId });
     } catch (err: any) {
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      if (code !== 500) return reply.code(code).send({ ok: false, message: err?.message });
       req.log.error({ err, id }, "GET /eventos/:id failed");
       return sendDbError(reply, "Error al obtener evento", err);
     }
   });
 
-  // POST /eventos (write 1/3, inserta academia_id)
+  // POST /eventos (write 1/3, inserta academia efectiva)
   app.post("/", { preHandler: canWrite }, async (req, reply) => {
-    const academiaId = getAcademiaScope(req, reply);
-    if (!academiaId) return;
-
     const parsed = CreateSchema.safeParse(req.body);
     if (!parsed.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: "Payload inválido",
-        errors: parsed.error.flatten(),
-      });
+      return reply.code(400).send({ ok: false, message: "Payload inválido", errors: parsed.error.flatten() });
     }
 
     const { titulo, descripcion, fecha_inicio, fecha_fin } = parsed.data;
@@ -233,6 +248,8 @@ export default async function eventos(app: FastifyInstance) {
     }
 
     try {
+      const academiaId = getEffectiveAcademiaId(req);
+
       const [result]: any = await db.query(
         `INSERT INTO eventos (academia_id, titulo, descripcion, fecha_inicio, fecha_fin, creado_en, actualizado_en)
          VALUES (?, ?, ?, ?, ?, NOW(), NOW())`,
@@ -250,29 +267,24 @@ export default async function eventos(app: FastifyInstance) {
       );
 
       reply.header("Cache-Control", "no-store");
-      return reply.code(201).send({ ok: true, item: rows?.[0] ?? null });
+      return reply.code(201).send({ ok: true, item: rows?.[0] ?? null, academia_id: academiaId });
     } catch (err: any) {
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      if (code !== 500) return reply.code(code).send({ ok: false, message: err?.message });
       req.log.error({ err }, "POST /eventos failed");
       return sendDbError(reply, "Error al crear evento", err);
     }
   });
 
-  // PUT /eventos/:id (write 1/3, update por academia)
+  // PUT /eventos/:id (write 1/3, update por academia efectiva)
   app.put("/:id", { preHandler: canWrite }, async (req, reply) => {
-    const academiaId = getAcademiaScope(req, reply);
-    if (!academiaId) return;
-
     const pid = IdParam.safeParse(req.params);
     if (!pid.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
     const { id } = pid.data;
 
     const parsed = UpdateSchema.safeParse(req.body);
     if (!parsed.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: "Payload inválido",
-        errors: parsed.error.flatten(),
-      });
+      return reply.code(400).send({ ok: false, message: "Payload inválido", errors: parsed.error.flatten() });
     }
 
     const fields: string[] = [];
@@ -306,17 +318,15 @@ export default async function eventos(app: FastifyInstance) {
       values.push(fin);
     }
 
-    if (fields.length === 0) {
-      return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
-    }
-
-    // Si vienen ambas en el payload, valida directo
+    if (fields.length === 0) return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
     if (iniTmp && finTmp && !isEndAfterStart(iniTmp, finTmp)) {
       return reply.code(400).send({ ok: false, message: "fecha_fin debe ser mayor que fecha_inicio" });
     }
 
     try {
-      // Si viene solo una de las fechas, valida contra la otra existente
+      const academiaId = getEffectiveAcademiaId(req);
+
+      // Si viene solo una fecha, valida contra la otra existente dentro del mismo tenant
       if (iniTmp || finTmp) {
         const [rowsPrev]: any = await db.query(
           `SELECT fecha_inicio, fecha_fin
@@ -359,23 +369,25 @@ export default async function eventos(app: FastifyInstance) {
       );
 
       reply.header("Cache-Control", "no-store");
-      return reply.send({ ok: true, item: rows?.[0] ?? null });
+      return reply.send({ ok: true, item: rows?.[0] ?? null, academia_id: academiaId });
     } catch (err: any) {
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      if (code !== 500) return reply.code(code).send({ ok: false, message: err?.message });
       req.log.error({ err, id }, "PUT /eventos/:id failed");
       return sendDbError(reply, "Error al actualizar evento", err);
     }
   });
 
-  // DELETE /eventos/:id (write 1/3, delete por academia)
+  // DELETE /eventos/:id (write 1/3, delete por academia efectiva)
   app.delete("/:id", { preHandler: canWrite }, async (req, reply) => {
-    const academiaId = getAcademiaScope(req, reply);
-    if (!academiaId) return;
-
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
+
     const { id } = parsed.data;
 
     try {
+      const academiaId = getEffectiveAcademiaId(req);
+
       const [result]: any = await db.query(
         "DELETE FROM eventos WHERE id = ? AND academia_id = ? LIMIT 1",
         [id, academiaId]
@@ -384,10 +396,8 @@ export default async function eventos(app: FastifyInstance) {
       if (!result?.affectedRows) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       reply.header("Cache-Control", "no-store");
-      return reply.send({ ok: true, deleted: id });
+      return reply.send({ ok: true, deleted: id, academia_id: academiaId });
     } catch (err: any) {
-      req.log.error({ err, id }, "DELETE /eventos/:id failed");
-
       if (err?.errno === 1451 || String(err?.code || "").includes("ER_ROW_IS_REFERENCED")) {
         return reply.code(409).send({
           ok: false,
@@ -396,6 +406,7 @@ export default async function eventos(app: FastifyInstance) {
         });
       }
 
+      req.log.error({ err, id }, "DELETE /eventos/:id failed");
       return sendDbError(reply, "Error al eliminar evento", err);
     }
   });

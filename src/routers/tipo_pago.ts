@@ -1,13 +1,18 @@
 // src/routers/tipo_pago.ts
-import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
 import { db } from "../db";
 import { requireAuth, requireRoles } from "../middlewares/authz";
 
 /**
  * Tabla: tipo_pago
- * Campos: id (PK), nombre (VARCHAR UNIQUE idealmente)
- * Catálogo de tipos de pago
+ * Campos: id (PK), academia_id (INT), nombre (VARCHAR)
+ * UNIQUE recomendado: (academia_id, nombre)
+ *
+ * Scope: catálogo por academia.
+ * Regla WELI:
+ * - rol 1/2: academia_id desde token (req.auth o req.user)
+ * - rol 3: academia_id desde header x-academia-id (obligatorio)
  */
 
 const IdParam = z.object({ id: z.coerce.number().int().positive() });
@@ -18,7 +23,13 @@ const CreateSchema = z
   })
   .strict();
 
-const UpdateSchema = z
+const PutSchema = z
+  .object({
+    nombre: z.string().trim().min(3, "El nombre debe tener al menos 3 caracteres").max(100, "Máximo 100 caracteres"),
+  })
+  .strict();
+
+const PatchSchema = z
   .object({
     nombre: z.string().trim().min(3, "El nombre debe tener al menos 3 caracteres").max(100, "Máximo 100 caracteres").optional(),
   })
@@ -27,148 +38,296 @@ const UpdateSchema = z
 function normalize(row: any) {
   return {
     id: Number(row.id),
+    academia_id: row.academia_id != null ? Number(row.academia_id) : null,
     nombre: String(row.nombre ?? ""),
   };
 }
 
+function zodDetail(err: ZodError) {
+  return err.issues.map((i) => `${i.path.join(".") || "field"}: ${i.message}`).join("; ");
+}
+
+/* ──────────────────────────────────────────────────────────────
+   Multi-academia helpers (WELI) — ESTÁNDAR ÚNICO
+────────────────────────────────────────────────────────────── */
+
+type AuthLike = {
+  rol_id?: number;
+  role_id?: number;
+  role?: number;
+  academia_id?: number;
+  academy_id?: number;
+  academiaId?: number;
+  academyId?: number;
+  academia?: number;
+  academy?: number;
+};
+
+function getAuthLike(req: FastifyRequest): AuthLike {
+  const a: any = (req as any).auth;
+  const u: any = (req as any).user;
+  return (a && typeof a === "object" ? a : u && typeof u === "object" ? u : {}) as AuthLike;
+}
+
+function getRolId(req: FastifyRequest): number {
+  const ctx = getAuthLike(req);
+  const raw = ctx.rol_id ?? ctx.role_id ?? ctx.role ?? 0;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function getEffectiveAcademiaId(req: FastifyRequest): number {
+  const rol = getRolId(req);
+
+  // superadmin => academia target por header
+  if (rol === 3) {
+    const hdr = req.headers["x-academia-id"];
+    const raw = Array.isArray(hdr) ? hdr[0] : hdr;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw Object.assign(new Error("FORBIDDEN: falta x-academia-id para superadmin"), { statusCode: 403 });
+    }
+    return n;
+  }
+
+  // admin/staff => academia por token
+  const ctx = getAuthLike(req);
+  const raw =
+    ctx.academia_id ??
+    ctx.academy_id ??
+    ctx.academiaId ??
+    ctx.academyId ??
+    ctx.academia ??
+    ctx.academy ??
+    0;
+
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
+  }
+  return n;
+}
+
+async function existsByNombreScoped(academiaId: number, nombre: string, excludeId?: number) {
+  const n = String(nombre ?? "").trim();
+  if (!n) return false;
+
+  if (excludeId) {
+    const [rows]: any = await db.query(
+      "SELECT id FROM tipo_pago WHERE academia_id = ? AND LOWER(TRIM(nombre)) = LOWER(?) AND id <> ? LIMIT 1",
+      [academiaId, n, excludeId]
+    );
+    return Array.isArray(rows) && rows.length > 0;
+  }
+
+  const [rows]: any = await db.query(
+    "SELECT id FROM tipo_pago WHERE academia_id = ? AND LOWER(TRIM(nombre)) = LOWER(?) LIMIT 1",
+    [academiaId, n]
+  );
+  return Array.isArray(rows) && rows.length > 0;
+}
+
+/* ────────────────────────────────────────────────────────────── */
+/* Router                                                        */
+/* ────────────────────────────────────────────────────────────── */
+
 export default async function tipo_pago(app: FastifyInstance) {
-  // ✅ Permisos reales (WELI):
-  // - READ: 1,2,3
-  // - WRITE: 1,3
+  // ✅ Catálogo por academia:
+  // - READ: roles 1/2/3
+  // - WRITE: roles 1/3 (admin + superadmin)
   const canRead = [requireAuth, requireRoles([1, 2, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  // ───────────────────── Health (READ) ─────────────────────
   app.get("/health", { preHandler: canRead }, async (_req, reply) => {
     reply.header("Cache-Control", "no-store");
-    return {
-      module: "tipo_pago",
-      status: "ready",
-      timestamp: new Date().toISOString(),
-    };
+    return { module: "tipo_pago", status: "ready", timestamp: new Date().toISOString() };
   });
 
-  // ───────────────────── GET all (READ) ─────────────────────
-  app.get("/", { preHandler: canRead }, async (_req: FastifyRequest, reply: FastifyReply) => {
+  // GET /tipo_pago (scoped)
+  app.get("/", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const [rows]: any = await db.query("SELECT id, nombre FROM tipo_pago ORDER BY id ASC");
+      const academiaId = getEffectiveAcademiaId(req);
+
+      const [rows]: any = await db.query(
+        "SELECT id, academia_id, nombre FROM tipo_pago WHERE academia_id = ? ORDER BY nombre ASC, id ASC",
+        [academiaId]
+      );
+
       reply.header("Cache-Control", "no-store");
-      return reply.send({
-        ok: true,
-        count: rows?.length ?? 0,
-        items: (rows ?? []).map(normalize),
-      });
+      return reply.send({ ok: true, count: rows?.length ?? 0, items: (rows ?? []).map(normalize) });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al listar tipo_pago", error: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      reply.header("Cache-Control", "no-store");
+      return reply.code(code).send({ ok: false, message: "Error al listar tipo_pago", detail: err?.message });
     }
   });
 
-  // ───────────────────── GET by ID (READ) ─────────────────────
+  // GET /tipo_pago/:id (scoped)
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
-    const parsed = IdParam.safeParse((req as any).params);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
-
-    const id = parsed.data.id;
+    const parsed = IdParam.safeParse(req.params);
+    if (!parsed.success) {
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
+    }
 
     try {
-      const [rows]: any = await db.query("SELECT id, nombre FROM tipo_pago WHERE id = ? LIMIT 1", [id]);
-      reply.header("Cache-Control", "no-store");
+      const academiaId = getEffectiveAcademiaId(req);
+      const id = parsed.data.id;
 
+      const [rows]: any = await db.query(
+        "SELECT id, academia_id, nombre FROM tipo_pago WHERE id = ? AND academia_id = ? LIMIT 1",
+        [id, academiaId]
+      );
+
+      reply.header("Cache-Control", "no-store");
       if (!rows?.length) return reply.code(404).send({ ok: false, message: "Tipo de pago no encontrado" });
 
       return reply.send({ ok: true, item: normalize(rows[0]) });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al obtener tipo_pago", error: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      reply.header("Cache-Control", "no-store");
+      return reply.code(code).send({ ok: false, message: "Error al obtener tipo_pago", detail: err?.message });
     }
   });
 
-  // ───────────────────── POST create (WRITE) ─────────────────────
+  // POST /tipo_pago (scoped)
   app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const parsed = CreateSchema.parse((req as any).body);
-      const nombre = parsed.nombre.trim();
+      const body = CreateSchema.parse(req.body);
+      const nombre = body.nombre.trim();
+      const academiaId = getEffectiveAcademiaId(req);
 
-      const [result]: any = await db.query("INSERT INTO tipo_pago (nombre) VALUES (?)", [nombre]);
+      const dup = await existsByNombreScoped(academiaId, nombre);
+      if (dup) {
+        reply.header("Cache-Control", "no-store");
+        return reply.code(409).send({ ok: false, message: "El tipo de pago ya existe en esta academia" });
+      }
 
-      return reply.code(201).send({ ok: true, id: result.insertId, nombre });
+      const [result]: any = await db.query("INSERT INTO tipo_pago (academia_id, nombre) VALUES (?, ?)", [academiaId, nombre]);
+
+      reply.header("Cache-Control", "no-store");
+      return reply.code(201).send({
+        ok: true,
+        id: result.insertId,
+        item: { id: result.insertId, academia_id: academiaId, nombre },
+      });
     } catch (err: any) {
-      if (err instanceof ZodError) {
-        const detail = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-        return reply.code(400).send({ ok: false, message: "Datos inválidos", detail });
-      }
-
-      if (err?.errno === 1062) {
-        return reply.code(409).send({ ok: false, message: "Ya existe un tipo de pago con ese nombre" });
-      }
-
-      return reply.code(500).send({ ok: false, message: "Error al crear tipo_pago", error: err?.message });
+      reply.header("Cache-Control", "no-store");
+      if (err instanceof ZodError) return reply.code(400).send({ ok: false, message: "Datos inválidos", detail: zodDetail(err) });
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") return reply.code(409).send({ ok: false, message: "El tipo de pago ya existe en esta academia" });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      return reply.code(code).send({ ok: false, message: "Error al crear tipo_pago", detail: err?.message });
     }
   });
 
-  // ───────────────────── PUT update (WRITE) ─────────────────────
+  // PUT /tipo_pago/:id (scoped reemplazo)
   app.put("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
-    const p = IdParam.safeParse((req as any).params);
-    if (!p.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
-    const id = p.data.id;
+    const pid = IdParam.safeParse(req.params);
+    if (!pid.success) {
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
+    }
 
     try {
-      const parsed = UpdateSchema.parse((req as any).body);
+      const academiaId = getEffectiveAcademiaId(req);
+      const id = pid.data.id;
 
-      if (Object.keys(parsed).length === 0) {
+      const body = PutSchema.parse(req.body);
+      const nombre = body.nombre.trim();
+
+      const dup = await existsByNombreScoped(academiaId, nombre, id);
+      if (dup) {
+        reply.header("Cache-Control", "no-store");
+        return reply.code(409).send({ ok: false, message: "El tipo de pago ya existe en esta academia" });
+      }
+
+      const [result]: any = await db.query(
+        "UPDATE tipo_pago SET nombre = ? WHERE id = ? AND academia_id = ?",
+        [nombre, id, academiaId]
+      );
+
+      reply.header("Cache-Control", "no-store");
+      if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "Tipo de pago no encontrado" });
+
+      return reply.send({ ok: true, updated: { id, nombre } });
+    } catch (err: any) {
+      reply.header("Cache-Control", "no-store");
+      if (err instanceof ZodError) return reply.code(400).send({ ok: false, message: "Datos inválidos", detail: zodDetail(err) });
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") return reply.code(409).send({ ok: false, message: "El tipo de pago ya existe en esta academia" });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      return reply.code(code).send({ ok: false, message: "Error al actualizar tipo_pago", detail: err?.message });
+    }
+  });
+
+  // PATCH /tipo_pago/:id (scoped parcial)
+  app.patch("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
+    const pid = IdParam.safeParse(req.params);
+    if (!pid.success) {
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
+    }
+
+    try {
+      const academiaId = getEffectiveAcademiaId(req);
+      const id = pid.data.id;
+
+      const body = PatchSchema.parse(req.body);
+      if (Object.keys(body).length === 0) {
+        reply.header("Cache-Control", "no-store");
         return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
       }
 
-      const setClauses: string[] = [];
-      const values: any[] = [];
+      if (body.nombre !== undefined) {
+        const nombre = body.nombre.trim();
+        const dup = await existsByNombreScoped(academiaId, nombre, id);
+        if (dup) {
+          reply.header("Cache-Control", "no-store");
+          return reply.code(409).send({ ok: false, message: "El tipo de pago ya existe en esta academia" });
+        }
 
-      if (parsed.nombre !== undefined) {
-        setClauses.push("nombre = ?");
-        values.push(parsed.nombre.trim());
+        const [result]: any = await db.query(
+          "UPDATE tipo_pago SET nombre = ? WHERE id = ? AND academia_id = ?",
+          [nombre, id, academiaId]
+        );
+
+        reply.header("Cache-Control", "no-store");
+        if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "Tipo de pago no encontrado" });
+
+        return reply.send({ ok: true, updated: { id, nombre } });
       }
 
-      values.push(id);
-
-      const [result]: any = await db.query(
-        `UPDATE tipo_pago SET ${setClauses.join(", ")} WHERE id = ?`,
-        values
-      );
-
-      if (result.affectedRows === 0) {
-        return reply.code(404).send({ ok: false, message: "Tipo de pago no encontrado" });
-      }
-
-      return reply.send({ ok: true, updated: { id, ...parsed } });
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "No hay campos válidos para actualizar" });
     } catch (err: any) {
-      if (err instanceof ZodError) {
-        const detail = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-        return reply.code(400).send({ ok: false, message: "Datos inválidos", detail });
-      }
-
-      if (err?.errno === 1062) {
-        return reply.code(409).send({ ok: false, message: "Ya existe un tipo de pago con ese nombre" });
-      }
-
-      return reply.code(500).send({ ok: false, message: "Error al actualizar tipo_pago", error: err?.message });
+      reply.header("Cache-Control", "no-store");
+      if (err instanceof ZodError) return reply.code(400).send({ ok: false, message: "Datos inválidos", detail: zodDetail(err) });
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") return reply.code(409).send({ ok: false, message: "El tipo de pago ya existe en esta academia" });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      return reply.code(code).send({ ok: false, message: "Error al actualizar tipo_pago", detail: err?.message });
     }
   });
 
-  // ───────────────────── DELETE (WRITE) ─────────────────────
+  // DELETE /tipo_pago/:id (scoped)
   app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
-    const p = IdParam.safeParse((req as any).params);
-    if (!p.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
-
-    const id = p.data.id;
+    const p = IdParam.safeParse(req.params);
+    if (!p.success) {
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
+    }
 
     try {
-      const [result]: any = await db.query("DELETE FROM tipo_pago WHERE id = ?", [id]);
+      const academiaId = getEffectiveAcademiaId(req);
+      const id = p.data.id;
 
-      if (result.affectedRows === 0) {
-        return reply.code(404).send({ ok: false, message: "Tipo de pago no encontrado" });
-      }
+      const [result]: any = await db.query("DELETE FROM tipo_pago WHERE id = ? AND academia_id = ?", [id, academiaId]);
+
+      reply.header("Cache-Control", "no-store");
+      if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "Tipo de pago no encontrado" });
 
       return reply.send({ ok: true, deleted: id });
     } catch (err: any) {
-      if (err?.errno === 1451) {
+      reply.header("Cache-Control", "no-store");
+      if (err?.errno === 1451 || String(err?.code || "").includes("ER_ROW_IS_REFERENCED")) {
         return reply.code(409).send({
           ok: false,
           message: "No se puede eliminar: hay pagos vinculados a este tipo de pago.",
@@ -176,7 +335,8 @@ export default async function tipo_pago(app: FastifyInstance) {
         });
       }
 
-      return reply.code(500).send({ ok: false, message: "Error al eliminar tipo_pago", error: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      return reply.code(code).send({ ok: false, message: "Error al eliminar tipo_pago", detail: err?.message });
     }
   });
 }

@@ -5,18 +5,28 @@ import { CONFIG } from "../config";
 
 type AnyObj = Record<string, any>;
 
-type AuthContext =
-  | { type: "user"; user_id?: number; rol_id?: number; academia_id?: number }
+/**
+ * AuthContext normalizado (single source of truth):
+ * - user: panel (admin/staff/superadmin)
+ * - apoderado: portal apoderado
+ */
+export type AuthContext =
+  | { type: "user"; user_id?: number; rol_id?: number; academia_id?: number | null }
   | { type: "apoderado"; rut: string; apoderado_id?: number };
 
 function getJwtSecret() {
-  const s = CONFIG.JWT_SECRET;
+  const s = CONFIG.JWT_SECRET ?? (process.env.JWT_SECRET as any);
   if (!s) throw new Error("JWT_SECRET missing (CONFIG.JWT_SECRET)");
-  return s;
+  return String(s);
 }
 
+/**
+ * Soporta tokens con payload en:
+ * - decoded.user (preferido)
+ * - decoded.payload
+ * - decoded (top-level legacy)
+ */
 function extractUser(decoded: AnyObj): AnyObj {
-  // soporta tokens donde vienen anidados
   return decoded?.user ?? decoded?.payload ?? decoded ?? {};
 }
 
@@ -54,8 +64,7 @@ function extractAcademiaId(user: AnyObj): number | undefined {
 
 /**
  * ✅ Fallback duro: si el backend ya armó req.user en un hook global
- * (como en src/index.ts), reconstruimos req.auth para que requireRoles /
- * requireApoderado no fallen por "auth missing".
+ * reconstruimos req.auth para que requireRoles / tenant helpers funcionen.
  */
 function readLegacyAuthFromReq(req: FastifyRequest): AuthContext | undefined {
   const u = (req as any).user as AnyObj | undefined;
@@ -63,16 +72,16 @@ function readLegacyAuthFromReq(req: FastifyRequest): AuthContext | undefined {
 
   const type = String(u?.type ?? "").toLowerCase();
 
-  // Hook global suele usar type:"admin" para panel
+  // Panel
   if (type === "admin" || type === "user" || type === "staff" || type === "superadmin") {
     const rol_id = extractRole(u);
     const user_id = toInt(u?.user_id ?? u?.id ?? u?.uid);
-    const academia_id =
-      extractAcademiaId(u) ?? (toInt(u?.academia_id) ?? undefined);
+    const academia_id = extractAcademiaId(u) ?? (toInt(u?.academia_id) ?? undefined);
 
     return { type: "user", user_id, rol_id, academia_id };
   }
 
+  // Apoderado
   if (type === "apoderado") {
     const rut = String(u?.rut ?? "");
     if (!/^\d{8}$/.test(rut)) return undefined;
@@ -89,12 +98,16 @@ function ensureAuthContext(req: FastifyRequest): AuthContext | undefined {
 
   if (!a) {
     a = readLegacyAuthFromReq(req);
-    if (a) (req as any).auth = a; // cache para el resto del pipeline
+    if (a) (req as any).auth = a;
   }
 
   return a;
 }
 
+/**
+ * ✅ Middleware: requiere Bearer token válido.
+ * - setea req.auth y mantiene req.user por compatibilidad
+ */
 export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
   const auth = String(req.headers.authorization || "");
   const [bearer, token] = auth.split(" ");
@@ -107,8 +120,9 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
     const decoded = jwt.verify(token, getJwtSecret()) as AnyObj;
     const user = extractUser(decoded);
 
-    // --- Caso APODERADO (token: { type:"apoderado", rut, apoderado_id? }) ---
     const type = String(user?.type ?? "").toLowerCase();
+
+    // --- APODERADO ---
     if (type === "apoderado") {
       const rut = String(user?.rut ?? "");
       if (!/^\d{8}$/.test(rut)) {
@@ -116,24 +130,27 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
       }
 
       const apoderado_id = toInt(user?.apoderado_id);
-      (req as any).auth = {
-        type: "apoderado",
-        rut,
-        apoderado_id,
-      } satisfies AuthContext;
 
-      // compat legacy
-      (req as any).user = user;
-
+      (req as any).auth = { type: "apoderado", rut, apoderado_id } satisfies AuthContext;
+      (req as any).user = user; // legacy
       return;
     }
 
-    // --- Caso ADMIN/STAFF (token con rol_id, user_id, academia_id, etc) ---
+    // --- PANEL (admin/staff/superadmin) ---
     const rol_id = extractRole(user);
     const user_id = toInt(user?.user_id ?? user?.id ?? user?.uid);
-    const academia_id = extractAcademiaId(user);
 
-    (req as any).auth = { type: "user", user_id, rol_id, academia_id } satisfies AuthContext;
+    // superadmin puede venir con academia_id null
+    const academia_id = extractAcademiaId(user);
+    const academia_id_effective: number | null | undefined =
+      rol_id === 3 ? null : academia_id;
+
+    (req as any).auth = {
+      type: "user",
+      user_id,
+      rol_id,
+      academia_id: academia_id_effective,
+    } satisfies AuthContext;
 
     // compat legacy
     (req as any).user = user;
@@ -147,7 +164,6 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
 
 export async function requireApoderado(req: FastifyRequest, reply: FastifyReply) {
   const a = ensureAuthContext(req);
-
   if (!a || a.type !== "apoderado") {
     return reply.code(403).send({ ok: false, message: "FORBIDDEN" });
   }
@@ -169,4 +185,96 @@ export function requireRoles(allowed: number[]) {
       return reply.code(403).send({ ok: false, message: "FORBIDDEN" });
     }
   };
+}
+
+/* ──────────────────────────────────────────────────────────────
+   ✅ Multi-tenant helpers (OPCIÓN 2) — exportables
+   Regla:
+   - rol 3 (superadmin): x-academia-id OBLIGATORIO
+   - rol 1/2 (admin/staff): academia_id desde token
+     - si viene x-academia-id, debe coincidir con token
+────────────────────────────────────────────────────────────── */
+
+export function getRolId(req: FastifyRequest): number {
+  const a = ensureAuthContext(req) as any;
+  const u: any = (req as any).user;
+
+  const raw =
+    (a?.type === "user" ? a?.rol_id : undefined) ??
+    u?.rol_id ??
+    u?.role_id ??
+    u?.roleId ??
+    u?.rolId ??
+    u?.rol ??
+    u?.role ??
+    0;
+
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+export function getTokenAcademiaId(req: FastifyRequest): number {
+  const a = ensureAuthContext(req) as any;
+  const u: any = (req as any).user;
+
+  const raw =
+    (a?.type === "user" ? a?.academia_id : undefined) ??
+    u?.academia_id ??
+    u?.academy_id ??
+    u?.academiaId ??
+    u?.academyId ??
+    u?.academia ??
+    u?.academy ??
+    0;
+
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+export function getHeaderAcademiaId(req: FastifyRequest): number {
+  const hdr = req.headers["x-academia-id"];
+  const raw = Array.isArray(hdr) ? hdr[0] : hdr;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * ✅ Tenant definitivo:
+ * - Superadmin: requiere header (si no, 403)
+ * - Admin/Staff: header opcional, pero si viene debe coincidir con token
+ * - Si no viene header: usa token
+ */
+export function getEffectiveAcademiaId(req: FastifyRequest): number {
+  const rol = getRolId(req);
+  const headerAcademia = getHeaderAcademiaId(req);
+  const tokenAcademia = getTokenAcademiaId(req);
+
+  // Superadmin: header manda (obligatorio)
+  if (rol === 3) {
+    if (!headerAcademia || headerAcademia <= 0) {
+      throw Object.assign(new Error("FORBIDDEN: falta x-academia-id para superadmin"), {
+        statusCode: 403,
+      });
+    }
+    return headerAcademia;
+  }
+
+  // Admin/Staff: si viene header, debe coincidir con token
+  if (headerAcademia && headerAcademia > 0) {
+    if (!tokenAcademia || tokenAcademia <= 0) {
+      throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
+    }
+    if (headerAcademia !== tokenAcademia) {
+      throw Object.assign(new Error("FORBIDDEN: x-academia-id no coincide con tu academia"), {
+        statusCode: 403,
+      });
+    }
+    return headerAcademia;
+  }
+
+  // Fallback: token
+  if (!tokenAcademia || tokenAcademia <= 0) {
+    throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
+  }
+  return tokenAcademia;
 }

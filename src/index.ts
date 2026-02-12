@@ -17,13 +17,8 @@ import { registerSchemas } from "./schemas/schemas";
 const APP_NAME = "WELI";
 
 // ✅ Identidad JWT (alineada con auth.ts / auth_apoderado.ts)
-const JWT_ISSUER = String(
-  (CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER ?? "app"
-).trim();
-
-const JWT_AUDIENCE = String(
-  (CONFIG as any)?.JWT_AUDIENCE ?? process.env.JWT_AUDIENCE ?? "web"
-).trim();
+const JWT_ISSUER = String((CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER ?? "app").trim();
+const JWT_AUDIENCE = String((CONFIG as any)?.JWT_AUDIENCE ?? process.env.JWT_AUDIENCE ?? "web").trim();
 
 /* ───────────────────────────────────────────────
  * Crear instancia Fastify
@@ -31,6 +26,15 @@ const JWT_AUDIENCE = String(
 const app = Fastify({
   logger: CONFIG.NODE_ENV === "production" ? { level: "warn" } : { level: "info" },
 });
+
+/* ───────────────────────────────────────────────
+ * Helpers
+ * ─────────────────────────────────────────────── */
+function toNumberOrUndef(v: any): number | undefined {
+  if (v === null || v === undefined) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
 
 /* ───────────────────────────────────────────────
  * Bootstrap
@@ -56,9 +60,7 @@ async function bootstrap() {
     "X-Academia-Id", // ✅ por si algún fetch lo manda con casing distinto
   ];
 
-  const allowedHeaders = Array.from(
-    new Set([...BASE_ALLOWED_HEADERS, ...envAllowed])
-  );
+  const allowedHeaders = Array.from(new Set([...BASE_ALLOWED_HEADERS, ...envAllowed]));
 
   await app.register(cors, {
     origin: CONFIG.NODE_ENV === "production" ? CONFIG.CORS_ORIGIN : true,
@@ -94,10 +96,7 @@ async function bootstrap() {
           }
         : false,
     frameguard: { action: "deny" },
-    hsts:
-      CONFIG.NODE_ENV === "production"
-        ? { maxAge: 15552000, includeSubDomains: true, preload: false }
-        : false,
+    hsts: CONFIG.NODE_ENV === "production" ? { maxAge: 15552000, includeSubDomains: true, preload: false } : false,
     noSniff: true,
     referrerPolicy: { policy: "no-referrer" },
     crossOriginResourcePolicy: { policy: "same-origin" },
@@ -137,26 +136,16 @@ async function bootstrap() {
     time: new Date().toISOString(),
   });
 
-  app.get("/", async (_req, reply) =>
-    reply.header("Content-Type", HTML_CT).send(homeHtml())
-  );
-  app.get("/api", async (_req, reply) =>
-    reply.header("Content-Type", HTML_CT).send(homeHtml())
-  );
+  app.get("/", async (_req, reply) => reply.header("Content-Type", HTML_CT).send(homeHtml()));
+  app.get("/api", async (_req, reply) => reply.header("Content-Type", HTML_CT).send(homeHtml()));
 
-  app.get("/health", async (req, reply) =>
-    reply.header("Content-Type", JSON_CT).send(healthJson(req))
-  );
-  app.get("/api/health", async (req, reply) =>
-    reply.header("Content-Type", JSON_CT).send(healthJson(req))
-  );
+  app.get("/health", async (req, reply) => reply.header("Content-Type", JSON_CT).send(healthJson(req)));
+  app.get("/api/health", async (req, reply) => reply.header("Content-Type", JSON_CT).send(healthJson(req)));
 
   /* ───────── Favicon / robots ───────── */
   app.get("/favicon.ico", async (_req, reply) => reply.code(204).send());
   app.get("/robots.txt", async (_req, reply) =>
-    reply
-      .header("Content-Type", "text/plain; charset=UTF-8")
-      .send("User-agent: *\nDisallow:\n")
+    reply.header("Content-Type", "text/plain; charset=UTF-8").send("User-agent: *\nDisallow:\n")
   );
 
   /* ───────── Swagger (solo en dev) ───────── */
@@ -252,30 +241,32 @@ async function bootstrap() {
         audience: JWT_AUDIENCE,
       });
 
-      // ✅ Apoderado
+      /* ───────── Apoderado ───────── */
       if (payload?.type === "apoderado") {
         const authObj = {
           type: "apoderado" as const,
-          apoderado_id:
-            payload?.apoderado_id != null ? Number(payload.apoderado_id) : undefined,
-          rut: String(payload.rut ?? ""),
+          apoderado_id: toNumberOrUndef(payload?.apoderado_id),
+          rut: String(payload?.rut ?? ""),
         };
 
         // ✅ Nuevo estándar
         (req as any).auth = authObj;
-        // 🔁 Legacy
+        // 🔁 Legacy (si aún hay rutas viejas)
         (req as any).user = authObj;
         return;
       }
 
-      // ✅ Panel (admin/staff/superadmin)
+      /* ───────── Panel (admin/staff/superadmin) ───────── */
+      const academiaNum = toNumberOrUndef(payload?.academia_id);
+
       const authObj = {
         type: "user" as const,
-        user_id: payload?.sub != null ? Number(payload.sub) : undefined,
-        rol_id: payload?.rol_id != null ? Number(payload.rol_id) : undefined,
-        nombre_usuario: String(payload.nombre_usuario ?? ""),
-        // ✅ Propagar academia_id desde JWT (para rol 1/2). Rol 3 puede venir null.
-        academia_id: payload?.academia_id != null ? Number(payload.academia_id) : null,
+        user_id: toNumberOrUndef(payload?.sub),
+        rol_id: toNumberOrUndef(payload?.rol_id),
+        nombre_usuario: String(payload?.nombre_usuario ?? ""),
+        // ✅ IMPORTANTE: NUNCA null (evita error number|null)
+        // rol 1/2 => number, rol 3 => undefined (y usará x-academia-id donde corresponda)
+        academia_id: academiaNum,
       };
 
       // ✅ Nuevo estándar
@@ -287,7 +278,8 @@ async function bootstrap() {
         id: authObj.user_id ?? null,
         rol_id: authObj.rol_id ?? null,
         nombre_usuario: authObj.nombre_usuario,
-        academia_id: authObj.academia_id,
+        // legacy puede aceptar null, pero no lo propagamos como null desde authObj
+        academia_id: authObj.academia_id ?? null,
       };
     } catch {
       return reply.code(401).send({ ok: false, message: "Token inválido o expirado" });
@@ -326,9 +318,7 @@ async function bootstrap() {
   const HOST = "0.0.0.0";
 
   await app.listen({ port: PORT, host: HOST });
-  app.log.info(
-    `🟢 ${APP_NAME} API ready (env=${CONFIG.NODE_ENV}) — listening on ${HOST}:${PORT}`
-  );
+  app.log.info(`🟢 ${APP_NAME} API ready (env=${CONFIG.NODE_ENV}) — listening on ${HOST}:${PORT}`);
 }
 
 bootstrap().catch((err) => {

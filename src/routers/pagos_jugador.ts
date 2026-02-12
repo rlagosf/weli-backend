@@ -1,5 +1,5 @@
 // src/routers/pagos_jugador.ts
-import { FastifyInstance } from "fastify";
+import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { db } from "../db";
 import { requireAuth, requireRoles } from "../middlewares/authz";
@@ -13,8 +13,8 @@ import { requireAuth, requireRoles } from "../middlewares/authz";
  *
  * ✅ Multi-academia (WELI):
  * - pagos_jugador NO tiene academia_id directo.
- * - El scoping se hace vía jugadores.academia_id + jugadores.rut_jugador.
- * - Para rol 3 (superadmin) se exige x-academia-id como "academia objetivo".
+ * - Scoping SIEMPRE vía JOIN jugadores (j.academia_id).
+ * - Regla platino: todo vive en la academia efectiva.
  */
 
 /* ────────────────────────────────────────────────────────────── */
@@ -32,7 +32,6 @@ const DIA_CORTE_VENCIDO = 5;
 function toSQLDate(input: string): string | null {
   if (!input) return null;
 
-  // si ya viene como YYYY-MM-DD, lo aceptamos
   if (/^\d{4}-\d{2}-\d{2}$/.test(input)) return input;
 
   const d = new Date(input);
@@ -63,86 +62,108 @@ function normalizeBody(raw: any) {
   return norm;
 }
 
-/**
- * Auth helpers (depende de tu middleware):
- * esperamos req.auth = { type:"user", rol_id, academia_id, ... }
- */
-function getAuth(req: any) {
-  return (req as any).auth as
-    | { type: "user"; user_id?: number; rol_id?: number; academia_id?: number }
-    | { type: "apoderado"; rut?: string }
-    | undefined;
+/* ──────────────────────────────────────────────────────────────
+   Multi-academia helpers (WELI) — MISMO ESTÁNDAR que jugadores.ts
+   Regla final:
+   - Rol 3 (superadmin): x-academia-id obligatorio y define el tenant.
+   - Rol 1/2 (admin/staff): pueden enviar x-academia-id, pero SOLO si coincide con el token.
+   - Si no viene header: usa academia_id del token.
+────────────────────────────────────────────────────────────── */
+
+type AuthLike = {
+  rol_id?: number;
+  role_id?: number;
+  role?: number;
+
+  academia_id?: number;
+  academy_id?: number;
+  academiaId?: number;
+  academyId?: number;
+  academia?: number;
+  academy?: number;
+};
+
+function getAuthLike(req: FastifyRequest): AuthLike {
+  const a: any = (req as any).auth;
+  const u: any = (req as any).user;
+  const ctx =
+    a && typeof a === "object"
+      ? a
+      : u && typeof u === "object"
+      ? u
+      : {};
+  return ctx as AuthLike;
 }
 
-function getHeaderAcademiaId(req: any): number | null {
+function getRolId(req: FastifyRequest): number {
+  const ctx = getAuthLike(req);
+  const raw = ctx.rol_id ?? ctx.role_id ?? ctx.role ?? 0;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function getTokenAcademiaId(req: FastifyRequest): number {
+  const ctx = getAuthLike(req);
   const raw =
-    (req.headers?.["x-academia-id"] as any) ??
-    (req.headers?.["X-Academia-Id"] as any) ??
-    null;
+    ctx.academia_id ??
+    ctx.academy_id ??
+    ctx.academiaId ??
+    ctx.academyId ??
+    ctx.academia ??
+    ctx.academy ??
+    0;
 
-  const v = Array.isArray(raw) ? raw[0] : raw;
-  const n = Number(v);
-  return Number.isFinite(n) && n > 0 ? n : null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
 }
 
-/**
- * ✅ Academia efectiva (anti-cruce)
- * - rol 3: requiere x-academia-id (academia "objetivo" en super-dashboard)
- * - rol 1: usa auth.academia_id; si no viene, permite fallback a header.
- */
-function getAcademiaIdOr403(req: any, reply: any): number | null {
-  const a = getAuth(req);
-  if (!a || a.type !== "user") {
-    reply.code(403).send({ ok: false, message: "FORBIDDEN" });
-    return null;
-  }
+function getHeaderAcademiaId(req: FastifyRequest): number {
+  const hdr = req.headers["x-academia-id"];
+  const raw = Array.isArray(hdr) ? hdr[0] : hdr;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
 
-  const rol = Number(a.rol_id ?? 0);
+function getEffectiveAcademiaId(req: FastifyRequest): number {
+  const rol = getRolId(req);
+  const headerAcademia = getHeaderAcademiaId(req);
+  const tokenAcademia = getTokenAcademiaId(req);
 
-  // superadmin: SIEMPRE target por header
+  // 1) Superadmin: header manda (obligatorio)
   if (rol === 3) {
-    const headerAcademia = getHeaderAcademiaId(req);
-    if (!headerAcademia) {
-      reply.code(403).send({ ok: false, message: "ACADEMIA_TARGET_REQUIRED" });
-      return null;
+    if (!headerAcademia || headerAcademia <= 0) {
+      throw Object.assign(new Error("FORBIDDEN: falta x-academia-id para superadmin"), {
+        statusCode: 403,
+      });
     }
     return headerAcademia;
   }
 
-  // admin/staff: academia desde token
-  const tokenAcademia = Number(a.academia_id ?? 0);
-  if (Number.isFinite(tokenAcademia) && tokenAcademia > 0) return tokenAcademia;
-
-  // fallback: header
-  const headerAcademia = getHeaderAcademiaId(req);
-  if (headerAcademia) return headerAcademia;
-
-  reply.code(403).send({ ok: false, message: "ACADEMIA_REQUIRED" });
-  return null;
-}
-
-/**
- * ✅ Type guard para que TS entienda que academia_id ya no es null
- */
-function assertAcademiaId(
-  academia_id: number | null,
-  reply: any
-): asserts academia_id is number {
-  if (!Number.isFinite(academia_id) || (academia_id as number) <= 0) {
-    if (!reply.sent) reply.code(403).send({ ok: false, message: "ACADEMIA_REQUIRED" });
-    throw new Error("ACADEMIA_REQUIRED");
+  // 2) Admin/Staff: si viene header, debe coincidir con token
+  if (headerAcademia && headerAcademia > 0) {
+    if (!tokenAcademia || tokenAcademia <= 0) {
+      throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
+    }
+    if (headerAcademia !== tokenAcademia) {
+      throw Object.assign(new Error("FORBIDDEN: x-academia-id no coincide con tu academia"), {
+        statusCode: 403,
+      });
+    }
+    return headerAcademia;
   }
+
+  // 3) Fallback: token
+  if (!tokenAcademia || tokenAcademia <= 0) {
+    throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
+  }
+  return tokenAcademia;
 }
 
 /**
  * Validación fuerte: el jugador pertenece a la academia efectiva
  * (sirve para POST/PUT/DELETE y evitar escritura cruzada)
  */
-async function assertJugadorInAcademiaOr403(
-  jugador_rut: number,
-  academia_id: number,
-  reply: any
-) {
+async function assertJugadorInAcademiaOrThrow(jugador_rut: number, academia_id: number) {
   const [chk]: any = await db.query(
     `SELECT rut_jugador
        FROM jugadores
@@ -153,10 +174,8 @@ async function assertJugadorInAcademiaOr403(
   );
 
   if (!chk?.length) {
-    reply.code(403).send({ ok: false, message: "FORBIDDEN_JUGADOR" });
-    return false;
+    throw Object.assign(new Error("FORBIDDEN_JUGADOR"), { statusCode: 403 });
   }
-  return true;
 }
 
 /* ────────────────────────────────────────────────────────────── */
@@ -185,7 +204,6 @@ const PageQuery = z.object({
   offset: z.coerce.number().int().nonnegative().default(0),
 });
 
-// 🔎 Filtros opcionales para listar
 const ListQuery = PageQuery.extend({
   year: z.coerce.number().int().optional(),
   month: z.coerce.number().int().min(1).max(12).optional(),
@@ -201,45 +219,44 @@ export default async function pagos_jugador(app: FastifyInstance) {
   /**
    * 🔐 FINANZAS
    * - canRead  -> roles 1 y 3
-   * - canWrite -> solo rol 1
+   * - canWrite -> roles 1 y 3 (según tu requerimiento actual)
    *
-   * ✅ Aunque rol 3 lea, siempre queda scoping por academia objetivo (x-academia-id).
+   * ✅ Todo scoped por academia efectiva (JOIN jugadores).
    */
   const canRead = [requireAuth, requireRoles([1, 3])];
-  const canWrite = [requireAuth, requireRoles([1])];
+  const canWrite = [requireAuth, requireRoles([1, 3])];
 
   // Health
-  app.get("/health", { preHandler: canRead }, async (req, reply) => {
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-    assertAcademiaId(academia_id, reply);
-
-    return {
-      module: "pagos_jugador",
-      status: "ready",
-      timestamp: new Date().toISOString(),
-      academia_id,
-    };
+  app.get("/health", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const academia_id = getEffectiveAcademiaId(req);
+      reply.header("Cache-Control", "no-store");
+      return {
+        module: "pagos_jugador",
+        status: "ready",
+        timestamp: new Date().toISOString(),
+        academia_id,
+      };
+    } catch (err: any) {
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      reply.header("Cache-Control", "no-store");
+      return reply.code(code).send({ ok: false, message: "Error /health pagos_jugador", detail: err?.message });
+    }
   });
 
   /* ───────── GET listado con filtros + paginación (SCOPED) ───────── */
-  app.get("/", { preHandler: canRead }, async (req, reply) => {
+  app.get("/", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const queryParsed = ListQuery.safeParse((req as any).query);
     if (!queryParsed.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: "Query inválida",
-        errors: queryParsed.error.flatten(),
-      });
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "Query inválida", errors: queryParsed.error.flatten() });
     }
 
     const { limit, offset, year, month, tipo_pago_id, jugador_rut } = queryParsed.data;
 
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-    assertAcademiaId(academia_id, reply);
-
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
       let sql = `
         SELECT p.*
           FROM pagos_jugador p
@@ -252,17 +269,14 @@ export default async function pagos_jugador(app: FastifyInstance) {
         sql += " AND p.jugador_rut = ?";
         params.push(jugador_rut);
       }
-
       if (tipo_pago_id) {
         sql += " AND p.tipo_pago_id = ?";
         params.push(tipo_pago_id);
       }
-
       if (year) {
         sql += " AND YEAR(p.fecha_pago) = ?";
         params.push(year);
       }
-
       if (month) {
         sql += " AND MONTH(p.fecha_pago) = ?";
         params.push(month);
@@ -276,39 +290,27 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
       const [rows] = await db.query(sql, params);
 
-      return reply.send({
-        ok: true,
-        academia_id,
-        items: rows,
-        limit,
-        offset,
-        filters: { year, month, tipo_pago_id, jugador_rut },
-      });
+      reply.header("Cache-Control", "no-store");
+      return reply.send({ ok: true, academia_id, items: rows, limit, offset, filters: { year, month, tipo_pago_id, jugador_rut } });
     } catch (err: any) {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error al listar pagos",
-        error: err?.message,
-      });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      reply.header("Cache-Control", "no-store");
+      return reply.code(code).send({ ok: false, message: "Error al listar pagos", detail: err?.message });
     }
   });
 
   /* ───────── GET estado de cuenta (SCOPED) ───────── */
-  app.get("/estado-cuenta", { preHandler: canRead }, async (req, reply) => {
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-    assertAcademiaId(academia_id, reply);
-
+  app.get("/estado-cuenta", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
       const now = new Date();
       const currentYear = now.getFullYear();
       const currentMonth = now.getMonth() + 1;
       const currentDay = now.getDate();
 
-      const baseEstadoSinPago: "PAGADO" | "VENCIDO" =
-        currentDay <= DIA_CORTE_VENCIDO ? "PAGADO" : "VENCIDO";
+      const baseEstadoSinPago: "PAGADO" | "VENCIDO" = currentDay <= DIA_CORTE_VENCIDO ? "PAGADO" : "VENCIDO";
 
-      /* 1) Jugadores + categoría (SOLO academia) */
       const [jugRows]: any = await db.query(
         `SELECT j.*,
                 c.nombre AS categoria_nombre
@@ -318,7 +320,6 @@ export default async function pagos_jugador(app: FastifyInstance) {
         [academia_id]
       );
 
-      /* 2) Pagos + joins a catálogos (SOLO pagos de jugadores de esa academia) */
       const [pagoRows]: any = await db.query(
         `SELECT p.*,
                 tp.id     AS tp_id,
@@ -370,14 +371,9 @@ export default async function pagos_jugador(app: FastifyInstance) {
         const categoria = j.categoria_nombre ?? j.categoria ?? "Sin categoría";
 
         const arrAll = rut ? pagosPorRut.get(rut) || [] : [];
+        const arrMensual = arrAll.filter((x) => Number(x.pago?.tipo_pago?.id) === MENSUALIDAD_TIPO_PAGO_ID);
 
-        const arrMensual = arrAll.filter(
-          (x) => Number(x.pago?.tipo_pago?.id) === MENSUALIDAD_TIPO_PAGO_ID
-        );
-
-        const pagosMensualMesActual = arrMensual.filter(
-          (x) => x.year === currentYear && x.month === currentMonth
-        );
+        const pagosMensualMesActual = arrMensual.filter((x) => x.year === currentYear && x.month === currentMonth);
 
         let estadoMensualidad: "PAGADO" | "VENCIDO" = baseEstadoSinPago;
         if (pagosMensualMesActual.length > 0) estadoMensualidad = "PAGADO";
@@ -395,39 +391,28 @@ export default async function pagos_jugador(app: FastifyInstance) {
         return { rut, nombre, categoria, estadoMensualidad, lastPago };
       });
 
-      const mesLabel = new Intl.DateTimeFormat("es-CL", {
-        month: "long",
-        year: "numeric",
-      }).format(now);
+      const mesLabel = new Intl.DateTimeFormat("es-CL", { month: "long", year: "numeric" }).format(now);
 
+      reply.header("Cache-Control", "no-store");
       return reply.send({
         ok: true,
         academia_id,
         filas,
         pagos,
-        mes: {
-          year: currentYear,
-          month: currentMonth,
-          dia_corte: DIA_CORTE_VENCIDO,
-          label: mesLabel,
-        },
+        mes: { year: currentYear, month: currentMonth, dia_corte: DIA_CORTE_VENCIDO, label: mesLabel },
       });
     } catch (err: any) {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error al calcular estado de cuenta",
-        error: err?.message,
-      });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      reply.header("Cache-Control", "no-store");
+      return reply.code(code).send({ ok: false, message: "Error al calcular estado de cuenta", detail: err?.message });
     }
   });
 
   /* ───────── GET estado mensualidad (solo deudores) (SCOPED) ───────── */
-  app.get("/mensualidad-estado", { preHandler: canRead }, async (req, reply) => {
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-    assertAcademiaId(academia_id, reply);
-
+  app.get("/mensualidad-estado", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
       const now = new Date();
       const currentYear = now.getFullYear();
       const currentMonth = now.getMonth() + 1;
@@ -484,9 +469,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
           if (!Number.isNaN(y) && !Number.isNaN(m)) {
             lastMensualidadFecha = s;
-            if (y === currentYear && m === currentMonth) {
-              tieneMensualidadMesActual = true;
-            }
+            if (y === currentYear && m === currentMonth) tieneMensualidadMesActual = true;
           }
         }
 
@@ -496,52 +479,36 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         if (estadoMensualidad !== "VENCIDO") continue;
 
-        filas.push({
-          rut,
-          nombre,
-          categoria,
-          estadoMensualidad,
-          lastMensualidadFecha,
-          tieneMensualidadMesActual,
-        });
+        filas.push({ rut, nombre, categoria, estadoMensualidad, lastMensualidadFecha, tieneMensualidadMesActual });
       }
 
-      const mesLabel = new Intl.DateTimeFormat("es-CL", {
-        month: "long",
-        year: "numeric",
-      }).format(now);
+      const mesLabel = new Intl.DateTimeFormat("es-CL", { month: "long", year: "numeric" }).format(now);
 
+      reply.header("Cache-Control", "no-store");
       return reply.send({
         ok: true,
         academia_id,
-        mes: {
-          year: currentYear,
-          month: currentMonth,
-          dia_corte: DIA_CORTE_VENCIDO,
-          label: mesLabel,
-        },
+        mes: { year: currentYear, month: currentMonth, dia_corte: DIA_CORTE_VENCIDO, label: mesLabel },
         filas,
       });
     } catch (err: any) {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error al calcular estado de mensualidad",
-        error: err?.message,
-      });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      reply.header("Cache-Control", "no-store");
+      return reply.code(code).send({ ok: false, message: "Error al calcular estado de mensualidad", detail: err?.message });
     }
   });
 
   /* ───────── GET por jugador_rut (SCOPED) ───────── */
-  // ✅ Importante: va ANTES de "/:id" para no ser capturado por la ruta dinámica.
-  app.get("/jugador/:jugador_rut", { preHandler: canRead }, async (req, reply) => {
+  app.get("/jugador/:jugador_rut", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = RutParam.safeParse((req as any).params);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: "RUT inválido" });
-
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-    assertAcademiaId(academia_id, reply);
+    if (!parsed.success) {
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "RUT inválido" });
+    }
 
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
       const [rows] = await db.query(
         `
         SELECT p.*
@@ -554,26 +521,26 @@ export default async function pagos_jugador(app: FastifyInstance) {
         [parsed.data.jugador_rut, academia_id]
       );
 
+      reply.header("Cache-Control", "no-store");
       return reply.send({ ok: true, academia_id, items: rows });
     } catch (err: any) {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error al listar pagos por jugador",
-        error: err?.message,
-      });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      reply.header("Cache-Control", "no-store");
+      return reply.code(code).send({ ok: false, message: "Error al listar pagos por jugador", detail: err?.message });
     }
   });
 
   /* ───────── GET por ID (SCOPED) ───────── */
-  app.get("/:id", { preHandler: canRead }, async (req, reply) => {
+  app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse((req as any).params);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
-
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-    assertAcademiaId(academia_id, reply);
+    if (!parsed.success) {
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
+    }
 
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
       const [rows]: any = await db.query(
         `
         SELECT p.*
@@ -586,58 +553,61 @@ export default async function pagos_jugador(app: FastifyInstance) {
         [parsed.data.id, academia_id]
       );
 
+      reply.header("Cache-Control", "no-store");
       if (!rows?.length) return reply.code(404).send({ ok: false, message: "Pago no encontrado" });
 
       return reply.send({ ok: true, academia_id, item: rows[0] });
     } catch (err: any) {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error al obtener pago",
-        error: err?.message,
-      });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      reply.header("Cache-Control", "no-store");
+      return reply.code(code).send({ ok: false, message: "Error al obtener pago", detail: err?.message });
     }
   });
 
   /* ───────── POST crear (SCOPED + valida jugador) ───────── */
-  app.post("/", { preHandler: canWrite }, async (req, reply) => {
+  app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const raw = (req as any).body ?? {};
     const normalized = normalizeBody(raw);
 
     const parsed = CreateSchema.safeParse(normalized);
     if (!parsed.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: "Payload inválido",
-        errors: parsed.error.flatten(),
-      });
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "Payload inválido", errors: parsed.error.flatten() });
     }
 
     const data = parsed.data;
 
-    const sqlDate = toSQLDate(data.fecha_pago);
-    if (!sqlDate) return reply.code(400).send({ ok: false, message: "fecha_pago inválida" });
+    const sqlDate = toSQLDate(String(data.fecha_pago));
+    if (!sqlDate) {
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "fecha_pago inválida" });
+    }
     data.fecha_pago = sqlDate;
 
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-    assertAcademiaId(academia_id, reply);
-
-    const ok = await assertJugadorInAcademiaOr403(data.jugador_rut, academia_id, reply);
-    if (!ok) return;
-
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
+      await assertJugadorInAcademiaOrThrow(data.jugador_rut, academia_id);
+
       const [result]: any = await db.query("INSERT INTO pagos_jugador SET ?", [data]);
-      return reply.code(201).send({ ok: true, academia_id, id: result.insertId, ...data });
+
+      reply.header("Cache-Control", "no-store");
+      return reply.code(201).send({ ok: true, academia_id, id: result.insertId, item: { id: result.insertId, ...data } });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al crear pago", error: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      reply.header("Cache-Control", "no-store");
+      const msg = err?.message === "FORBIDDEN_JUGADOR" ? "FORBIDDEN_JUGADOR" : "Error al crear pago";
+      return reply.code(code).send({ ok: false, message: msg, detail: err?.message });
     }
   });
 
   /* ───────── PUT actualizar (SCOPED + valida jugador) ───────── */
-  app.put("/:id", { preHandler: canWrite }, async (req, reply) => {
+  app.put("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const pid = IdParam.safeParse((req as any).params);
-    if (!pid.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
-
+    if (!pid.success) {
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
+    }
     const id = pid.data.id;
 
     const raw = (req as any).body ?? {};
@@ -645,68 +615,76 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
     const parsed = UpdateSchema.safeParse(normalized);
     if (!parsed.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: "Payload inválido",
-        errors: parsed.error.flatten(),
-      });
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "Payload inválido", errors: parsed.error.flatten() });
     }
 
     const data = parsed.data;
 
     if (data.fecha_pago) {
-      const sqlDate = toSQLDate(data.fecha_pago);
-      if (!sqlDate) return reply.code(400).send({ ok: false, message: "fecha_pago inválida" });
+      const sqlDate = toSQLDate(String(data.fecha_pago));
+      if (!sqlDate) {
+        reply.header("Cache-Control", "no-store");
+        return reply.code(400).send({ ok: false, message: "fecha_pago inválida" });
+      }
       data.fecha_pago = sqlDate;
     }
 
     if (Object.keys(data).length === 0) {
+      reply.header("Cache-Control", "no-store");
       return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
     }
 
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-    assertAcademiaId(academia_id, reply);
-
-    const [exists]: any = await db.query(
-      `
-      SELECT p.id, p.jugador_rut
-        FROM pagos_jugador p
-        JOIN jugadores j ON j.rut_jugador = p.jugador_rut
-       WHERE p.id = ?
-         AND j.academia_id = ?
-       LIMIT 1
-      `,
-      [id, academia_id]
-    );
-    if (!exists?.length) return reply.code(404).send({ ok: false, message: "Pago no encontrado" });
-
-    if (data.jugador_rut) {
-      const ok = await assertJugadorInAcademiaOr403(data.jugador_rut, academia_id, reply);
-      if (!ok) return;
-    }
-
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
+      // Asegura que el pago a editar pertenece a la academia efectiva
+      const [exists]: any = await db.query(
+        `
+        SELECT p.id, p.jugador_rut
+          FROM pagos_jugador p
+          JOIN jugadores j ON j.rut_jugador = p.jugador_rut
+         WHERE p.id = ?
+           AND j.academia_id = ?
+         LIMIT 1
+        `,
+        [id, academia_id]
+      );
+      if (!exists?.length) {
+        reply.header("Cache-Control", "no-store");
+        return reply.code(404).send({ ok: false, message: "Pago no encontrado" });
+      }
+
+      // Si quieren mover el pago a otro jugador: valida pertenencia
+      if (data.jugador_rut) {
+        await assertJugadorInAcademiaOrThrow(Number(data.jugador_rut), academia_id);
+      }
+
       const [result]: any = await db.query("UPDATE pagos_jugador SET ? WHERE id = ?", [data, id]);
 
-      if (result.affectedRows === 0) return reply.code(404).send({ ok: false, message: "Pago no encontrado" });
+      reply.header("Cache-Control", "no-store");
+      if (!result?.affectedRows) return reply.code(404).send({ ok: false, message: "Pago no encontrado" });
 
       return reply.send({ ok: true, academia_id, updated: { id, ...data } });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al actualizar pago", error: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      reply.header("Cache-Control", "no-store");
+      const msg = err?.message === "FORBIDDEN_JUGADOR" ? "FORBIDDEN_JUGADOR" : "Error al actualizar pago";
+      return reply.code(code).send({ ok: false, message: msg, detail: err?.message });
     }
   });
 
   /* ───────── DELETE eliminar (SCOPED) ───────── */
-  app.delete("/:id", { preHandler: canWrite }, async (req, reply) => {
+  app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse((req as any).params);
-    if (!parsed.success) return reply.code(400).send({ ok: false, message: "ID inválido" });
-
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-    assertAcademiaId(academia_id, reply);
+    if (!parsed.success) {
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
+    }
 
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
       const [result]: any = await db.query(
         `
         DELETE p
@@ -718,11 +696,14 @@ export default async function pagos_jugador(app: FastifyInstance) {
         [parsed.data.id, academia_id]
       );
 
-      if (result.affectedRows === 0) return reply.code(404).send({ ok: false, message: "Pago no encontrado" });
+      reply.header("Cache-Control", "no-store");
+      if (!result?.affectedRows) return reply.code(404).send({ ok: false, message: "Pago no encontrado" });
 
       return reply.send({ ok: true, academia_id, deleted: parsed.data.id });
     } catch (err: any) {
-      return reply.code(500).send({ ok: false, message: "Error al eliminar pago", error: err?.message });
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+      reply.header("Cache-Control", "no-store");
+      return reply.code(code).send({ ok: false, message: "Error al eliminar pago", detail: err?.message });
     }
   });
 }

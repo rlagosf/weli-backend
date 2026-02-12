@@ -1,5 +1,5 @@
 // src/routers/prevision_medica.ts
-import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
 import { db } from "../db";
 import { requireAuth, requireRoles } from "../middlewares/authz";
@@ -7,6 +7,11 @@ import { requireAuth, requireRoles } from "../middlewares/authz";
 /**
  * Tabla: prevision_medica
  * Campos: id (PK), nombre (VARCHAR UNIQUE idealmente)
+ * Scope: catálogo global (sin academia)
+ *
+ * Regla Platino (catálogo global):
+ * - READ: roles 1/2/3
+ * - WRITE: solo rol 3 (superadmin)
  */
 
 const IdParam = z.object({
@@ -15,11 +20,27 @@ const IdParam = z.object({
 
 const CreateSchema = z
   .object({
-    nombre: z.string().trim().min(3, "El nombre debe tener al menos 3 caracteres").max(100, "Máximo 100 caracteres"),
+    nombre: z
+      .string()
+      .trim()
+      .min(3, "El nombre debe tener al menos 3 caracteres")
+      .max(100, "Máximo 100 caracteres"),
   })
   .strict();
 
-const UpdateSchema = z
+// ✅ PUT reemplazo (nombre requerido)
+const PutSchema = z
+  .object({
+    nombre: z
+      .string()
+      .trim()
+      .min(3, "El nombre debe tener al menos 3 caracteres")
+      .max(100, "Máximo 100 caracteres"),
+  })
+  .strict();
+
+// ✅ PATCH parcial (nombre opcional)
+const PatchSchema = z
   .object({
     nombre: z
       .string()
@@ -37,135 +58,235 @@ function normalize(row: any) {
   };
 }
 
+function zodDetail(err: ZodError) {
+  return err.issues.map((i) => `${i.path.join(".") || "field"}: ${i.message}`).join("; ");
+}
+
+async function existsByNombre(nombre: string, excludeId?: number) {
+  const n = String(nombre ?? "").trim();
+  if (!n) return false;
+
+  if (excludeId) {
+    const [rows]: any = await db.query(
+      "SELECT id FROM prevision_medica WHERE LOWER(TRIM(nombre)) = LOWER(?) AND id <> ? LIMIT 1",
+      [n, excludeId]
+    );
+    return Array.isArray(rows) && rows.length > 0;
+  }
+
+  const [rows]: any = await db.query(
+    "SELECT id FROM prevision_medica WHERE LOWER(TRIM(nombre)) = LOWER(?) LIMIT 1",
+    [n]
+  );
+  return Array.isArray(rows) && rows.length > 0;
+}
+
 export default async function prevision_medica(app: FastifyInstance) {
-  // ✅ Reglas (catálogo global)
+  // ✅ Catálogo global (sin academia)
   const canRead = [requireAuth, requireRoles([1, 2, 3])];
-  const canWrite = [requireAuth, requireRoles([1, 3])];
+  const canWrite = [requireAuth, requireRoles([3])]; // 🔥 SOLO superadmin por ser global
 
-  // ───────────────────── Health (READ) ─────────────────────
-  app.get("/health", { preHandler: canRead }, async () => ({
-    module: "prevision_medica",
-    status: "ready",
-    timestamp: new Date().toISOString(),
-  }));
+  // Health
+  app.get("/health", { preHandler: canRead }, async (_req, reply) => {
+    reply.header("Cache-Control", "no-store");
+    return { module: "prevision_medica", status: "ready", timestamp: new Date().toISOString() };
+  });
 
-  // ───────────────────── GET all (READ) ─────────────────────
+  // GET /
   app.get("/", { preHandler: canRead }, async (_req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const [rows]: any = await db.query(
-        "SELECT id, nombre FROM prevision_medica ORDER BY nombre ASC, id ASC"
-      );
-
+      const [rows]: any = await db.query("SELECT id, nombre FROM prevision_medica ORDER BY nombre ASC, id ASC");
+      reply.header("Cache-Control", "no-store");
       return reply.send({
         ok: true,
         count: rows?.length ?? 0,
         items: (rows ?? []).map(normalize),
       });
     } catch (err: any) {
+      reply.header("Cache-Control", "no-store");
       return reply.code(500).send({
         ok: false,
-        message: "Error al listar prevision_medica",
-        error: err?.message,
+        message: "Error al listar previsiones médicas",
+        detail: err?.message,
       });
     }
   });
 
-  // ───────────────────── GET by ID (READ) ─────────────────────
+  // GET /:id
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const parsed = IdParam.safeParse(req.params);
     if (!parsed.success) {
-      return reply.code(400).send({ ok: false, message: parsed.error.issues[0]?.message ?? "ID inválido" });
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
     }
 
     const id = parsed.data.id;
 
     try {
       const [rows]: any = await db.query("SELECT id, nombre FROM prevision_medica WHERE id = ? LIMIT 1", [id]);
+      reply.header("Cache-Control", "no-store");
 
       if (!rows?.length) return reply.code(404).send({ ok: false, message: "No encontrado" });
-
       return reply.send({ ok: true, item: normalize(rows[0]) });
     } catch (err: any) {
+      reply.header("Cache-Control", "no-store");
       return reply.code(500).send({
         ok: false,
-        message: "Error al obtener prevision_medica",
-        error: err?.message,
+        message: "Error al obtener previsión médica",
+        detail: err?.message,
       });
     }
   });
 
-  // ───────────────────── POST crear (WRITE) ─────────────────────
+  // POST /
   app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       const body = CreateSchema.parse(req.body);
       const nombre = body.nombre.trim();
 
-      const [result]: any = await db.query("INSERT INTO prevision_medica (nombre) VALUES (?)", [nombre]);
-
-      return reply.code(201).send({ ok: true, id: result.insertId, nombre });
-    } catch (err: any) {
-      if (err instanceof ZodError) {
-        const detail = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-        return reply.code(400).send({ ok: false, message: "Payload inválido", detail });
-      }
-
-      if (err?.errno === 1062) {
+      const dup = await existsByNombre(nombre);
+      if (dup) {
+        reply.header("Cache-Control", "no-store");
         return reply.code(409).send({ ok: false, message: "Ya existe una previsión con ese nombre" });
       }
 
-      return reply.code(500).send({ ok: false, message: "Error al crear prevision_medica", error: err?.message });
+      const [result]: any = await db.query("INSERT INTO prevision_medica (nombre) VALUES (?)", [nombre]);
+
+      reply.header("Cache-Control", "no-store");
+      return reply.code(201).send({
+        ok: true,
+        id: result.insertId,
+        item: { id: result.insertId, nombre },
+      });
+    } catch (err: any) {
+      reply.header("Cache-Control", "no-store");
+      if (err instanceof ZodError) {
+        return reply.code(400).send({ ok: false, message: "Payload inválido", detail: zodDetail(err) });
+      }
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
+        return reply.code(409).send({ ok: false, message: "Ya existe una previsión con ese nombre" });
+      }
+      return reply.code(500).send({
+        ok: false,
+        message: "Error al crear previsión médica",
+        detail: err?.message,
+      });
     }
   });
 
-  // ───────────────────── PUT actualizar (WRITE) ─────────────────────
+  // PUT /:id (reemplazo)
   app.put("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const p = IdParam.safeParse(req.params);
-    if (!p.success) return reply.code(400).send({ ok: false, message: p.error.issues[0]?.message ?? "ID inválido" });
+    if (!p.success) {
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
+    }
+
     const id = p.data.id;
 
     try {
-      const body = UpdateSchema.parse(req.body);
+      const body = PutSchema.parse(req.body);
+      const nombre = body.nombre.trim();
 
-      if (Object.keys(body).length === 0) {
-        return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
-      }
-
-      const changes: any = {};
-      if (body.nombre !== undefined) changes.nombre = body.nombre.trim();
-
-      const [result]: any = await db.query("UPDATE prevision_medica SET ? WHERE id = ?", [changes, id]);
-
-      if (result.affectedRows === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
-
-      return reply.send({ ok: true, updated: { id, ...changes } });
-    } catch (err: any) {
-      if (err instanceof ZodError) {
-        const detail = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-        return reply.code(400).send({ ok: false, message: "Payload inválido", detail });
-      }
-
-      if (err?.errno === 1062) {
+      const dup = await existsByNombre(nombre, id);
+      if (dup) {
+        reply.header("Cache-Control", "no-store");
         return reply.code(409).send({ ok: false, message: "Nombre duplicado" });
       }
 
-      return reply.code(500).send({ ok: false, message: "Error al actualizar prevision_medica", error: err?.message });
+      const [result]: any = await db.query("UPDATE prevision_medica SET nombre = ? WHERE id = ? LIMIT 1", [nombre, id]);
+
+      reply.header("Cache-Control", "no-store");
+      if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
+
+      return reply.send({ ok: true, updated: { id, nombre } });
+    } catch (err: any) {
+      reply.header("Cache-Control", "no-store");
+      if (err instanceof ZodError) {
+        return reply.code(400).send({ ok: false, message: "Payload inválido", detail: zodDetail(err) });
+      }
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
+        return reply.code(409).send({ ok: false, message: "Nombre duplicado" });
+      }
+      return reply.code(500).send({
+        ok: false,
+        message: "Error al actualizar previsión médica",
+        detail: err?.message,
+      });
     }
   });
 
-  // ───────────────────── DELETE eliminar (WRITE) ─────────────────────
-  app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
+  // PATCH /:id (parcial)
+  app.patch("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     const p = IdParam.safeParse(req.params);
-    if (!p.success) return reply.code(400).send({ ok: false, message: p.error.issues[0]?.message ?? "ID inválido" });
+    if (!p.success) {
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
+    }
 
     const id = p.data.id;
 
     try {
-      const [result]: any = await db.query("DELETE FROM prevision_medica WHERE id = ?", [id]);
+      const body = PatchSchema.parse(req.body);
+      if (Object.keys(body).length === 0) {
+        reply.header("Cache-Control", "no-store");
+        return reply.code(400).send({ ok: false, message: "No hay campos para actualizar" });
+      }
 
-      if (result.affectedRows === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
+      if (body.nombre !== undefined) {
+        const nombre = body.nombre.trim();
+
+        const dup = await existsByNombre(nombre, id);
+        if (dup) {
+          reply.header("Cache-Control", "no-store");
+          return reply.code(409).send({ ok: false, message: "Nombre duplicado" });
+        }
+
+        const [result]: any = await db.query("UPDATE prevision_medica SET nombre = ? WHERE id = ? LIMIT 1", [nombre, id]);
+
+        reply.header("Cache-Control", "no-store");
+        if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
+
+        return reply.send({ ok: true, updated: { id, nombre } });
+      }
+
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "No hay campos válidos para actualizar" });
+    } catch (err: any) {
+      reply.header("Cache-Control", "no-store");
+      if (err instanceof ZodError) {
+        return reply.code(400).send({ ok: false, message: "Payload inválido", detail: zodDetail(err) });
+      }
+      if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
+        return reply.code(409).send({ ok: false, message: "Nombre duplicado" });
+      }
+      return reply.code(500).send({
+        ok: false,
+        message: "Error al actualizar previsión médica",
+        detail: err?.message,
+      });
+    }
+  });
+
+  // DELETE /:id
+  app.delete("/:id", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
+    const p = IdParam.safeParse(req.params);
+    if (!p.success) {
+      reply.header("Cache-Control", "no-store");
+      return reply.code(400).send({ ok: false, message: "ID inválido" });
+    }
+
+    const id = p.data.id;
+
+    try {
+      const [result]: any = await db.query("DELETE FROM prevision_medica WHERE id = ? LIMIT 1", [id]);
+
+      reply.header("Cache-Control", "no-store");
+      if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       return reply.send({ ok: true, deleted: id });
     } catch (err: any) {
+      reply.header("Cache-Control", "no-store");
       if (err?.errno === 1451 || String(err?.code || "").includes("ER_ROW_IS_REFERENCED")) {
         return reply.code(409).send({
           ok: false,
@@ -173,8 +294,11 @@ export default async function prevision_medica(app: FastifyInstance) {
           detail: err?.sqlMessage ?? err?.message,
         });
       }
-
-      return reply.code(500).send({ ok: false, message: "Error al eliminar", error: err?.message });
+      return reply.code(500).send({
+        ok: false,
+        message: "Error al eliminar previsión médica",
+        detail: err?.message,
+      });
     }
   });
 }

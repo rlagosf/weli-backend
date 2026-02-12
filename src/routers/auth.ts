@@ -67,35 +67,27 @@ function getJwtSecret() {
 type ExpiresIn = SignOptions["expiresIn"]; // number | StringValue | undefined
 
 function normalizeExpiresIn(v: unknown): ExpiresIn {
-  // default seguro
   const FALLBACK: ExpiresIn = "12h";
-
   if (v == null) return FALLBACK;
 
-  // number directo => segundos
   if (typeof v === "number" && Number.isFinite(v) && v > 0) {
     return Math.floor(v);
   }
 
-  // string => validar formato permitido
   const s = String(v).trim();
   if (!s) return FALLBACK;
 
-  // "3600" => seconds
   if (/^\d+$/.test(s)) {
     const n = Number(s);
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
     return FALLBACK;
   }
 
-  // "12h", "30m", "15s", "7d", "1w", "500ms", "1y" (con o sin espacios)
   const compact = s.replace(/\s+/g, "");
   if (/^\d+(ms|s|m|h|d|w|y)$/i.test(compact)) {
-    // TS: esto calza con StringValue (string con unidad)
     return compact as ExpiresIn;
   }
 
-  // si llega basura, no arriesgamos
   return FALLBACK;
 }
 
@@ -433,8 +425,11 @@ export default async function auth(app: FastifyInstance) {
         let academia_id_effective: number | null = null;
 
         if (rol === 3) {
+          // superadmin: el tenant se decide por header (x-academia-id) en routers tenantizados,
+          // por eso en el token queda null.
           academia_id_effective = null;
         } else {
+          // admin/staff: academia fija del token (DB), jamás “switch” por input.
           if (academiaIdDb == null || !Number.isFinite(academiaIdDb) || academiaIdDb <= 0) {
             fireAndForgetAudit("access_denied", req, 400, user.id, {
               reason: "user_missing_academia_id_db",
@@ -446,6 +441,7 @@ export default async function auth(app: FastifyInstance) {
             });
           }
 
+          // Si el cliente manda academia_id, solo se usa para detectar mismatch (no para setear).
           if (academia_id_input !== undefined) {
             if (!Number.isFinite(academia_id_input) || academia_id_input <= 0) {
               fireAndForgetAudit("access_denied", req, 400, user.id, {
@@ -471,18 +467,15 @@ export default async function auth(app: FastifyInstance) {
         }
 
         // ✅ Payload dual (compatibilidad total)
-        // IMPORTANTE: sub debe ser string (si no, jsonwebtoken puede explotar)
         const userIdStr = String(user.id);
 
         const payload = {
-          // top-level (para compat)
           type: "admin",
           sub: userIdStr,
           rol_id: rol,
           nombre_usuario: String(user.nombre_usuario ?? ""),
           academia_id: academia_id_effective,
 
-          // nested (para authz.extractUser(decoded) => decoded.user)
           user: {
             type: "admin",
             id: Number(user.id),
@@ -498,7 +491,6 @@ export default async function auth(app: FastifyInstance) {
           expiresIn: normalizeExpiresIn(
             (CONFIG as any).JWT_EXPIRES_IN ?? process.env.JWT_EXPIRES_IN
           ),
-          // ✅ NO subject aquí: ya usamos sub en payload (evita duplicación)
         };
 
         let token: string;

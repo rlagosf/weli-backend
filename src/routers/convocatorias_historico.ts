@@ -2,7 +2,11 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db";
-import { requireAuth, requireRoles } from "../middlewares/authz";
+import {
+  requireAuth,
+  requireRoles,
+  getEffectiveAcademiaId, // ✅ estándar único
+} from "../middlewares/authz";
 
 /* ───────────────────────────────
    ZOD SCHEMAS
@@ -37,53 +41,12 @@ const stripDataUrlPrefix = (s: string) => {
 const approxBytes = (b64: string) => Math.floor((b64.length * 3) / 4);
 const MAX_BYTES = Number(process.env.CONVOC_HIST_MAX_BYTES || 12 * 1024 * 1024);
 
-function getAuth(req: any) {
-  return (req as any).auth as
-    | { type: "user"; user_id?: number; rol_id?: number; academia_id?: number }
-    | { type: "apoderado"; rut: string; apoderado_id?: number }
-    | undefined;
-}
-
-function getHeaderAcademiaId(req: any): number | null {
-  const raw =
-    (req.headers?.["x-academia-id"] as any) ??
-    (req.headers?.["X-Academia-Id"] as any) ??
-    null;
-
-  const v = Array.isArray(raw) ? raw[0] : raw;
-  const n = Number(v);
+function getUserIdOrNull(req: any): number | null {
+  const a = (req as any).auth;
+  if (!a || typeof a !== "object") return null;
+  if (a.type !== "user") return null;
+  const n = Number(a.user_id ?? 0);
   return Number.isFinite(n) && n > 0 ? n : null;
-}
-
-/**
- * ✅ Academia efectiva:
- * - rol 3 (superadmin): OBLIGATORIO x-academia-id (academia "objetivo" del super-dashboard)
- * - rol 1/2: usa auth.academia_id
- */
-function getAcademiaIdOr403(req: any, reply: any) {
-  const a = getAuth(req);
-  if (!a || a.type !== "user") {
-    reply.code(403).send({ ok: false, message: "FORBIDDEN" });
-    return null;
-  }
-
-  const rol = Number(a.rol_id ?? 0);
-
-  if (rol === 3) {
-    const headerAcademia = getHeaderAcademiaId(req);
-    if (!headerAcademia) {
-      reply.code(403).send({ ok: false, message: "ACADEMIA_TARGET_REQUIRED" });
-      return null;
-    }
-    return headerAcademia;
-  }
-
-  const academia_id = Number(a.academia_id ?? 0);
-  if (!Number.isFinite(academia_id) || academia_id <= 0) {
-    reply.code(403).send({ ok: false, message: "ACADEMIA_REQUIRED" });
-    return null;
-  }
-  return academia_id;
 }
 
 /* ───────────────────────────────
@@ -109,8 +72,7 @@ export default async function convocatorias_historico(app: FastifyInstance) {
       const limit = Math.min(Math.max(size, 1), 200);
       const offset = (Math.max(page, 1) - 1) * limit;
 
-      const academia_id = getAcademiaIdOr403(req, reply);
-      if ((reply as any).sent) return;
+      const academia_id = getEffectiveAcademiaId(req);
 
       const [rows]: any = await db.query(
         `
@@ -126,7 +88,9 @@ export default async function convocatorias_historico(app: FastifyInstance) {
 
       return reply.send({ ok: true, items: rows, page, pageSize: limit, academia_id });
     } catch (e: any) {
-      return reply.code(500).send({ ok: false, message: "Error al listar", error: e?.message });
+      const code =
+        e?.statusCode && Number.isFinite(e.statusCode) ? Number(e.statusCode) : 500;
+      return reply.code(code).send({ ok: false, message: "Error al listar", error: e?.message });
     }
   });
 
@@ -140,10 +104,9 @@ export default async function convocatorias_historico(app: FastifyInstance) {
 
       const { evento_id, convocatoria_id } = p.data;
 
-      const academia_id = getAcademiaIdOr403(req, reply);
-      if ((reply as any).sent) return;
-
       try {
+        const academia_id = getEffectiveAcademiaId(req);
+
         const [rows]: any = await db.query(
           `
           SELECT h.id, h.evento_id, h.convocatoria_id, h.fecha_generacion, h.generado_por
@@ -159,7 +122,9 @@ export default async function convocatorias_historico(app: FastifyInstance) {
 
         return reply.send({ ok: true, items: rows, academia_id });
       } catch (e: any) {
-        return reply.code(500).send({
+        const code =
+          e?.statusCode && Number.isFinite(e.statusCode) ? Number(e.statusCode) : 500;
+        return reply.code(code).send({
           ok: false,
           message: "Error al obtener registros del evento",
           error: e?.message,
@@ -175,10 +140,9 @@ export default async function convocatorias_historico(app: FastifyInstance) {
 
     const { id } = p.data;
 
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
       const [rows]: any = await db.query(
         `
         SELECT h.listado_base64
@@ -200,7 +164,9 @@ export default async function convocatorias_historico(app: FastifyInstance) {
       reply.header("Content-Disposition", `inline; filename="convocatoria_${id}.pdf"`);
       return reply.send(buf);
     } catch (e: any) {
-      return reply.code(500).send({ ok: false, message: "Error al generar PDF", error: e?.message });
+      const code =
+        e?.statusCode && Number.isFinite(e.statusCode) ? Number(e.statusCode) : 500;
+      return reply.code(code).send({ ok: false, message: "Error al generar PDF", error: e?.message });
     }
   });
 
@@ -211,10 +177,9 @@ export default async function convocatorias_historico(app: FastifyInstance) {
 
     const { id } = p.data;
 
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-
     try {
+      const academia_id = getEffectiveAcademiaId(req);
+
       const [rows]: any = await db.query(
         `
         SELECT h.*
@@ -231,7 +196,9 @@ export default async function convocatorias_historico(app: FastifyInstance) {
 
       return reply.send({ ok: true, item: rows[0], academia_id });
     } catch (e: any) {
-      return reply.code(500).send({ ok: false, message: "Error al obtener registro", error: e?.message });
+      const code =
+        e?.statusCode && Number.isFinite(e.statusCode) ? Number(e.statusCode) : 500;
+      return reply.code(code).send({ ok: false, message: "Error al obtener registro", error: e?.message });
     }
   });
 
@@ -239,17 +206,20 @@ export default async function convocatorias_historico(app: FastifyInstance) {
   app.post("/", { preHandler: canWrite }, async (req, reply) => {
     const parsed = CreateSchema.safeParse((req as any).body);
     if (!parsed.success) {
-      return reply.code(400).send({ ok: false, message: "Payload inválido", errors: parsed.error.flatten() });
+      return reply.code(400).send({
+        ok: false,
+        message: "Payload inválido",
+        errors: parsed.error.flatten(),
+      });
     }
 
     const { evento_id, convocatoria_id, listado_base64 } = parsed.data;
     let { fecha_generacion } = parsed.data;
 
-    const academia_id = getAcademiaIdOr403(req, reply);
-    if ((reply as any).sent) return;
-
     try {
-      // ✅ Validar evento pertenece a academia efectiva (incluye rol 3)
+      const academia_id = getEffectiveAcademiaId(req);
+
+      // ✅ Validar evento pertenece a academia efectiva
       const [chk]: any = await db.query(
         `SELECT id FROM eventos WHERE id = ? AND academia_id = ? LIMIT 1`,
         [evento_id, academia_id]
@@ -271,15 +241,17 @@ export default async function convocatorias_historico(app: FastifyInstance) {
         if (!isNaN(d.getTime())) fechaMySQL = d.toISOString().slice(0, 19).replace("T", " ");
       }
 
+      const generado_por = getUserIdOrNull(req); // ✅ auditable (admin/super/s)
+
       const sql = `
         INSERT INTO convocatorias_historico
           (evento_id, convocatoria_id, fecha_generacion, listado_base64, generado_por)
-        VALUES (?, ?, ${fechaMySQL ? "?" : "NOW()"}, ?, NULL)
+        VALUES (?, ?, ${fechaMySQL ? "?" : "NOW()"}, ?, ?)
       `;
 
       const params = fechaMySQL
-        ? [evento_id, convocatoria_id, fechaMySQL, pure]
-        : [evento_id, convocatoria_id, pure];
+        ? [evento_id, convocatoria_id, fechaMySQL, pure, generado_por]
+        : [evento_id, convocatoria_id, pure, generado_por];
 
       const [result]: any = await db.query(sql, params);
 
@@ -292,7 +264,9 @@ export default async function convocatorias_historico(app: FastifyInstance) {
         fecha_generacion: fechaMySQL ?? new Date().toISOString(),
       });
     } catch (e: any) {
-      return reply.code(500).send({ ok: false, message: "Error al crear registro", error: e?.message });
+      const code =
+        e?.statusCode && Number.isFinite(e.statusCode) ? Number(e.statusCode) : 500;
+      return reply.code(code).send({ ok: false, message: "Error al crear registro", error: e?.message });
     }
   });
 }

@@ -88,8 +88,8 @@ export default async function academias(app: FastifyInstance) {
           a.created_at,
           a.updated_at
         FROM academias a
-        JOIN deportes d ON d.id = a.deporte_id
-        JOIN estado_academia ea ON ea.id = a.estado_id
+        LEFT JOIN deportes d ON d.id = a.deporte_id
+        LEFT JOIN estado_academia ea ON ea.id = a.estado_id
         ${whereSql}
         ORDER BY a.id DESC
         LIMIT ? OFFSET ?
@@ -140,8 +140,8 @@ export default async function academias(app: FastifyInstance) {
           a.created_at,
           a.updated_at
         FROM academias a
-        JOIN deportes d ON d.id = a.deporte_id
-        JOIN estado_academia ea ON ea.id = a.estado_id
+        LEFT JOIN deportes d ON d.id = a.deporte_id
+        LEFT JOIN estado_academia ea ON ea.id = a.estado_id
         WHERE a.id = ?
         LIMIT 1
         `,
