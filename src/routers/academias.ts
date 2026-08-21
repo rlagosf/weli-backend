@@ -15,7 +15,14 @@ const CreateSchema = z
   .object({
     nombre: z.string().trim().min(2).max(120),
     deporte_id: z.coerce.number().int().positive(),
-    estado_id: z.coerce.number().int().positive().optional(), // 1 activado, 2 desactivado
+    estado_id: z.coerce.number().int().positive().optional(),
+
+    sucursales: z
+      .array(
+        z.string().trim().min(2).max(100)
+      )
+      .min(1, "Debe registrar al menos una sucursal")
+      .max(50, "No se pueden registrar más de 50 sucursales"),
   })
   .strict();
 
@@ -119,48 +126,95 @@ export default async function academias(app: FastifyInstance) {
 
   /* ───────── Get by id ───────── */
   // GET /api/academias/:id  (rol 3)
+  /* ───────── Get by id ───────── */
+  // GET /api/academias/:id  (rol 3)
   app.get("/:id", { preHandler: onlySuper }, async (req, reply) => {
     const parsed = IdParam.safeParse((req as any).params);
+
     if (!parsed.success) {
-      return reply.code(400).send({ ok: false, message: "ID inválido" });
+      return reply.code(400).send({
+        ok: false,
+        message: "ID inválido",
+      });
     }
 
     const { id } = parsed.data;
 
     try {
+      // ---------------------------------------------------------
+      // Academia
+      // ---------------------------------------------------------
+
       const [rows]: any = await db.query(
         `
-        SELECT
-          a.id,
-          a.nombre,
-          a.deporte_id,
-          d.nombre AS deporte_nombre,
-          a.estado_id,
-          ea.nombre AS estado_nombre,
-          a.created_at,
-          a.updated_at
-        FROM academias a
-        LEFT JOIN deportes d ON d.id = a.deporte_id
-        LEFT JOIN estado_academia ea ON ea.id = a.estado_id
-        WHERE a.id = ?
-        LIMIT 1
-        `,
+      SELECT
+        a.id,
+        a.nombre,
+        a.deporte_id,
+        d.nombre AS deporte_nombre,
+        a.estado_id,
+        ea.nombre AS estado_nombre,
+        a.created_at,
+        a.updated_at
+      FROM academias a
+      LEFT JOIN deportes d
+        ON d.id = a.deporte_id
+      LEFT JOIN estado_academia ea
+        ON ea.id = a.estado_id
+      WHERE a.id = ?
+      LIMIT 1
+      `,
         [id]
       );
 
       if (!rows?.length) {
-        return reply.code(404).send({ ok: false, message: "Academia no encontrada" });
+        return reply.code(404).send({
+          ok: false,
+          message: "Academia no encontrada",
+        });
       }
 
-      return reply.send({ ok: true, item: rows[0] });
+      // ---------------------------------------------------------
+      // Sucursales
+      // ---------------------------------------------------------
+
+      const [sucursales]: any = await db.query(
+        `
+      SELECT
+        id,
+        academia_id,
+        nombre
+      FROM sucursales_real
+      WHERE academia_id = ?
+      ORDER BY nombre ASC
+      `,
+        [id]
+      );
+
+      // ---------------------------------------------------------
+      // Respuesta
+      // ---------------------------------------------------------
+
+      return reply.send({
+        ok: true,
+        item: {
+          ...rows[0],
+          sucursales,
+        },
+      });
     } catch {
-      return reply.code(500).send({ ok: false, message: "Error interno" });
+      return reply.code(500).send({
+        ok: false,
+        message: "Error interno",
+      });
     }
   });
 
   /* ───────── Create ───────── */
   // POST /api/academias  (rol 3)
   app.post("/", { preHandler: onlySuper }, async (req, reply) => {
+    const conn = await db.getConnection();
+
     try {
       const body = CreateSchema.parse(req.body);
 
@@ -168,26 +222,106 @@ export default async function academias(app: FastifyInstance) {
       const deporte_id = body.deporte_id;
       const estado_id = body.estado_id ?? 1;
 
-      const [result]: any = await db.query(
+      // Limpiar nombres de sucursales
+      const sucursales = body.sucursales.map((s) => s.trim());
+
+      // Evitar sucursales duplicadas dentro de la misma solicitud
+      const sucursalesNormalizadas = sucursales.map((s) =>
+        s.toLocaleLowerCase("es")
+      );
+
+      if (new Set(sucursalesNormalizadas).size !== sucursales.length) {
+        return reply.code(400).send({
+          ok: false,
+          message: "No se pueden registrar sucursales duplicadas",
+        });
+      }
+
+      // =========================================================
+      // TRANSACCIÓN
+      // =========================================================
+
+      await conn.beginTransaction();
+
+      // 1. Crear academia
+      const [resultAcademia]: any = await conn.query(
         `
-        INSERT INTO academias (nombre, deporte_id, estado_id)
-        VALUES (?, ?, ?)
-        `,
+      INSERT INTO academias (
+        nombre,
+        deporte_id,
+        estado_id
+      )
+      VALUES (?, ?, ?)
+      `,
         [nombre, deporte_id, estado_id]
+      );
+
+      const academiaId = resultAcademia.insertId;
+
+      // 2. Preparar sucursales
+      const values = sucursales.map((nombreSucursal) => [
+        academiaId,
+        nombreSucursal,
+      ]);
+
+      // 3. Crear todas las sucursales
+      await conn.query(
+        `
+      INSERT INTO sucursales_real (
+        academia_id,
+        nombre
+      )
+      VALUES ?
+      `,
+        [values]
+      );
+
+      // 4. Confirmar todo
+      await conn.commit();
+
+      // 5. Obtener sucursales ya creadas con sus ID reales
+      const [sucursalesCreadas]: any = await db.query(
+        `
+      SELECT
+        id,
+        academia_id,
+        nombre
+      FROM sucursales_real
+      WHERE academia_id = ?
+      ORDER BY id ASC
+      `,
+        [academiaId]
       );
 
       return reply.code(201).send({
         ok: true,
-        id: result.insertId,
-        nombre,
+        message: "Academia y sucursales creadas correctamente",
+        academia: {
+          id: academiaId,
+          nombre,
+          deporte_id,
+          estado_id,
+          sucursales: sucursalesCreadas,
+        },
       });
     } catch (error: any) {
+      // Si algo falla, deshacer TODA la operación
+      try {
+        await conn.rollback();
+      } catch { }
+
       const isDup = error?.code === "ER_DUP_ENTRY";
+
       const msg = isDup
-        ? "Ya existe una academia con ese nombre"
+        ? "Ya existe una academia con ese nombre o una sucursal duplicada"
         : error?.message ?? "BAD_REQUEST";
 
-      return reply.code(isDup ? 409 : 400).send({ ok: false, message: msg });
+      return reply.code(isDup ? 409 : 400).send({
+        ok: false,
+        message: msg,
+      });
+    } finally {
+      conn.release();
     }
   });
 
