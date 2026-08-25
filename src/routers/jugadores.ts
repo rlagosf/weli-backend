@@ -792,6 +792,81 @@ export default async function jugadores(app: FastifyInstance) {
     }
   });
 
+  // ───────── Buscar apoderado por RUT para autocompletar (write 1/3) ─────────
+  app.get(
+    "/apoderado/rut/:rut",
+    { preHandler: canWrite },
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      reply.header("Cache-Control", "no-store");
+
+      const rawRut = String((req.params as any)?.rut ?? "")
+        .replace(/\D/g, "")
+        .trim();
+
+      // apoderados_auth trabaja con 8 dígitos sin DV.
+      if (!/^\d{8}$/.test(rawRut)) {
+        return reply.code(400).send({
+          ok: false,
+          message: "El RUT del apoderado debe tener 8 dígitos sin DV.",
+        });
+      }
+
+      try {
+        // Conserva la validación multiacademia existente.
+        // - superadmin: exige x-academia-id
+        // - admin: academia desde token
+        getEffectiveAcademiaId(req);
+
+        const [rows]: any = await db.query(
+          `
+          SELECT
+            apoderado_id,
+            rut_apoderado,
+            nombre_apoderado
+          FROM apoderados_auth
+          WHERE rut_apoderado = ?
+          LIMIT 1
+          `,
+          [rawRut]
+        );
+
+        if (!Array.isArray(rows) || rows.length === 0) {
+          return reply.code(404).send({
+            ok: false,
+            exists: false,
+            message: "Apoderado no encontrado",
+          });
+        }
+
+        const nombre = String(rows[0]?.nombre_apoderado ?? "").trim();
+
+        return reply.send({
+          ok: true,
+          exists: true,
+          item: {
+            apoderado_id: Number(rows[0]?.apoderado_id ?? 0),
+            rut_apoderado: String(rows[0]?.rut_apoderado ?? rawRut),
+            nombre_apoderado: nombre || null,
+          },
+        });
+      } catch (err: any) {
+        const code =
+          err?.statusCode && Number.isFinite(err.statusCode)
+            ? err.statusCode
+            : 500;
+
+        return reply.code(code).send({
+          ok: false,
+          message:
+            code === 403
+              ? "Acceso denegado"
+              : "Error al buscar apoderado",
+          detail: err?.message,
+        });
+      }
+    }
+  );
+
   // ───────── GET por ID (read 1/2/3) ─────────
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     const pid = IdParam.safeParse(req.params);
