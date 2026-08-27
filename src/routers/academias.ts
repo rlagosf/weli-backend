@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { db } from "../db";
-import { requireAuth, requireRoles } from "../middlewares/authz";
+import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
 /* =========================
    Schemas
@@ -49,6 +49,10 @@ const ListQuery = z.object({
 export default async function academias(app: FastifyInstance) {
   // ✅ Solo SUPERADMIN (rol 3) puede usar TODO este router
   const onlySuper = [requireAuth, requireRoles([3])];
+  const canReadOwnAcademia = [
+    requireAuth,
+    requireRoles([1, 2, 3]),
+  ];
 
   /* ───────── Health ───────── */
   app.get("/health", { preHandler: onlySuper }, async () => ({
@@ -128,87 +132,188 @@ export default async function academias(app: FastifyInstance) {
   // GET /api/academias/:id  (rol 3)
   /* ───────── Get by id ───────── */
   // GET /api/academias/:id  (rol 3)
-  app.get("/:id", { preHandler: onlySuper }, async (req, reply) => {
-    const parsed = IdParam.safeParse((req as any).params);
+  app.get(
+    "/:id",
+    {
+      preHandler: canReadOwnAcademia,
+    },
+    async (
+      req,
+      reply
+    ) => {
+      const parsed =
+        IdParam.safeParse(
+          (req as any).params
+        );
 
-    if (!parsed.success) {
-      return reply.code(400).send({
-        ok: false,
-        message: "ID inválido",
-      });
-    }
-
-    const { id } = parsed.data;
-
-    try {
-      // ---------------------------------------------------------
-      // Academia
-      // ---------------------------------------------------------
-
-      const [rows]: any = await db.query(
-        `
-      SELECT
-        a.id,
-        a.nombre,
-        a.deporte_id,
-        d.nombre AS deporte_nombre,
-        a.estado_id,
-        ea.nombre AS estado_nombre,
-        a.created_at,
-        a.updated_at
-      FROM academias a
-      LEFT JOIN deportes d
-        ON d.id = a.deporte_id
-      LEFT JOIN estado_academia ea
-        ON ea.id = a.estado_id
-      WHERE a.id = ?
-      LIMIT 1
-      `,
-        [id]
-      );
-
-      if (!rows?.length) {
-        return reply.code(404).send({
-          ok: false,
-          message: "Academia no encontrada",
-        });
+      if (
+        !parsed.success
+      ) {
+        return reply
+          .code(400)
+          .send({
+            ok: false,
+            message:
+              "ID inválido",
+          });
       }
 
-      // ---------------------------------------------------------
-      // Sucursales
-      // ---------------------------------------------------------
-
-      const [sucursales]: any = await db.query(
-        `
-      SELECT
+      const {
         id,
-        academia_id,
-        nombre
-      FROM sucursales_real
-      WHERE academia_id = ?
-      ORDER BY nombre ASC
-      `,
-        [id]
-      );
+      } = parsed.data;
 
-      // ---------------------------------------------------------
-      // Respuesta
-      // ---------------------------------------------------------
+      try {
+        /* =================================================
+           Academia efectiva
+  
+           - Admin / Staff:
+             viene del token.
+  
+           - Superadmin:
+             viene del mecanismo actual de selección
+             de academia.
+  
+           El frontend NO decide el tenant.
+        ================================================= */
 
-      return reply.send({
-        ok: true,
-        item: {
-          ...rows[0],
-          sucursales,
-        },
-      });
-    } catch {
-      return reply.code(500).send({
-        ok: false,
-        message: "Error interno",
-      });
+        const academiaIdEfectiva =
+          getEffectiveAcademiaId(
+            req
+          );
+
+        /* =================================================
+           Protección contra acceso cruzado
+  
+           Ejemplo:
+           usuario academia_id = 2
+  
+           GET /academias/2  -> permitido
+           GET /academias/3  -> 403
+        ================================================= */
+
+        if (
+          Number(id) !==
+          Number(
+            academiaIdEfectiva
+          )
+        ) {
+          return reply
+            .code(403)
+            .send({
+              ok: false,
+              message:
+                "FORBIDDEN_ACADEMIA",
+            });
+        }
+
+        /* =================================================
+           Academia
+        ================================================= */
+
+        const [rows]: any =
+          await db.query(
+            `
+          SELECT
+            a.id,
+            a.nombre,
+            a.deporte_id,
+            d.nombre AS deporte_nombre,
+            a.estado_id,
+            ea.nombre AS estado_nombre,
+            a.created_at,
+            a.updated_at
+
+          FROM academias a
+
+          LEFT JOIN deportes d
+            ON d.id = a.deporte_id
+
+          LEFT JOIN estado_academia ea
+            ON ea.id = a.estado_id
+
+          WHERE a.id = ?
+
+          LIMIT 1
+          `,
+            [
+              academiaIdEfectiva,
+            ]
+          );
+
+        if (
+          !rows?.length
+        ) {
+          return reply
+            .code(404)
+            .send({
+              ok: false,
+              message:
+                "Academia no encontrada",
+            });
+        }
+
+        /* =================================================
+           Sucursales
+        ================================================= */
+
+        const [sucursales]: any =
+          await db.query(
+            `
+          SELECT
+            id,
+            academia_id,
+            nombre
+
+          FROM sucursales_real
+
+          WHERE academia_id = ?
+
+          ORDER BY nombre ASC
+          `,
+            [
+              academiaIdEfectiva,
+            ]
+          );
+
+        /* =================================================
+           Respuesta
+        ================================================= */
+
+        return reply.send({
+          ok: true,
+
+          item: {
+            ...rows[0],
+            sucursales,
+          },
+        });
+      } catch (
+      error: any
+      ) {
+        const status =
+          Number(
+            error
+              ?.statusCode ??
+            500
+          );
+
+        return reply
+          .code(
+            Number.isFinite(
+              status
+            )
+              ? status
+              : 500
+          )
+          .send({
+            ok: false,
+            message:
+              error?.message ??
+              "Error interno",
+          });
+      }
     }
-  });
+  );
 
   /* ───────── Create ───────── */
   // POST /api/academias  (rol 3)

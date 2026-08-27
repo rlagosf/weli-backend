@@ -1,92 +1,67 @@
 // src/routers/auth.ts
+
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { verify as argon2Verify, hash as argon2Hash } from "@node-rs/argon2";
 import jwt, { SignOptions } from "jsonwebtoken";
 import { db } from "../db";
 import { CONFIG } from "../config";
-import {
-  requireAuth as authzRequireAuth,
-  requireRoles as authzRequireRoles,
-} from "../middlewares/authz";
+import { requireAuth as authzRequireAuth, requireRoles as authzRequireRoles } from "../middlewares/authz";
 
 /* ───────────────────────── Config ───────────────────────── */
 
-// ✅ 1=admin, 2=staff, 3=superadmin
 const ALLOWED_PANEL_ROLES = new Set([1, 2, 3]);
 const ACTIVE_ESTADO_ID = 1;
+const JWT_ALGORITHM = "HS256" as const;
 
-const JWT_ISSUER = String(
-  (CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER ?? "app"
-).trim();
+const JWT_ISSUER = String((CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER ?? "app").trim();
+const JWT_AUDIENCE = String((CONFIG as any)?.JWT_AUDIENCE ?? process.env.JWT_AUDIENCE ?? "web").trim();
 
-const JWT_AUDIENCE = String(
-  (CONFIG as any)?.JWT_AUDIENCE ?? process.env.JWT_AUDIENCE ?? "web"
-).trim();
+const PERF_LOG = String((CONFIG as any)?.AUTH_PERF_LOG ?? process.env.AUTH_PERF_LOG ?? "0") === "1";
+const TRUST_PROXY = String((CONFIG as any)?.TRUST_PROXY ?? process.env.TRUST_PROXY ?? "0") === "1";
 
-const PERF_LOG =
-  String((CONFIG as any)?.AUTH_PERF_LOG ?? process.env.AUTH_PERF_LOG ?? "0") === "1";
-
-/**
- * Por defecto NO confiamos en XFF.
- */
-const TRUST_PROXY =
-  String((CONFIG as any)?.TRUST_PROXY ?? process.env.TRUST_PROXY ?? "0") === "1";
-
-/**
- * Limita cuántos Argon2 corren en paralelo.
- */
 const MAX_AUTH_CONCURRENCY = Math.max(
   2,
   Number((CONFIG as any)?.AUTH_CONCURRENCY ?? process.env.AUTH_CONCURRENCY ?? 8) || 8
 );
 
-/**
- * Evita inflar auth_audit.extra
- */
 const AUDIT_EXTRA_MAX_CHARS = Math.max(
   512,
-  Number(
-    (CONFIG as any)?.AUDIT_EXTRA_MAX_CHARS ??
-      process.env.AUDIT_EXTRA_MAX_CHARS ??
-      2048
-  ) || 2048
+  Number((CONFIG as any)?.AUDIT_EXTRA_MAX_CHARS ?? process.env.AUDIT_EXTRA_MAX_CHARS ?? 2048) || 2048
 );
 
 function getJwtSecret() {
-  const s = CONFIG.JWT_SECRET ?? process.env.JWT_SECRET;
-  if (!s) throw new Error("JWT_SECRET missing (CONFIG.JWT_SECRET)");
-  return String(s);
+  const secret = String(CONFIG.JWT_SECRET ?? process.env.JWT_SECRET ?? "");
+
+  if (!secret) throw new Error("JWT_SECRET missing");
+  if (secret.length < 32) throw new Error("JWT_SECRET must contain at least 32 characters");
+
+  return secret;
 }
 
-/**
- * ✅ CORRECCIÓN TS:
- * jsonwebtoken tipa expiresIn como `number | StringValue | undefined`.
- * Por eso NO puede ser `string | number` genérico.
- */
-type ExpiresIn = SignOptions["expiresIn"]; // number | StringValue | undefined
+/* ───────────────────────── JWT expiration ───────────────────────── */
 
-function normalizeExpiresIn(v: unknown): ExpiresIn {
+type ExpiresIn = SignOptions["expiresIn"];
+
+function normalizeExpiresIn(value: unknown): ExpiresIn {
   const FALLBACK: ExpiresIn = "12h";
-  if (v == null) return FALLBACK;
 
-  if (typeof v === "number" && Number.isFinite(v) && v > 0) {
-    return Math.floor(v);
+  if (value == null) return FALLBACK;
+
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
   }
 
-  const s = String(v).trim();
-  if (!s) return FALLBACK;
+  const raw = String(value).trim();
+  if (!raw) return FALLBACK;
 
-  if (/^\d+$/.test(s)) {
-    const n = Number(s);
-    if (Number.isFinite(n) && n > 0) return Math.floor(n);
-    return FALLBACK;
+  if (/^\d+$/.test(raw)) {
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : FALLBACK;
   }
 
-  const compact = s.replace(/\s+/g, "");
-  if (/^\d+(ms|s|m|h|d|w|y)$/i.test(compact)) {
-    return compact as ExpiresIn;
-  }
+  const compact = raw.replace(/\s+/g, "");
+  if (/^\d+(ms|s|m|h|d|w|y)$/i.test(compact)) return compact as ExpiresIn;
 
   return FALLBACK;
 }
@@ -99,8 +74,14 @@ function getIp(req: FastifyRequest): string | null {
   if (!TRUST_PROXY) return (req as any).ip ? String((req as any).ip) : null;
 
   const xff = req.headers?.["x-forwarded-for"];
-  if (Array.isArray(xff)) return String(xff[0] || "").split(",")[0].trim() || null;
-  if (typeof xff === "string" && xff) return xff.split(",")[0].trim() || null;
+
+  if (Array.isArray(xff)) {
+    return String(xff[0] || "").split(",")[0].trim() || null;
+  }
+
+  if (typeof xff === "string" && xff) {
+    return xff.split(",")[0].trim() || null;
+  }
 
   const realIp = req.headers?.["x-real-ip"];
   if (typeof realIp === "string" && realIp) return realIp.trim();
@@ -108,11 +89,12 @@ function getIp(req: FastifyRequest): string | null {
   return (req as any).ip ? String((req as any).ip) : null;
 }
 
-function safeJsonTruncate(extra: any, maxChars: number) {
+function safeJsonTruncate(extra: unknown, maxChars: number) {
   if (!extra) return null;
+
   try {
-    const s = JSON.stringify(extra);
-    return s.length <= maxChars ? s : s.slice(0, maxChars);
+    const json = JSON.stringify(extra);
+    return json.length <= maxChars ? json : json.slice(0, maxChars);
   } catch {
     return null;
   }
@@ -123,7 +105,7 @@ async function audit(
   req: FastifyRequest,
   status: number,
   userId?: number | null,
-  extra?: any
+  extra?: unknown
 ) {
   try {
     const ip = getIp(req);
@@ -141,13 +123,13 @@ async function audit(
         route.substring(0, 255),
         method.substring(0, 10),
         status,
-        ip?.toString().substring(0, 64),
-        userAgent?.substring(0, 255),
+        ip?.toString().substring(0, 64) ?? null,
+        userAgent?.substring(0, 255) ?? null,
         safeJsonTruncate(extra, AUDIT_EXTRA_MAX_CHARS),
       ]
     );
   } catch {
-    // auditoría nunca debe botar auth
+    // La auditoría nunca debe interrumpir el flujo de autenticación.
   }
 }
 
@@ -155,11 +137,11 @@ function fireAndForgetAudit(...args: Parameters<typeof audit>) {
   void audit(...args).catch(() => {});
 }
 
-/* ───────────────────────── Semaphore (argon2) ───────────────────────── */
+/* ───────────────────────── Semaphore Argon2 ───────────────────────── */
 
 function createSemaphore(max: number) {
   let inFlight = 0;
-  const q: Array<() => void> = [];
+  const queue: Array<() => void> = [];
 
   const acquire = () =>
     new Promise<void>((resolve) => {
@@ -167,13 +149,14 @@ function createSemaphore(max: number) {
         inFlight += 1;
         resolve();
       };
+
       if (inFlight < max) run();
-      else q.push(run);
+      else queue.push(run);
     });
 
   const release = () => {
     inFlight = Math.max(0, inFlight - 1);
-    const next = q.shift();
+    const next = queue.shift();
     if (next) next();
   };
 
@@ -190,6 +173,7 @@ const authSem = createSemaphore(MAX_AUTH_CONCURRENCY);
 
 async function withAuthSlot<T>(fn: () => Promise<T>): Promise<T> {
   await authSem.acquire();
+
   try {
     return await fn();
   } finally {
@@ -197,12 +181,11 @@ async function withAuthSlot<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-/* ───────────────────────── Rate limit login (memoria) ───────────────────────── */
+/* ───────────────────────── Rate limit ───────────────────────── */
 
 const RL_MAX = 10;
 const RL_WINDOW_MS = 10 * 60_000;
 const RL_BLOCK_MS = 15 * 60_000;
-
 const RL_MAX_KEYS = 50_000;
 const RL_GC_INTERVAL_MS = 60_000;
 
@@ -216,59 +199,68 @@ type RLState = {
 const rl = new Map<string, RLState>();
 
 function rlKey(ip: string | null, nombre_usuario: string) {
-  return `${ip || "noip"}:${String(nombre_usuario || "").toLowerCase()}`;
+  return `${ip || "noip"}:${String(nombre_usuario || "").trim().toLowerCase()}`;
+}
+
+function rlFallbackKey(ip: string | null) {
+  return `${ip || "noip"}:*`;
 }
 
 function rlSafeKeysOk() {
   return rl.size < RL_MAX_KEYS;
 }
 
+/**
+ * Solo consulta el estado.
+ * NO incrementa intentos.
+ */
 function checkRateLimit(ip: string | null, nombre_usuario: string) {
   const now = Date.now();
-  const key = rlSafeKeysOk() ? rlKey(ip, nombre_usuario) : `${ip || "noip"}:*`;
+  const exactKey = rlKey(ip, nombre_usuario);
 
-  const st = rl.get(key);
-  if (!st) {
-    rl.set(key, { count: 1, windowStart: now, blockedUntil: 0, lastSeen: now });
-    return { ok: true, retryAfterSec: 0 };
+  /*
+   * Cuando el mapa alcanza el máximo, registerFailed()
+   * puede utilizar el bucket global por IP.
+   * Por eso revisamos ambos.
+   */
+  const keys = [exactKey, rlFallbackKey(ip)];
+
+  for (const key of keys) {
+    const st = rl.get(key);
+    if (!st) continue;
+
+    st.lastSeen = now;
+
+    if (st.blockedUntil > now) {
+      return {
+        ok: false,
+        retryAfterSec: Math.ceil((st.blockedUntil - now) / 1000),
+      };
+    }
+
+    if (now - st.windowStart > RL_WINDOW_MS) {
+      rl.delete(key);
+    }
   }
 
-  st.lastSeen = now;
-
-  if (st.blockedUntil > now) {
-    return { ok: false, retryAfterSec: Math.ceil((st.blockedUntil - now) / 1000) };
-  }
-
-  if (now - st.windowStart > RL_WINDOW_MS) {
-    st.count = 0;
-    st.windowStart = now;
-    st.blockedUntil = 0;
-  }
-
-  st.count += 1;
-
-  if (st.count >= RL_MAX) {
-    st.blockedUntil = now + RL_BLOCK_MS;
-    st.count = 0;
-    st.windowStart = now;
-    rl.set(key, st);
-    return { ok: false, retryAfterSec: Math.ceil(RL_BLOCK_MS / 1000) };
-  }
-
-  rl.set(key, st);
   return { ok: true, retryAfterSec: 0 };
 }
 
+/**
+ * Único lugar donde se contabiliza un fallo real.
+ */
 function registerFailed(ip: string | null, nombre_usuario: string) {
   const now = Date.now();
-  const key = rlSafeKeysOk() ? rlKey(ip, nombre_usuario) : `${ip || "noip"}:*`;
+  const key = rlSafeKeysOk() ? rlKey(ip, nombre_usuario) : rlFallbackKey(ip);
 
-  const st = rl.get(key) ?? {
-    count: 0,
-    windowStart: now,
-    blockedUntil: 0,
-    lastSeen: now,
-  };
+  const st =
+    rl.get(key) ??
+    ({
+      count: 0,
+      windowStart: now,
+      blockedUntil: 0,
+      lastSeen: now,
+    } satisfies RLState);
 
   st.lastSeen = now;
 
@@ -289,37 +281,61 @@ function registerFailed(ip: string | null, nombre_usuario: string) {
   rl.set(key, st);
 }
 
+/**
+ * Login correcto:
+ * elimina penalización previa de ese usuario/IP.
+ */
+function clearRateLimit(ip: string | null, nombre_usuario: string) {
+  rl.delete(rlKey(ip, nombre_usuario));
+}
+
 let rlGcStarted = false;
+
 function startRlGcOnce() {
   if (rlGcStarted) return;
   rlGcStarted = true;
 
   setInterval(() => {
     const now = Date.now();
-    for (const [k, st] of rl.entries()) {
-      if (now - st.lastSeen > 60 * 60_000) rl.delete(k);
-      else if (st.blockedUntil === 0 && now - st.windowStart > 2 * RL_WINDOW_MS) rl.delete(k);
+
+    for (const [key, st] of rl.entries()) {
+      if (now - st.lastSeen > 60 * 60_000) {
+        rl.delete(key);
+        continue;
+      }
+
+      if (st.blockedUntil === 0 && now - st.windowStart > 2 * RL_WINDOW_MS) {
+        rl.delete(key);
+      }
     }
   }, RL_GC_INTERVAL_MS).unref?.();
 }
 
-/* ───────────────────────── Anti-timing dummy hash ───────────────────────── */
+/* ───────────────────────── Anti timing ───────────────────────── */
 
-const DUMMY_HASH_PROMISE = withAuthSlot(() => argon2Hash("dummy-password-not-valid"));
+/**
+ * Hash dummy reutilizable:
+ * evita una diferencia demasiado evidente entre
+ * usuario existente e inexistente.
+ */
+const DUMMY_HASH_PROMISE = withAuthSlot(() => argon2Hash("weli-dummy-password-not-valid"));
 
 /* ───────────────────────── Schemas ───────────────────────── */
 
-const LoginSchema = z.object({
-  nombre_usuario: z.string().trim().min(3).max(80),
-  password: z.string().min(4).max(200),
-  // opcional
-  academia_id: z.coerce.number().int().positive().optional(),
-});
+const LoginSchema = z
+  .object({
+    nombre_usuario: z.string().trim().min(3).max(80),
+    password: z.string().min(4).max(200),
+    academia_id: z.coerce.number().int().positive().optional(),
+  })
+  .strict();
 
 /* ───────────────────────── Router ───────────────────────── */
 
 export default async function auth(app: FastifyInstance) {
   startRlGcOnce();
+
+  /* ───────── Health ───────── */
 
   app.get("/health", async () => ({
     module: "auth",
@@ -327,214 +343,271 @@ export default async function auth(app: FastifyInstance) {
     timestamp: new Date().toISOString(),
   }));
 
-  app.post(
-    "/login",
-    { schema: { security: [] } },
-    async (req: FastifyRequest, reply: FastifyReply) => {
-      const parsed = LoginSchema.safeParse(req.body);
-      if (!parsed.success) {
-        fireAndForgetAudit("access_denied", req, 400, null, { reason: "invalid_payload" });
-        return reply.code(400).send({ ok: false, message: "Payload inválido" });
-      }
+  /* ───────── Login panel ───────── */
 
-      const ip = getIp(req);
-      const nombre_usuario = String(parsed.data.nombre_usuario ?? "").trim();
-      const password = String(parsed.data.password ?? "");
-      const academia_id_input =
-        parsed.data.academia_id === undefined ? undefined : Number(parsed.data.academia_id);
+  app.post("/login", { schema: { security: [] } }, async (req: FastifyRequest, reply: FastifyReply) => {
+    const parsed = LoginSchema.safeParse(req.body);
 
-      const rlCheck = checkRateLimit(ip, nombre_usuario);
-      if (!rlCheck.ok) {
-        fireAndForgetAudit("access_denied", req, 429, null, {
-          reason: "rate_limit",
-          nombre_usuario,
-          retryAfterSec: rlCheck.retryAfterSec,
-        });
-        reply.header("Retry-After", String(rlCheck.retryAfterSec));
-        return reply.code(429).send({ ok: false, message: "TOO_MANY_ATTEMPTS" });
-      }
+    if (!parsed.success) {
+      fireAndForgetAudit("access_denied", req, 400, null, { reason: "invalid_payload" });
+      return reply.code(400).send({ ok: false, message: "Payload inválido" });
+    }
 
-      const t0 = Date.now();
+    const ip = getIp(req);
+    const nombre_usuario = parsed.data.nombre_usuario.trim();
+    const password = parsed.data.password;
+    const academia_id_input =
+      parsed.data.academia_id === undefined ? undefined : Number(parsed.data.academia_id);
 
-      try {
-        const [rows]: any = await db.query(
-          `SELECT id, nombre_usuario, email, password, rol_id, estado_id, academia_id
-           FROM usuarios
-           WHERE nombre_usuario = BINARY ?
-             AND estado_id = ?
-             AND rol_id IN (1,2,3)
-           LIMIT 1`,
-          [nombre_usuario, ACTIVE_ESTADO_ID]
+    /* ───────── Rate limit ───────── */
+
+    const rlCheck = checkRateLimit(ip, nombre_usuario);
+
+    if (!rlCheck.ok) {
+      fireAndForgetAudit("access_denied", req, 429, null, {
+        reason: "rate_limit",
+        nombre_usuario,
+        retryAfterSec: rlCheck.retryAfterSec,
+      });
+
+      reply.header("Retry-After", String(rlCheck.retryAfterSec));
+      return reply.code(429).send({ ok: false, message: "TOO_MANY_ATTEMPTS" });
+    }
+
+    const t0 = Date.now();
+
+    try {
+      /* ───────── Usuario ───────── */
+
+      const [rows]: any = await db.query(
+        `SELECT id, nombre_usuario, email, password, rol_id, estado_id, academia_id
+         FROM usuarios
+         WHERE nombre_usuario = BINARY ?
+           AND estado_id = ?
+           AND rol_id IN (1,2,3)
+         LIMIT 1`,
+        [nombre_usuario, ACTIVE_ESTADO_ID]
+      );
+
+      const t1 = Date.now();
+      const user = rows?.length ? rows[0] : null;
+
+      /* ───────── Verificación Argon2 ───────── */
+
+      const hashToVerify = user?.password ?? (await DUMMY_HASH_PROMISE);
+      const t2a = Date.now();
+
+      const passwordOk = await withAuthSlot(async () => {
+        try {
+          return await argon2Verify(hashToVerify, password);
+        } catch {
+          return false;
+        }
+      });
+
+      const t2b = Date.now();
+
+      if (PERF_LOG) {
+        req.log.info(
+          {
+            nombre_usuario,
+            ip,
+            ms_select: t1 - t0,
+            ms_verify: t2b - t2a,
+            ms_total_so_far: t2b - t0,
+            has_user: Boolean(user),
+            argon2_inflight: authSem.inFlight,
+            rl_keys: rl.size,
+            trust_proxy: TRUST_PROXY,
+          },
+          "AUTH_PANEL_LOGIN_PERF"
         );
+      }
 
-        const t1 = Date.now();
-        const user = rows?.length ? rows[0] : null;
+      /* ───────── Credenciales inválidas ───────── */
 
-        const hashToVerify = user?.password ?? (await DUMMY_HASH_PROMISE);
+      if (!user || !passwordOk) {
+        registerFailed(ip, nombre_usuario);
 
-        const t2a = Date.now();
-        const ok = await withAuthSlot(async () => {
-          try {
-            return await argon2Verify(hashToVerify, password);
-          } catch {
-            return false;
-          }
+        fireAndForgetAudit("access_denied", req, 401, user?.id ?? null, {
+          reason: !user ? "user_not_found_or_not_allowed" : "bad_password",
+          nombre_usuario,
+          ms_total: t2b - t0,
         });
-        const t2b = Date.now();
 
-        if (PERF_LOG) {
-          req.log.info(
-            {
-              nombre_usuario,
-              ip,
-              ms_select: t1 - t0,
-              ms_verify: t2b - t2a,
-              ms_total_so_far: t2b - t0,
-              has_user: Boolean(user),
-              argon2_inflight: authSem.inFlight,
-              rl_keys: rl.size,
-              trust_proxy: TRUST_PROXY,
-            },
-            "AUTH_PANEL_LOGIN_PERF"
-          );
+        return reply.code(401).send({ ok: false, message: "Credenciales inválidas" });
+      }
+
+      const rol = Number(user.rol_id);
+      const estado = Number(user.estado_id);
+      const academiaIdDb = user.academia_id === null ? null : Number(user.academia_id);
+
+      /* ───────── Rol ───────── */
+
+      if (!ALLOWED_PANEL_ROLES.has(rol)) {
+        fireAndForgetAudit("access_denied", req, 403, user.id, {
+          reason: "role_not_allowed",
+          rol_id: rol,
+        });
+
+        return reply.code(403).send({ ok: false, message: "No autorizado" });
+      }
+
+      /* ───────── Multi tenant ───────── */
+
+      let academia_id_effective: number | null = null;
+
+      if (rol === 3) {
+        /*
+         * Superadmin:
+         * la academia se determina posteriormente mediante
+         * x-academia-id en routers tenantizados.
+         */
+        academia_id_effective = null;
+      } else {
+        /*
+         * Admin / Staff:
+         * la academia se obtiene exclusivamente desde DB.
+         */
+        if (academiaIdDb == null || !Number.isFinite(academiaIdDb) || academiaIdDb <= 0) {
+          fireAndForgetAudit("access_denied", req, 400, user.id, {
+            reason: "user_missing_academia_id_db",
+            rol_id: rol,
+          });
+
+          return reply.code(400).send({
+            ok: false,
+            message: "Usuario sin academia asignada. Contacta al administrador.",
+          });
         }
 
-        if (!user || !ok) {
-          registerFailed(ip, nombre_usuario);
-          fireAndForgetAudit("access_denied", req, 401, user?.id ?? null, {
-            reason: !user ? "user_not_found_or_not_allowed" : "bad_password",
-            nombre_usuario,
-            ms_total: t2b - t0,
+        /*
+         * Si el cliente envía academia_id,
+         * solamente se utiliza para detectar inconsistencias.
+         *
+         * Nunca determina el tenant.
+         */
+        if (academia_id_input !== undefined && academiaIdDb !== academia_id_input) {
+          fireAndForgetAudit("access_denied", req, 401, user.id, {
+            reason: "academy_mismatch",
+            rol_id: rol,
+            academia_id_input,
+            academia_id_db: academiaIdDb,
           });
+
           return reply.code(401).send({ ok: false, message: "Credenciales inválidas" });
         }
 
-        const rol = Number(user.rol_id);
-        const estado = Number(user.estado_id);
-        const academiaIdDb = user.academia_id === null ? null : Number(user.academia_id);
+        academia_id_effective = academiaIdDb;
+      }
 
-        if (!ALLOWED_PANEL_ROLES.has(rol)) {
-          fireAndForgetAudit("access_denied", req, 403, user.id, {
-            reason: "role_not_allowed",
-            rol_id: rol,
-          });
-          return reply.code(403).send({ ok: false, message: "No autorizado" });
-        }
+      /*
+       * Autenticación correcta:
+       * limpia fallos anteriores de este usuario/IP.
+       */
+      clearRateLimit(ip, nombre_usuario);
 
-        /* ───────── Regla multi-tenant (robusta) ───────── */
-        let academia_id_effective: number | null = null;
+      /* ───────── JWT WELI ───────── */
 
-        if (rol === 3) {
-          // superadmin: el tenant se decide por header (x-academia-id) en routers tenantizados,
-          // por eso en el token queda null.
-          academia_id_effective = null;
-        } else {
-          // admin/staff: academia fija del token (DB), jamás “switch” por input.
-          if (academiaIdDb == null || !Number.isFinite(academiaIdDb) || academiaIdDb <= 0) {
-            fireAndForgetAudit("access_denied", req, 400, user.id, {
-              reason: "user_missing_academia_id_db",
-              rol_id: rol,
-            });
-            return reply.code(400).send({
-              ok: false,
-              message: "Usuario sin academia asignada. Contacta al administrador.",
-            });
-          }
+      const userIdStr = String(user.id);
 
-          // Si el cliente manda academia_id, solo se usa para detectar mismatch (no para setear).
-          if (academia_id_input !== undefined) {
-            if (!Number.isFinite(academia_id_input) || academia_id_input <= 0) {
-              fireAndForgetAudit("access_denied", req, 400, user.id, {
-                reason: "invalid_academia_id_input",
-                rol_id: rol,
-                academia_id_input,
-              });
-              return reply.code(400).send({ ok: false, message: "academia_id inválido." });
-            }
+      /*
+       * Conservamos por ahora claims top-level + user
+       * porque varios componentes actuales todavía leen
+       * ambas estructuras.
+       *
+       * Esta compatibilidad se podrá retirar cuando terminemos
+       * la purga global del proyecto.
+       */
+      const payload = {
+        type: "admin",
+        sub: userIdStr,
+        rol_id: rol,
+        nombre_usuario: String(user.nombre_usuario ?? ""),
+        academia_id: academia_id_effective,
 
-            if (academiaIdDb !== academia_id_input) {
-              fireAndForgetAudit("access_denied", req, 401, user.id, {
-                reason: "academy_mismatch",
-                rol_id: rol,
-                academia_id_input,
-                academia_id_db: academiaIdDb,
-              });
-              return reply.code(401).send({ ok: false, message: "Credenciales inválidas" });
-            }
-          }
-
-          academia_id_effective = academiaIdDb;
-        }
-
-        // ✅ Payload dual (compatibilidad total)
-        const userIdStr = String(user.id);
-
-        const payload = {
+        user: {
           type: "admin",
-          sub: userIdStr,
+          id: Number(user.id),
           rol_id: rol,
           nombre_usuario: String(user.nombre_usuario ?? ""),
           academia_id: academia_id_effective,
+        },
+      };
 
-          user: {
-            type: "admin",
-            id: Number(user.id),
-            rol_id: rol,
-            nombre_usuario: String(user.nombre_usuario ?? ""),
-            academia_id: academia_id_effective,
+      const signOpts: SignOptions = {
+        algorithm: JWT_ALGORITHM,
+        issuer: JWT_ISSUER,
+        audience: JWT_AUDIENCE,
+        expiresIn: normalizeExpiresIn((CONFIG as any).JWT_EXPIRES_IN ?? process.env.JWT_EXPIRES_IN),
+      };
+
+      let token: string;
+
+      try {
+        token = jwt.sign(payload, getJwtSecret(), signOpts);
+      } catch (error: any) {
+        req.log.error(
+          {
+            err: error,
+            issuer: JWT_ISSUER,
+            audience: JWT_AUDIENCE,
+            algorithm: JWT_ALGORITHM,
+            expiresIn: signOpts.expiresIn,
           },
-        };
+          "[auth/login] jwt.sign failed"
+        );
 
-        const signOpts: SignOptions = {
-          issuer: JWT_ISSUER,
-          audience: JWT_AUDIENCE,
-          expiresIn: normalizeExpiresIn(
-            (CONFIG as any).JWT_EXPIRES_IN ?? process.env.JWT_EXPIRES_IN
-          ),
-        };
-
-        let token: string;
-        try {
-          token = jwt.sign(payload, getJwtSecret(), signOpts);
-        } catch (e: any) {
-          req.log.error(
-            { err: e, issuer: JWT_ISSUER, audience: JWT_AUDIENCE, expiresIn: signOpts.expiresIn },
-            "[auth/login] jwt.sign failed"
-          );
-          fireAndForgetAudit("access_denied", req, 500, user.id, {
-            reason: "jwt_sign_failed",
-            message: e?.message,
-          });
-          return reply.code(500).send({ ok: false, message: "Error procesando login" });
-        }
-
-        fireAndForgetAudit("login", req, 200, user.id, { ok: true, rol_id: rol });
-
-        return reply.send({
-          ok: true,
-          token,
-          rol_id: rol,
-          user: {
-            id: user.id,
-            nombre_usuario: user.nombre_usuario,
-            email: user.email,
-            rol_id: rol,
-            estado_id: estado,
-            academia_id: academia_id_effective,
-          },
+        fireAndForgetAudit("access_denied", req, 500, user.id, {
+          reason: "jwt_sign_failed",
         });
-      } catch (err: any) {
-        req.log.error({ err }, "auth/login failed");
-        fireAndForgetAudit("access_denied", req, 500, null, {
-          reason: "exception",
-          message: err?.message,
-        });
+
         return reply.code(500).send({ ok: false, message: "Error procesando login" });
       }
-    }
-  );
 
-  // Logout panel (roles 1/2/3)
+      /* ───────── Auditoría login ───────── */
+
+      fireAndForgetAudit("login", req, 200, user.id, {
+        ok: true,
+        rol_id: rol,
+      });
+
+      /* ───────── Respuesta ───────── */
+
+      return reply.send({
+        ok: true,
+        token,
+        rol_id: rol,
+
+        user: {
+          id: Number(user.id),
+          nombre_usuario: String(user.nombre_usuario ?? ""),
+          email: user.email,
+          rol_id: rol,
+          estado_id: estado,
+          academia_id: academia_id_effective,
+        },
+      });
+    } catch (error: any) {
+      req.log.error({ err: error }, "auth/login failed");
+
+      /*
+       * No persistimos error.message en auth_audit:
+       * puede contener detalles internos de DB o infraestructura.
+       */
+      fireAndForgetAudit("access_denied", req, 500, null, {
+        reason: "exception",
+      });
+
+      return reply.code(500).send({
+        ok: false,
+        message: "Error procesando login",
+      });
+    }
+  });
+
+  /* ───────── Logout panel ───────── */
+
   app.post(
     "/logout",
     { preHandler: [authzRequireAuth, authzRequireRoles([1, 2, 3])] },
@@ -543,7 +616,11 @@ export default async function auth(app: FastifyInstance) {
       const userId = auth?.type === "user" ? auth?.user_id ?? null : null;
 
       fireAndForgetAudit("logout", req, 200, userId);
-      return reply.send({ ok: true, message: "logout" });
+
+      return reply.send({
+        ok: true,
+        message: "logout",
+      });
     }
   );
 }
