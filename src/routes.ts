@@ -1,4 +1,4 @@
-// src/routes/index.ts ✅ recomendado
+// src/routes/routes.ts ✅ recomendado
 import type { FastifyInstance } from "fastify";
 
 import { noticiasPublicRoutes } from "./routers/noticias_public";
@@ -38,6 +38,17 @@ import convocatorias_historico from "./routers/convocatorias_historico";
 
 import admin_noticias from "./routers/admin_noticias";
 import estado_noticias from "./routers/estado_noticias";
+
+import planes from "./routers/planes";
+import cargos_jugador from "./routers/cargos_jugador";
+import jugador_planes from "./routers/jugador_planes";
+import plan_sucursales from "./routers/plan_sucursales";
+import plan_tarifas from "./routers/plan_tarifas";
+import promocion_planes from "./routers/promocion_planes";
+import promocion_sucursales from "./routers/promocion_sucursales";
+import promocion_tipos_pago from "./routers/promocion_tipos_pago";
+import promociones from "./routers/promociones";
+import tarifa_sucursales from "./routers/tarifa_sucursales";
 
 import gabriela from "./gabriela";
 
@@ -91,4 +102,16 @@ export async function registerRoutes(app: FastifyInstance) {
 
   // ───────────────────────── IA ─────────────────────────
   app.register(gabriela, { prefix: `${API_BASE}/gabriela` });
-}
+
+    // ───────────────────────── TARIFAS ─────────────────────────
+  app.register(planes, { prefix: `${API_BASE}/planes` });
+  app.register(cargos_jugador, { prefix: `${API_BASE}/cargos-jugador` });
+  app.register(jugador_planes, { prefix: `${API_BASE}/jugador-planes` });
+  app.register(plan_sucursales, { prefix: `${API_BASE}/plan-sucursales` });
+  app.register(plan_tarifas, { prefix: `${API_BASE}/plan-tarifas` });
+  app.register(promocion_planes, { prefix: `${API_BASE}/promocion-planes` });
+  app.register(promocion_sucursales, { prefix: `${API_BASE}/promocion-sucursales` });
+  app.register(promocion_tipos_pago, { prefix: `${API_BASE}/promocion-tipos-pago` });
+  app.register(promociones, { prefix: `${API_BASE}/promociones` });
+  app.register(tarifa_sucursales, { prefix: `${API_BASE}/tarifa-sucursales` });
+} 
