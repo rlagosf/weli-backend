@@ -25,17 +25,17 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
  * - Multi-academia
  *
  * Seguridad:
- * - READ: roles 1,2,3
+ * - READ: roles 1,3
  * - WRITE: roles 1,3
  *
  * academia_id:
- * - Admin/Staff: JWT firmado
+ * - Admin: JWT firmado
  * - Superadmin: x-academia-id validado
  *
  * Reglas:
  * - academia_id nunca se recibe desde body.
  * - plan_id debe pertenecer a la academia efectiva.
- * - tipo_pago_id debe ser global (academia_id NULL) o pertenecer a la academia efectiva.
+ * - tipo_pago_id pertenece al catálogo global y debe estar habilitado para la academia efectiva mediante academia_tipo_pago.
  * - monto debe ser >= 0.
  * - vigencia_hasta >= vigencia_desde cuando exista.
  * - una tarifa utilizada por cargos conserva sus datos históricos.
@@ -228,6 +228,11 @@ async function getTarifa(academiaId: number, id: number) {
     INNER JOIN tipo_pago tp
       ON tp.id = pt.tipo_pago_id
 
+    INNER JOIN academia_tipo_pago atp
+      ON atp.academia_id = pt.academia_id
+     AND atp.tipo_pago_id = pt.tipo_pago_id
+     AND atp.estado_id = 1
+
     WHERE pt.id = ?
       AND pt.academia_id = ?
 
@@ -263,20 +268,23 @@ async function validatePlan(academiaId: number, planId: number, requireActive = 
 async function validateTipoPago(academiaId: number, tipoPagoId: number) {
   const [rows]: any = await db.query(
     `
-    SELECT id
-    FROM tipo_pago
-    WHERE id = ?
-      AND (
-        academia_id IS NULL
-        OR academia_id = ?
-      )
+    SELECT
+      tp.id
+    FROM tipo_pago tp
+
+    INNER JOIN academia_tipo_pago atp
+      ON atp.tipo_pago_id = tp.id
+     AND atp.academia_id = ?
+     AND atp.estado_id = 1
+
+    WHERE tp.id = ?
     LIMIT 1
     `,
-    [tipoPagoId, academiaId]
+    [academiaId, tipoPagoId]
   );
 
   if (!rows?.length) {
-    throw new Error("El tipo de pago no existe o no pertenece a la academia");
+    throw new Error("El tipo de pago no existe o no está habilitado para la academia");
   }
 }
 
@@ -333,7 +341,7 @@ function isBusinessValidationError(err: any) {
     "Monto inválido",
     "El plan no existe o no pertenece a la academia",
     "El plan seleccionado no se encuentra activo",
-    "El tipo de pago no existe o no pertenece a la academia",
+    "El tipo de pago no existe o no está habilitado para la academia",
   ].includes(String(err?.message ?? ""));
 }
 
@@ -342,7 +350,7 @@ function isBusinessValidationError(err: any) {
 ========================================================= */
 
 export default async function plan_tarifas(app: FastifyInstance) {
-  const canRead = [requireAuth, requireRoles([1, 2, 3])];
+  const canRead = [requireAuth, requireRoles([1, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
   /* =======================================================
@@ -459,6 +467,11 @@ export default async function plan_tarifas(app: FastifyInstance) {
 
         INNER JOIN tipo_pago tp
           ON tp.id = pt.tipo_pago_id
+
+        INNER JOIN academia_tipo_pago atp
+          ON atp.academia_id = pt.academia_id
+         AND atp.tipo_pago_id = pt.tipo_pago_id
+         AND atp.estado_id = 1
 
         WHERE ${where.join(" AND ")}
 

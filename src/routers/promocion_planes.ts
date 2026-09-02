@@ -19,11 +19,11 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
  * - Multi-academia
  *
  * Seguridad:
- * - READ: roles 1,2,3
+ * - READ: roles 1,3
  * - WRITE: roles 1,3
  *
  * academia_id:
- * - Admin/Staff: JWT firmado
+ * - Admin: JWT firmado
  * - Superadmin: x-academia-id validado
  *
  * Reglas:
@@ -270,7 +270,7 @@ function isBusinessValidationError(err: any) {
 ========================================================= */
 
 export default async function promocion_planes(app: FastifyInstance) {
-  const canRead = [requireAuth, requireRoles([1, 2, 3])];
+  const canRead = [requireAuth, requireRoles([1, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
   /* =======================================================

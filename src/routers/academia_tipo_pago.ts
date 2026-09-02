@@ -1,4 +1,4 @@
-// src/routers/promocion_sucursales.ts
+// src/routers/academia_tipo_pago.ts
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
@@ -6,33 +6,34 @@ import { db } from "../db";
 import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
 /**
- * Tabla: promocion_sucursal
+ * Tabla: academia_tipo_pago
  *
  * Campos:
  * - id
  * - academia_id
- * - promocion_id
- * - sucursal_id
- * - created_at
+ * - tipo_pago_id
+ * - estado_id
  *
  * Scope:
- * - Multi-academia
+ * - Multi-academia.
  *
  * Seguridad:
- * - READ: roles 1,3
- * - WRITE: roles 1,3
+ * - READ: roles 1, 3
+ * - WRITE: roles 1, 3
+ * - Staff (rol 2): sin acceso.
  *
  * academia_id:
- * - Admin: JWT firmado
- * - Superadmin: x-academia-id validado
+ * - Admin: academia firmada en JWT.
+ * - Superadmin: x-academia-id validado por authz.
+ * - Nunca se recibe academia_id desde el body.
  *
  * Reglas:
- * - academia_id nunca se acepta desde el body.
- * - promocion_id debe pertenecer a la academia efectiva.
- * - sucursal_id debe pertenecer a la academia efectiva.
- * - no se permite duplicar promocion_id + sucursal_id.
- * - si esta relación fue utilizada en cargos históricos,
- *   no puede transformarse ni eliminarse.
+ * - tipo_pago_id referencia el catálogo GLOBAL tipo_pago.
+ * - La misma academia no puede asociar dos veces el mismo tipo_pago_id.
+ * - estado_id = 1 representa asociación habilitada según la política actual.
+ * - Deshabilitar una asociación no elimina el tipo_pago global.
+ * - No se permite eliminar una asociación utilizada por configuración comercial
+ *   o registros operacionales dependientes.
  */
 
 /* =========================================================
@@ -45,29 +46,29 @@ const IdParam = z.object({
 
 const CreateSchema = z
   .object({
-    promocion_id: z.coerce.number().int().positive(),
-    sucursal_id: z.coerce.number().int().positive(),
+    tipo_pago_id: z.coerce.number().int().positive(),
+    estado_id: z.coerce.number().int().positive().max(255).default(1),
   })
   .strict();
 
 const PutSchema = z
   .object({
-    promocion_id: z.coerce.number().int().positive(),
-    sucursal_id: z.coerce.number().int().positive(),
+    tipo_pago_id: z.coerce.number().int().positive(),
+    estado_id: z.coerce.number().int().positive().max(255),
   })
   .strict();
 
 const PatchSchema = z
   .object({
-    promocion_id: z.coerce.number().int().positive().optional(),
-    sucursal_id: z.coerce.number().int().positive().optional(),
+    tipo_pago_id: z.coerce.number().int().positive().optional(),
+    estado_id: z.coerce.number().int().positive().max(255).optional(),
   })
   .strict();
 
 const QuerySchema = z
   .object({
-    promocion_id: z.coerce.number().int().positive().optional(),
-    sucursal_id: z.coerce.number().int().positive().optional(),
+    tipo_pago_id: z.coerce.number().int().positive().optional(),
+    estado_id: z.coerce.number().int().positive().max(255).optional(),
     limit: z.coerce.number().int().min(1).max(500).default(200),
   })
   .strict();
@@ -77,7 +78,7 @@ const QuerySchema = z
 ========================================================= */
 
 function zodDetail(err: ZodError) {
-  return err.issues.map((i) => `${i.path.join(".") || "field"}: ${i.message}`).join("; ");
+  return err.issues.map((issue) => `${issue.path.join(".") || "field"}: ${issue.message}`).join("; ");
 }
 
 function resolveAcademiaId(req: FastifyRequest) {
@@ -96,57 +97,34 @@ function normalize(row: any) {
   return {
     id: Number(row.id),
     academia_id: Number(row.academia_id),
-    promocion_id: Number(row.promocion_id),
-    sucursal_id: Number(row.sucursal_id),
+    tipo_pago_id: Number(row.tipo_pago_id),
+    estado_id: Number(row.estado_id),
 
-    promocion_nombre: row.promocion_nombre == null ? undefined : String(row.promocion_nombre),
+    tipo_pago_nombre: row.tipo_pago_nombre == null ? undefined : String(row.tipo_pago_nombre),
 
-    tipo_beneficio: row.tipo_beneficio == null ? undefined : String(row.tipo_beneficio),
-
-    valor: row.valor == null ? undefined : Number(row.valor),
-
-    fecha_desde: row.fecha_desde ?? undefined,
-    fecha_hasta: row.fecha_hasta ?? undefined,
-
-    promocion_estado_id: row.promocion_estado_id == null ? undefined : Number(row.promocion_estado_id),
-
-    sucursal_nombre: row.sucursal_nombre == null ? undefined : String(row.sucursal_nombre),
-
-    created_at: row.created_at ?? null,
+    tipo_pago_descripcion: row.tipo_pago_descripcion == null ? null : String(row.tipo_pago_descripcion),
   };
 }
 
-async function getPromocionSucursal(academiaId: number, id: number) {
+async function getRelacion(academiaId: number, id: number) {
   const [rows]: any = await db.query(
     `
       SELECT
-        ps.id,
-        ps.academia_id,
-        ps.promocion_id,
-        ps.sucursal_id,
-        ps.created_at,
+        atp.id,
+        atp.academia_id,
+        atp.tipo_pago_id,
+        atp.estado_id,
 
-        p.nombre AS promocion_nombre,
-        p.tipo_beneficio,
-        p.valor,
-        p.fecha_desde,
-        p.fecha_hasta,
-        p.estado_id AS promocion_estado_id,
+        tp.nombre AS tipo_pago_nombre,
+        tp.descripcion AS tipo_pago_descripcion
 
-        sr.nombre AS sucursal_nombre
+      FROM academia_tipo_pago atp
 
-      FROM promocion_sucursal ps
+      INNER JOIN tipo_pago tp
+        ON tp.id = atp.tipo_pago_id
 
-      INNER JOIN promociones_academia p
-        ON p.id = ps.promocion_id
-       AND p.academia_id = ps.academia_id
-
-      INNER JOIN sucursales_real sr
-        ON sr.id = ps.sucursal_id
-       AND sr.academia_id = ps.academia_id
-
-      WHERE ps.id = ?
-        AND ps.academia_id = ?
+      WHERE atp.id = ?
+        AND atp.academia_id = ?
 
       LIMIT 1
     `,
@@ -156,49 +134,30 @@ async function getPromocionSucursal(academiaId: number, id: number) {
   return rows?.length ? rows[0] : null;
 }
 
-async function validatePromocion(academiaId: number, promocionId: number) {
+async function validateTipoPagoGlobal(tipoPagoId: number) {
   const [rows]: any = await db.query(
     `
       SELECT id
-      FROM promociones_academia
+      FROM tipo_pago
       WHERE id = ?
-        AND academia_id = ?
       LIMIT 1
     `,
-    [promocionId, academiaId]
+    [tipoPagoId]
   );
 
   if (!rows?.length) {
-    throw new Error("La promoción no existe o no pertenece a la academia");
+    throw new Error("El tipo de pago no existe en el catálogo global");
   }
 }
 
-async function validateSucursal(academiaId: number, sucursalId: number) {
-  const [rows]: any = await db.query(
-    `
-      SELECT id
-      FROM sucursales_real
-      WHERE id = ?
-        AND academia_id = ?
-      LIMIT 1
-    `,
-    [sucursalId, academiaId]
-  );
-
-  if (!rows?.length) {
-    throw new Error("La sucursal no existe o no pertenece a la academia");
-  }
-}
-
-async function existsRelation(academiaId: number, promocionId: number, sucursalId: number, excludeId?: number) {
-  const values: any[] = [academiaId, promocionId, sucursalId];
+async function existsRelation(academiaId: number, tipoPagoId: number, excludeId?: number) {
+  const values: any[] = [academiaId, tipoPagoId];
 
   let sql = `
     SELECT id
-    FROM promocion_sucursal
+    FROM academia_tipo_pago
     WHERE academia_id = ?
-      AND promocion_id = ?
-      AND sucursal_id = ?
+      AND tipo_pago_id = ?
   `;
 
   if (excludeId) {
@@ -214,27 +173,79 @@ async function existsRelation(academiaId: number, promocionId: number, sucursalI
 }
 
 /**
- * Determina si la combinación promoción + sucursal
- * ya fue utilizada efectivamente en algún cargo.
+ * Protege relaciones que ya están utilizadas.
  *
- * cargos_jugador almacena ambos datos:
- * - promocion_id
- * - sucursal_id
+ * Se revisan únicamente tablas que forman parte de la arquitectura
+ * comercial acordada para WELI.
  */
-async function relationHasCargos(academiaId: number, promocionId: number, sucursalId: number) {
-  const [rows]: any = await db.query(
+async function relationHasDependencies(academiaId: number, tipoPagoId: number) {
+  const [tarifas]: any = await db.query(
     `
       SELECT id
-      FROM cargos_jugador
+      FROM plan_tarifas
       WHERE academia_id = ?
-        AND promocion_id = ?
-        AND sucursal_id = ?
+        AND tipo_pago_id = ?
       LIMIT 1
     `,
-    [academiaId, promocionId, sucursalId]
+    [academiaId, tipoPagoId]
   );
 
-  return Array.isArray(rows) && rows.length > 0;
+  if (tarifas?.length) {
+    return {
+      used: true,
+      source: "plan_tarifas",
+    };
+  }
+
+  const [promociones]: any = await db.query(
+    `
+      SELECT id
+      FROM promocion_tipo_pago
+      WHERE academia_id = ?
+        AND tipo_pago_id = ?
+      LIMIT 1
+    `,
+    [academiaId, tipoPagoId]
+  );
+
+  if (promociones?.length) {
+    return {
+      used: true,
+      source: "promocion_tipo_pago",
+    };
+  }
+
+  /*
+   * pagos_jugador no posee academia_id.
+   * El scope se obtiene mediante jugadores.
+   */
+  const [pagos]: any = await db.query(
+    `
+      SELECT p.id
+      FROM pagos_jugador p
+
+      INNER JOIN jugadores j
+        ON j.rut_jugador = p.jugador_rut
+
+      WHERE j.academia_id = ?
+        AND p.tipo_pago_id = ?
+
+      LIMIT 1
+    `,
+    [academiaId, tipoPagoId]
+  );
+
+  if (pagos?.length) {
+    return {
+      used: true,
+      source: "pagos_jugador",
+    };
+  }
+
+  return {
+    used: false,
+    source: null,
+  };
 }
 
 function handleScopeError(reply: FastifyReply, err: any) {
@@ -253,17 +264,14 @@ function handleScopeError(reply: FastifyReply, err: any) {
 }
 
 function isBusinessValidationError(err: any) {
-  return [
-    "La promoción no existe o no pertenece a la academia",
-    "La sucursal no existe o no pertenece a la academia",
-  ].includes(String(err?.message ?? ""));
+  return ["El tipo de pago no existe en el catálogo global"].includes(String(err?.message ?? ""));
 }
 
 /* =========================================================
    Router
 ========================================================= */
 
-export default async function promocion_sucursales(app: FastifyInstance) {
+export default async function academia_tipo_pago(app: FastifyInstance) {
   const canRead = [requireAuth, requireRoles([1, 3])];
 
   const canWrite = [requireAuth, requireRoles([1, 3])];
@@ -284,7 +292,7 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         reply.header("Cache-Control", "no-store");
 
         return reply.send({
-          module: "promocion_sucursal",
+          module: "academia_tipo_pago",
           status: "ready",
           academia_id: academiaId,
           timestamp: new Date().toISOString(),
@@ -300,7 +308,7 @@ export default async function promocion_sucursales(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
-          message: "Error en módulo promocion_sucursales",
+          message: "Error en módulo academia_tipo_pago",
         });
       }
     }
@@ -320,18 +328,18 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         const academiaId = resolveAcademiaId(req);
         const query = QuerySchema.parse(req.query);
 
-        const where: string[] = ["ps.academia_id = ?"];
+        const where: string[] = ["atp.academia_id = ?"];
 
         const values: any[] = [academiaId];
 
-        if (query.promocion_id !== undefined) {
-          where.push("ps.promocion_id = ?");
-          values.push(query.promocion_id);
+        if (query.tipo_pago_id !== undefined) {
+          where.push("atp.tipo_pago_id = ?");
+          values.push(query.tipo_pago_id);
         }
 
-        if (query.sucursal_id !== undefined) {
-          where.push("ps.sucursal_id = ?");
-          values.push(query.sucursal_id);
+        if (query.estado_id !== undefined) {
+          where.push("atp.estado_id = ?");
+          values.push(query.estado_id);
         }
 
         values.push(query.limit);
@@ -339,37 +347,24 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         const [rows]: any = await db.query(
           `
             SELECT
-              ps.id,
-              ps.academia_id,
-              ps.promocion_id,
-              ps.sucursal_id,
-              ps.created_at,
+              atp.id,
+              atp.academia_id,
+              atp.tipo_pago_id,
+              atp.estado_id,
 
-              p.nombre AS promocion_nombre,
-              p.tipo_beneficio,
-              p.valor,
-              p.fecha_desde,
-              p.fecha_hasta,
-              p.estado_id AS promocion_estado_id,
+              tp.nombre AS tipo_pago_nombre,
+              tp.descripcion AS tipo_pago_descripcion
 
-              sr.nombre AS sucursal_nombre
+            FROM academia_tipo_pago atp
 
-            FROM promocion_sucursal ps
-
-            INNER JOIN promociones_academia p
-              ON p.id = ps.promocion_id
-             AND p.academia_id = ps.academia_id
-
-            INNER JOIN sucursales_real sr
-              ON sr.id = ps.sucursal_id
-             AND sr.academia_id = ps.academia_id
+            INNER JOIN tipo_pago tp
+              ON tp.id = atp.tipo_pago_id
 
             WHERE ${where.join(" AND ")}
 
             ORDER BY
-              p.nombre ASC,
-              sr.nombre ASC,
-              ps.id ASC
+              tp.nombre ASC,
+              atp.id ASC
 
             LIMIT ?
           `,
@@ -380,6 +375,7 @@ export default async function promocion_sucursales(app: FastifyInstance) {
 
         return reply.send({
           ok: true,
+          academia_id: academiaId,
           count: rows?.length ?? 0,
           items: (rows ?? []).map(normalize),
         });
@@ -402,7 +398,7 @@ export default async function promocion_sucursales(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
-          message: "Error al listar relaciones promoción-sucursal",
+          message: "Error al listar tipos de pago de la academia",
         });
       }
     }
@@ -432,14 +428,14 @@ export default async function promocion_sucursales(app: FastifyInstance) {
       try {
         const academiaId = resolveAcademiaId(req);
 
-        const row = await getPromocionSucursal(academiaId, parsed.data.id);
+        const row = await getRelacion(academiaId, parsed.data.id);
 
         reply.header("Cache-Control", "no-store");
 
         if (!row) {
           return reply.code(404).send({
             ok: false,
-            message: "Relación promoción-sucursal no encontrada",
+            message: "Relación academia-tipo de pago no encontrada",
           });
         }
 
@@ -458,7 +454,7 @@ export default async function promocion_sucursales(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
-          message: "Error al obtener relación promoción-sucursal",
+          message: "Error al obtener tipo de pago de la academia",
         });
       }
     }
@@ -476,39 +472,37 @@ export default async function promocion_sucursales(app: FastifyInstance) {
     async (req: FastifyRequest, reply: FastifyReply) => {
       try {
         const academiaId = resolveAcademiaId(req);
-
         const body = CreateSchema.parse(req.body);
 
-        await validatePromocion(academiaId, body.promocion_id);
+        await validateTipoPagoGlobal(body.tipo_pago_id);
 
-        await validateSucursal(academiaId, body.sucursal_id);
-
-        const duplicate = await existsRelation(academiaId, body.promocion_id, body.sucursal_id);
+        const duplicate = await existsRelation(academiaId, body.tipo_pago_id);
 
         if (duplicate) {
           reply.header("Cache-Control", "no-store");
 
           return reply.code(409).send({
             ok: false,
-            message: "La promoción ya está asociada a esta sucursal",
+            message: "Este tipo de pago ya se encuentra asociado a la academia",
           });
         }
 
         const [result]: any = await db.query(
           `
-            INSERT INTO promocion_sucursal (
+            INSERT INTO academia_tipo_pago
+            (
               academia_id,
-              promocion_id,
-              sucursal_id
+              tipo_pago_id,
+              estado_id
             )
             VALUES (?, ?, ?)
           `,
-          [academiaId, body.promocion_id, body.sucursal_id]
+          [academiaId, body.tipo_pago_id, body.estado_id]
         );
 
         const insertId = Number(result?.insertId);
 
-        const row = await getPromocionSucursal(academiaId, insertId);
+        const row = await getRelacion(academiaId, insertId);
 
         reply.header("Cache-Control", "no-store");
 
@@ -521,8 +515,8 @@ export default async function promocion_sucursales(app: FastifyInstance) {
             : {
                 id: insertId,
                 academia_id: academiaId,
-                promocion_id: body.promocion_id,
-                sucursal_id: body.sucursal_id,
+                tipo_pago_id: body.tipo_pago_id,
+                estado_id: body.estado_id,
               },
         });
       } catch (err: any) {
@@ -545,14 +539,14 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
           return reply.code(409).send({
             ok: false,
-            message: "La promoción ya está asociada a esta sucursal",
+            message: "Este tipo de pago ya se encuentra asociado a la academia",
           });
         }
 
         if (err?.errno === 1452 || err?.code === "ER_NO_REFERENCED_ROW_2") {
           return reply.code(409).send({
             ok: false,
-            message: "La promoción o sucursal indicada no existe",
+            message: "La academia o el tipo de pago indicado no existe",
           });
         }
 
@@ -565,7 +559,7 @@ export default async function promocion_sucursales(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
-          message: "Error al asociar promoción con sucursal",
+          message: "Error al asociar tipo de pago con academia",
         });
       }
     }
@@ -596,60 +590,58 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         const academiaId = resolveAcademiaId(req);
         const id = parsed.data.id;
 
-        const current = await getPromocionSucursal(academiaId, id);
+        const current = await getRelacion(academiaId, id);
 
         if (!current) {
           reply.header("Cache-Control", "no-store");
 
           return reply.code(404).send({
             ok: false,
-            message: "Relación promoción-sucursal no encontrada",
+            message: "Relación academia-tipo de pago no encontrada",
           });
         }
 
         const body = PutSchema.parse(req.body);
 
-        const changed =
-          body.promocion_id !== Number(current.promocion_id) || body.sucursal_id !== Number(current.sucursal_id);
+        const changingTipoPago = body.tipo_pago_id !== Number(current.tipo_pago_id);
 
-        if (
-          changed &&
-          (await relationHasCargos(academiaId, Number(current.promocion_id), Number(current.sucursal_id)))
-        ) {
-          reply.header("Cache-Control", "no-store");
+        if (changingTipoPago) {
+          const dependencies = await relationHasDependencies(academiaId, Number(current.tipo_pago_id));
 
-          return reply.code(409).send({
-            ok: false,
-            message: "La relación promoción-sucursal ya fue utilizada en cargos y no puede modificarse",
-          });
+          if (dependencies.used) {
+            reply.header("Cache-Control", "no-store");
+
+            return reply.code(409).send({
+              ok: false,
+              message: "La asociación actual está siendo utilizada y no puede cambiar de tipo de pago",
+            });
+          }
         }
 
-        await validatePromocion(academiaId, body.promocion_id);
+        await validateTipoPagoGlobal(body.tipo_pago_id);
 
-        await validateSucursal(academiaId, body.sucursal_id);
-
-        const duplicate = await existsRelation(academiaId, body.promocion_id, body.sucursal_id, id);
+        const duplicate = await existsRelation(academiaId, body.tipo_pago_id, id);
 
         if (duplicate) {
           reply.header("Cache-Control", "no-store");
 
           return reply.code(409).send({
             ok: false,
-            message: "Ya existe otra asociación entre esta promoción y esta sucursal",
+            message: "Ya existe otra asociación de esta academia con ese tipo de pago",
           });
         }
 
         const [result]: any = await db.query(
           `
-            UPDATE promocion_sucursal
+            UPDATE academia_tipo_pago
             SET
-              promocion_id = ?,
-              sucursal_id = ?
+              tipo_pago_id = ?,
+              estado_id = ?
             WHERE id = ?
               AND academia_id = ?
             LIMIT 1
           `,
-          [body.promocion_id, body.sucursal_id, id, academiaId]
+          [body.tipo_pago_id, body.estado_id, id, academiaId]
         );
 
         reply.header("Cache-Control", "no-store");
@@ -657,11 +649,11 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         if (Number(result?.affectedRows ?? 0) === 0) {
           return reply.code(404).send({
             ok: false,
-            message: "Relación promoción-sucursal no encontrada",
+            message: "Relación academia-tipo de pago no encontrada",
           });
         }
 
-        const updated = await getPromocionSucursal(academiaId, id);
+        const updated = await getRelacion(academiaId, id);
 
         return reply.send({
           ok: true,
@@ -671,8 +663,8 @@ export default async function promocion_sucursales(app: FastifyInstance) {
             : {
                 id,
                 academia_id: academiaId,
-                promocion_id: body.promocion_id,
-                sucursal_id: body.sucursal_id,
+                tipo_pago_id: body.tipo_pago_id,
+                estado_id: body.estado_id,
               },
         });
       } catch (err: any) {
@@ -695,14 +687,14 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
           return reply.code(409).send({
             ok: false,
-            message: "Ya existe otra asociación entre esta promoción y esta sucursal",
+            message: "Ya existe otra asociación de esta academia con ese tipo de pago",
           });
         }
 
         if (err?.errno === 1452 || err?.code === "ER_NO_REFERENCED_ROW_2") {
           return reply.code(409).send({
             ok: false,
-            message: "La promoción o sucursal indicada no existe",
+            message: "La academia o el tipo de pago indicado no existe",
           });
         }
 
@@ -715,7 +707,7 @@ export default async function promocion_sucursales(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
-          message: "Error al actualizar relación promoción-sucursal",
+          message: "Error al actualizar tipo de pago de academia",
         });
       }
     }
@@ -746,14 +738,14 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         const academiaId = resolveAcademiaId(req);
         const id = parsed.data.id;
 
-        const current = await getPromocionSucursal(academiaId, id);
+        const current = await getRelacion(academiaId, id);
 
         if (!current) {
           reply.header("Cache-Control", "no-store");
 
           return reply.code(404).send({
             ok: false,
-            message: "Relación promoción-sucursal no encontrada",
+            message: "Relación academia-tipo de pago no encontrada",
           });
         }
 
@@ -769,52 +761,50 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         }
 
         const merged = {
-          promocion_id: body.promocion_id ?? Number(current.promocion_id),
+          tipo_pago_id: body.tipo_pago_id ?? Number(current.tipo_pago_id),
 
-          sucursal_id: body.sucursal_id ?? Number(current.sucursal_id),
+          estado_id: body.estado_id ?? Number(current.estado_id),
         };
 
-        const changed =
-          merged.promocion_id !== Number(current.promocion_id) || merged.sucursal_id !== Number(current.sucursal_id);
+        const changingTipoPago = merged.tipo_pago_id !== Number(current.tipo_pago_id);
 
-        if (
-          changed &&
-          (await relationHasCargos(academiaId, Number(current.promocion_id), Number(current.sucursal_id)))
-        ) {
-          reply.header("Cache-Control", "no-store");
+        if (changingTipoPago) {
+          const dependencies = await relationHasDependencies(academiaId, Number(current.tipo_pago_id));
 
-          return reply.code(409).send({
-            ok: false,
-            message: "La relación promoción-sucursal ya fue utilizada en cargos y no puede modificarse",
-          });
+          if (dependencies.used) {
+            reply.header("Cache-Control", "no-store");
+
+            return reply.code(409).send({
+              ok: false,
+              message: "La asociación actual está siendo utilizada y no puede cambiar de tipo de pago",
+            });
+          }
         }
 
-        await validatePromocion(academiaId, merged.promocion_id);
+        await validateTipoPagoGlobal(merged.tipo_pago_id);
 
-        await validateSucursal(academiaId, merged.sucursal_id);
-
-        const duplicate = await existsRelation(academiaId, merged.promocion_id, merged.sucursal_id, id);
+        const duplicate = await existsRelation(academiaId, merged.tipo_pago_id, id);
 
         if (duplicate) {
           reply.header("Cache-Control", "no-store");
 
           return reply.code(409).send({
             ok: false,
-            message: "Ya existe otra asociación entre esta promoción y esta sucursal",
+            message: "Ya existe otra asociación de esta academia con ese tipo de pago",
           });
         }
 
         const [result]: any = await db.query(
           `
-            UPDATE promocion_sucursal
+            UPDATE academia_tipo_pago
             SET
-              promocion_id = ?,
-              sucursal_id = ?
+              tipo_pago_id = ?,
+              estado_id = ?
             WHERE id = ?
               AND academia_id = ?
             LIMIT 1
           `,
-          [merged.promocion_id, merged.sucursal_id, id, academiaId]
+          [merged.tipo_pago_id, merged.estado_id, id, academiaId]
         );
 
         reply.header("Cache-Control", "no-store");
@@ -822,11 +812,11 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         if (Number(result?.affectedRows ?? 0) === 0) {
           return reply.code(404).send({
             ok: false,
-            message: "Relación promoción-sucursal no encontrada",
+            message: "Relación academia-tipo de pago no encontrada",
           });
         }
 
-        const updated = await getPromocionSucursal(academiaId, id);
+        const updated = await getRelacion(academiaId, id);
 
         return reply.send({
           ok: true,
@@ -836,8 +826,8 @@ export default async function promocion_sucursales(app: FastifyInstance) {
             : {
                 id,
                 academia_id: academiaId,
-                promocion_id: merged.promocion_id,
-                sucursal_id: merged.sucursal_id,
+                tipo_pago_id: merged.tipo_pago_id,
+                estado_id: merged.estado_id,
               },
         });
       } catch (err: any) {
@@ -860,14 +850,14 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
           return reply.code(409).send({
             ok: false,
-            message: "Ya existe otra asociación entre esta promoción y esta sucursal",
+            message: "Ya existe otra asociación de esta academia con ese tipo de pago",
           });
         }
 
         if (err?.errno === 1452 || err?.code === "ER_NO_REFERENCED_ROW_2") {
           return reply.code(409).send({
             ok: false,
-            message: "La promoción o sucursal indicada no existe",
+            message: "La academia o el tipo de pago indicado no existe",
           });
         }
 
@@ -880,7 +870,7 @@ export default async function promocion_sucursales(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
-          message: "Error al actualizar relación promoción-sucursal",
+          message: "Error al actualizar tipo de pago de academia",
         });
       }
     }
@@ -911,29 +901,32 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         const academiaId = resolveAcademiaId(req);
         const id = parsed.data.id;
 
-        const current = await getPromocionSucursal(academiaId, id);
+        const current = await getRelacion(academiaId, id);
 
         if (!current) {
           reply.header("Cache-Control", "no-store");
 
           return reply.code(404).send({
             ok: false,
-            message: "Relación promoción-sucursal no encontrada",
+            message: "Relación academia-tipo de pago no encontrada",
           });
         }
 
-        if (await relationHasCargos(academiaId, Number(current.promocion_id), Number(current.sucursal_id))) {
+        const dependencies = await relationHasDependencies(academiaId, Number(current.tipo_pago_id));
+
+        if (dependencies.used) {
           reply.header("Cache-Control", "no-store");
 
           return reply.code(409).send({
             ok: false,
-            message: "La relación promoción-sucursal ya fue utilizada para generar cargos y no puede eliminarse",
+            message:
+              "El tipo de pago está siendo utilizado por la academia y no puede eliminarse. Debe desactivarse mediante estado_id",
           });
         }
 
         const [result]: any = await db.query(
           `
-            DELETE FROM promocion_sucursal
+            DELETE FROM academia_tipo_pago
             WHERE id = ?
               AND academia_id = ?
             LIMIT 1
@@ -946,7 +939,7 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         if (Number(result?.affectedRows ?? 0) === 0) {
           return reply.code(404).send({
             ok: false,
-            message: "Relación promoción-sucursal no encontrada",
+            message: "Relación academia-tipo de pago no encontrada",
           });
         }
 
@@ -966,14 +959,14 @@ export default async function promocion_sucursales(app: FastifyInstance) {
         if (err?.errno === 1451 || String(err?.code || "").includes("ER_ROW_IS_REFERENCED")) {
           return reply.code(409).send({
             ok: false,
-            message: "No se puede eliminar la relación porque está en uso",
+            message: "No se puede eliminar la asociación porque está en uso",
             detail: err?.sqlMessage ?? err?.message,
           });
         }
 
         return reply.code(500).send({
           ok: false,
-          message: "Error al eliminar relación promoción-sucursal",
+          message: "Error al eliminar tipo de pago de academia",
         });
       }
     }

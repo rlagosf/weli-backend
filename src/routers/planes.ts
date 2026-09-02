@@ -8,6 +8,8 @@ import { db } from "../db";
 
 import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
+const LEGACY_PERIODICIDAD = "MENSUAL";
+
 /**
  * Tabla: planes_academia
  *
@@ -16,7 +18,7 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
  * - academia_id
  * - nombre
  * - descripcion
- * - periodicidad
+ * - periodicidad (legacy interno; no forma parte del contrato API)
  * - estado_id
  * - created_at
  * - updated_at
@@ -25,11 +27,11 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
  * - Multi-academia
  *
  * Seguridad:
- * - READ: roles 1, 2, 3
+ * - READ: roles 1, 3
  * - WRITE: roles 1, 3
  *
  * academia_id:
- * - Admin/Staff: JWT firmado
+ * - Admin: JWT firmado
  * - Superadmin: x-academia-id validado
  *
  * Nunca se confía en academia_id proveniente del body.
@@ -49,8 +51,6 @@ const CreateSchema = z
 
     descripcion: z.string().trim().max(500).nullable().optional(),
 
-    periodicidad: z.string().trim().min(2, "Periodicidad inválida").max(30).default("MENSUAL"),
-
     estado_id: z.coerce.number().int().positive().max(255).default(1),
   })
   .strict();
@@ -61,8 +61,6 @@ const PutSchema = z
 
     descripcion: z.string().trim().max(500).nullable(),
 
-    periodicidad: z.string().trim().min(2, "Periodicidad inválida").max(30),
-
     estado_id: z.coerce.number().int().positive().max(255),
   })
   .strict();
@@ -72,8 +70,6 @@ const PatchSchema = z
     nombre: z.string().trim().min(2, "Debe tener al menos 2 caracteres").max(120).optional(),
 
     descripcion: z.string().trim().max(500).nullable().optional(),
-
-    periodicidad: z.string().trim().min(2, "Periodicidad inválida").max(30).optional(),
 
     estado_id: z.coerce.number().int().positive().max(255).optional(),
   })
@@ -97,8 +93,6 @@ function normalize(row: any) {
 
     descripcion: row.descripcion == null ? null : String(row.descripcion),
 
-    periodicidad: String(row.periodicidad ?? ""),
-
     estado_id: Number(row.estado_id),
 
     created_at: row.created_at ?? null,
@@ -111,7 +105,7 @@ function normalize(row: any) {
  * Obtiene academia efectiva utilizando exclusivamente
  * el contexto autenticado.
  *
- * Admin / Staff:
+ * Admin:
  * JWT.
  *
  * Superadmin:
@@ -131,11 +125,6 @@ function resolveAcademiaId(req: FastifyRequest) {
   return academiaId;
 }
 
-function normalizePeriodicidad(value: string) {
-  return String(value ?? "")
-    .trim()
-    .toUpperCase();
-}
 
 function normalizeDescripcion(value: string | null | undefined) {
   if (value === null || value === undefined) {
@@ -225,9 +214,9 @@ function scopeError(reply: FastifyReply, err: any) {
 export default async function planes(app: FastifyInstance) {
   /*
    * Lectura:
-   * Admin, Staff, Superadmin.
+   * Admin, Superadmin.
    */
-  const canRead = [requireAuth, requireRoles([1, 2, 3])];
+  const canRead = [requireAuth, requireRoles([1, 3])];
 
   /*
    * Escritura:
@@ -296,7 +285,6 @@ export default async function planes(app: FastifyInstance) {
               academia_id,
               nombre,
               descripcion,
-              periodicidad,
               estado_id,
               created_at,
               updated_at
@@ -372,7 +360,6 @@ export default async function planes(app: FastifyInstance) {
               academia_id,
               nombre,
               descripcion,
-              periodicidad,
               estado_id,
               created_at,
               updated_at
@@ -446,8 +433,6 @@ export default async function planes(app: FastifyInstance) {
 
         const descripcion = normalizeDescripcion(body.descripcion);
 
-        const periodicidad = normalizePeriodicidad(body.periodicidad);
-
         const estadoId = Number(body.estado_id);
 
         const duplicate = await existsByNombre(academiaId, nombre);
@@ -469,12 +454,11 @@ export default async function planes(app: FastifyInstance) {
               academia_id,
               nombre,
               descripcion,
-              periodicidad,
               estado_id
             )
             VALUES (?, ?, ?, ?, ?)
             `,
-          [academiaId, nombre, descripcion, periodicidad, estadoId]
+          [academiaId, nombre, descripcion, LEGACY_PERIODICIDAD, estadoId]
         );
 
         const insertId = Number(result?.insertId);
@@ -491,7 +475,6 @@ export default async function planes(app: FastifyInstance) {
               academia_id,
               nombre,
               descripcion,
-              periodicidad,
               estado_id,
               created_at,
               updated_at
@@ -521,8 +504,7 @@ export default async function planes(app: FastifyInstance) {
 
                 descripcion,
 
-                periodicidad,
-
+  
                 estado_id: estadoId,
               },
         });
@@ -617,8 +599,6 @@ export default async function planes(app: FastifyInstance) {
 
         const descripcion = normalizeDescripcion(body.descripcion);
 
-        const periodicidad = normalizePeriodicidad(body.periodicidad);
-
         const estadoId = Number(body.estado_id);
 
         const duplicate = await existsByNombre(academiaId, nombre, id);
@@ -639,13 +619,12 @@ export default async function planes(app: FastifyInstance) {
             SET
               nombre = ?,
               descripcion = ?,
-              periodicidad = ?,
               estado_id = ?
             WHERE id = ?
               AND academia_id = ?
             LIMIT 1
             `,
-          [nombre, descripcion, periodicidad, estadoId, id, academiaId]
+          [nombre, descripcion, estadoId, id, academiaId]
         );
 
         reply.header("Cache-Control", "no-store");
@@ -665,7 +644,6 @@ export default async function planes(app: FastifyInstance) {
               academia_id,
               nombre,
               descripcion,
-              periodicidad,
               estado_id,
               created_at,
               updated_at
@@ -687,8 +665,7 @@ export default async function planes(app: FastifyInstance) {
                 academia_id: academiaId,
                 nombre,
                 descripcion,
-                periodicidad,
-                estado_id: estadoId,
+                  estado_id: estadoId,
               },
         });
       } catch (err: any) {
@@ -816,12 +793,6 @@ export default async function planes(app: FastifyInstance) {
           values.push(normalizeDescripcion(body.descripcion));
         }
 
-        if (body.periodicidad !== undefined) {
-          fields.push("periodicidad = ?");
-
-          values.push(normalizePeriodicidad(body.periodicidad));
-        }
-
         if (body.estado_id !== undefined) {
           fields.push("estado_id = ?");
 
@@ -868,7 +839,6 @@ export default async function planes(app: FastifyInstance) {
               academia_id,
               nombre,
               descripcion,
-              periodicidad,
               estado_id,
               created_at,
               updated_at

@@ -20,7 +20,7 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
  * - Multi-academia
  *
  * Seguridad:
- * - READ: roles 1,2,3
+ * - READ: roles 1,3
  * - WRITE: roles 1,3
  *
  * Reglas:
@@ -223,7 +223,7 @@ function isBusinessValidationError(err: any) {
 ========================================================= */
 
 export default async function plan_sucursales(app: FastifyInstance) {
-  const canRead = [requireAuth, requireRoles([1, 2, 3])];
+  const canRead = [requireAuth, requireRoles([1, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
   /* =======================================================

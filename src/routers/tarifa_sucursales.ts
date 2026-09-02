@@ -19,7 +19,7 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
  * - Multi-academia
  *
  * Seguridad:
- * - READ: roles 1,2,3
+ * - READ: roles 1,3
  * - WRITE: roles 1,3
  *
  * academia_id:
@@ -156,10 +156,11 @@ async function getTarifaSucursal(academiaId: number, id: number) {
 
     INNER JOIN tipo_pago tp
       ON tp.id = pt.tipo_pago_id
-     AND (
-       tp.academia_id IS NULL
-       OR tp.academia_id = ts.academia_id
-     )
+
+    INNER JOIN academia_tipo_pago atp
+      ON atp.academia_id = ts.academia_id
+     AND atp.tipo_pago_id = pt.tipo_pago_id
+     AND atp.estado_id = 1
 
     INNER JOIN sucursales_real sr
       ON sr.id = ts.sucursal_id
@@ -193,6 +194,14 @@ async function validateTarifa(academiaId: number, tarifaId: number) {
       ON pa.id = pt.plan_id
      AND pa.academia_id = pt.academia_id
 
+    INNER JOIN tipo_pago tp
+      ON tp.id = pt.tipo_pago_id
+
+    INNER JOIN academia_tipo_pago atp
+      ON atp.academia_id = pt.academia_id
+     AND atp.tipo_pago_id = pt.tipo_pago_id
+     AND atp.estado_id = 1
+
     WHERE pt.id = ?
       AND pt.academia_id = ?
 
@@ -202,7 +211,7 @@ async function validateTarifa(academiaId: number, tarifaId: number) {
   );
 
   if (!rows?.length) {
-    throw new Error("La tarifa no existe o no pertenece a la academia");
+    throw new Error("La tarifa no existe, no pertenece a la academia o su tipo de pago no está habilitado");
   }
 
   if (Number(rows[0].plan_estado_id) !== 1) {
@@ -326,7 +335,7 @@ function handleScopeError(reply: FastifyReply, err: any) {
 
 function isBusinessValidationError(err: any) {
   return [
-    "La tarifa no existe o no pertenece a la academia",
+    "La tarifa no existe, no pertenece a la academia o su tipo de pago no está habilitado",
     "La sucursal no existe o no pertenece a la academia",
     "El plan asociado a la tarifa no se encuentra activo",
     "El plan asociado a la tarifa no está disponible en esta sucursal",
@@ -338,7 +347,7 @@ function isBusinessValidationError(err: any) {
 ========================================================= */
 
 export default async function tarifa_sucursales(app: FastifyInstance) {
-  const canRead = [requireAuth, requireRoles([1, 2, 3])];
+  const canRead = [requireAuth, requireRoles([1, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
   /* =======================================================
@@ -451,10 +460,11 @@ export default async function tarifa_sucursales(app: FastifyInstance) {
 
         INNER JOIN tipo_pago tp
           ON tp.id = pt.tipo_pago_id
-         AND (
-           tp.academia_id IS NULL
-           OR tp.academia_id = ts.academia_id
-         )
+
+        INNER JOIN academia_tipo_pago atp
+          ON atp.academia_id = ts.academia_id
+         AND atp.tipo_pago_id = pt.tipo_pago_id
+         AND atp.estado_id = 1
 
         INNER JOIN sucursales_real sr
           ON sr.id = ts.sucursal_id

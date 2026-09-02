@@ -33,7 +33,7 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
  * - Multi-academia
  *
  * Seguridad:
- * - READ: roles 1, 2, 3
+ * - READ: roles 1, 3
  * - WRITE: roles 1, 3
  *
  * Reglas:
@@ -373,6 +373,11 @@ async function validateRelations(
     INNER JOIN tipo_pago tp
       ON tp.id = ?
 
+    INNER JOIN academia_tipo_pago atp
+      ON atp.academia_id = ?
+     AND atp.tipo_pago_id = tp.id
+     AND atp.estado_id = 1
+
     INNER JOIN situacion_pago sp
       ON sp.id = ?
 
@@ -403,6 +408,7 @@ async function validateRelations(
       academiaId,
 
       data.tipo_pago_id,
+      academiaId,
       data.situacion_pago_id,
 
       data.jugador_plan_id,
@@ -420,28 +426,6 @@ async function validateRelations(
     throw new Error(
       "Las relaciones del cargo son inválidas, no pertenecen a la academia o la tarifa no aplica al plan/sucursal/tipo de pago indicado"
     );
-  }
-
-  /*
-   * tipo_pago puede ser histórico/global (academia_id NULL)
-   * o tenantizado.
-   */
-  const [tipoRows]: any = await db.query(
-    `
-    SELECT id
-    FROM tipo_pago
-    WHERE id = ?
-      AND (
-        academia_id IS NULL
-        OR academia_id = ?
-      )
-    LIMIT 1
-    `,
-    [data.tipo_pago_id, academiaId]
-  );
-
-  if (!tipoRows?.length) {
-    throw new Error("El tipo de pago no pertenece a la academia");
   }
 
   /*
@@ -525,7 +509,7 @@ function handleScopeError(reply: FastifyReply, err: any) {
 ========================================================= */
 
 export default async function cargos_jugador(app: FastifyInstance) {
-  const canRead = [requireAuth, requireRoles([1, 2, 3])];
+  const canRead = [requireAuth, requireRoles([1, 3])];
 
   const canWrite = [requireAuth, requireRoles([1, 3])];
 

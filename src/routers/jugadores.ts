@@ -3,7 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z, ZodError } from "zod";
 import { db } from "../db";
 import { ensureApoderadoAuth } from "../scripts/hash_apoderado";
-import { requireAuth, requireRoles } from "../middlewares/authz";
+import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
 /**
  * ───────────────────────────────
@@ -12,12 +12,16 @@ import { requireAuth, requireRoles } from "../middlewares/authz";
  */
 function isValidMime(m?: string) {
   return ["image/jpeg", "image/jpg", "image/png", "image/webp"].includes(
-    String(m || "").toLowerCase().trim()
+    String(m || "")
+      .toLowerCase()
+      .trim()
   );
 }
 
 function isValidPdfMime(m?: string) {
-  const mm = String(m || "").toLowerCase().trim();
+  const mm = String(m || "")
+    .toLowerCase()
+    .trim();
   return mm === "application/pdf";
 }
 
@@ -29,7 +33,9 @@ function cleanBase64Payload(input: string) {
 }
 
 function normalizeB64(input: string) {
-  return String(input || "").replace(/\s+/g, "").trim();
+  return String(input || "")
+    .replace(/\s+/g, "")
+    .trim();
 }
 
 function looksLikeBase64(b64: string) {
@@ -55,94 +61,19 @@ async function getConn() {
     const conn = await anyDb.getConnection();
     return { conn, release: () => conn.release?.() };
   }
-  return { conn: anyDb, release: () => { } };
+  return { conn: anyDb, release: () => {} };
 }
 
 /**
  * ───────────────────────────────
- * Helpers Multi-academia (WELI) — REGLA PLATINO (búnker)
+ * Contexto de academia
  * ───────────────────────────────
- * - rol 3 (superadmin): x-academia-id OBLIGATORIO (define tenant)
- * - rol 1/2 (admin/staff): tenant SOLO desde token (ignora header)
- * Lee desde req.auth o req.user (según middleware).
+ * La resolución del tenant se centraliza en authz.ts mediante
+ * getEffectiveAcademiaId(req).
  */
 
-type AuthLike = {
-  rol_id?: number;
-  role_id?: number;
-  role?: number;
-
-  academia_id?: number;
-  academy_id?: number;
-  academiaId?: number;
-  academyId?: number;
-  academia?: number;
-  academy?: number;
-};
-
-function getAuthLike(req: FastifyRequest): AuthLike {
-  const a: any = (req as any).auth;
-  const u: any = (req as any).user;
-  return (a && typeof a === "object" ? a : u && typeof u === "object" ? u : {}) as AuthLike;
-}
-
-function getRolId(req: FastifyRequest): number {
-  const ctx = getAuthLike(req);
-  const raw = ctx.rol_id ?? ctx.role_id ?? ctx.role ?? 0;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function getTokenAcademiaId(req: FastifyRequest): number {
-  const ctx = getAuthLike(req);
-  const raw =
-    ctx.academia_id ??
-    ctx.academy_id ??
-    ctx.academiaId ??
-    ctx.academyId ??
-    ctx.academia ??
-    ctx.academy ??
-    0;
-
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function getHeaderAcademiaId(req: FastifyRequest): number {
-  const hdr = (req.headers as any)["x-academia-id"];
-  const raw = Array.isArray(hdr) ? hdr[0] : hdr;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function getEffectiveAcademiaId(req: FastifyRequest): number {
-  const rol = getRolId(req);
-
-  // ✅ Superadmin: header manda (OBLIGATORIO)
-  if (rol === 3) {
-    const headerAcademia = getHeaderAcademiaId(req);
-    if (!headerAcademia || headerAcademia <= 0) {
-      throw Object.assign(new Error("FORBIDDEN: falta x-academia-id para superadmin"), {
-        statusCode: 403,
-      });
-    }
-    return headerAcademia;
-  }
-
-  // ✅ Admin/Staff: SOLO token (búnker)
-  const tokenAcademia = getTokenAcademiaId(req);
-  if (!tokenAcademia || tokenAcademia <= 0) {
-    throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
-  }
-  return tokenAcademia;
-}
-
-
 async function resolveAcademiaContext(conn: any, academiaId: number) {
-  const [rows]: any = await conn.query(
-    "SELECT id, deporte_id FROM academias WHERE id = ? LIMIT 1",
-    [academiaId]
-  );
+  const [rows]: any = await conn.query("SELECT id, deporte_id FROM academias WHERE id = ? LIMIT 1", [academiaId]);
 
   if (!rows || rows.length === 0) {
     throw Object.assign(new Error("Academia no existe (tenant inválido)"), { statusCode: 409 });
@@ -204,7 +135,10 @@ const BaseFields = {
   observaciones: z.string().trim().optional(),
   fecha_nacimiento: z.union([z.string(), z.date()]).optional(),
 
-  sucursal_id: z.union([z.number().int(), z.string().regex(/^\d+$/)]).nullable().optional(),
+  sucursal_id: z
+    .union([z.number().int(), z.string().regex(/^\d+$/)])
+    .nullable()
+    .optional(),
 
   foto_base64: z.string().trim().nullable().optional(),
   foto_mime: z.string().trim().nullable().optional(),
@@ -221,7 +155,10 @@ const CreateSchema = z
     rut_jugador: z.union([z.string().regex(/^\d{7,8}$/), z.number().int().min(1)]),
 
     // Compatibilidad legacy: clientes antiguos todavía pueden enviar sucursal_id.
-    sucursal_id: z.union([z.number().int(), z.string().regex(/^\d+$/)]).nullable().optional(),
+    sucursal_id: z
+      .union([z.number().int(), z.string().regex(/^\d+$/)])
+      .nullable()
+      .optional(),
 
     // Nuevo modelo: una o muchas sucursales.
     sucursales: z
@@ -419,14 +356,17 @@ function applyFotoRules(target: Record<string, any>) {
   }
 
   const b64 = normalizeB64(cleanBase64Payload(String(b64Raw || "")));
-  const mime = String(mimeRaw || "").toLowerCase().trim();
+  const mime = String(mimeRaw || "")
+    .toLowerCase()
+    .trim();
 
   if (!mime || !isValidMime(mime)) throw Object.assign(new Error("foto_mime inválido"), { statusCode: 400 });
   if (!b64 || !looksLikeBase64(b64)) throw Object.assign(new Error("foto_base64 inválido"), { statusCode: 400 });
 
   const bytes = approxBytesFromBase64(b64);
   const MAX_BYTES = 350 * 1024;
-  if (bytes > MAX_BYTES) throw Object.assign(new Error(`Foto excede el máximo (${MAX_BYTES} bytes)`), { statusCode: 413 });
+  if (bytes > MAX_BYTES)
+    throw Object.assign(new Error(`Foto excede el máximo (${MAX_BYTES} bytes)`), { statusCode: 413 });
 
   target.foto_base64 = b64;
   target.foto_mime = mime;
@@ -452,7 +392,9 @@ function applyContratoRules(target: Record<string, any>) {
   }
 
   const b64 = normalizeB64(cleanBase64Payload(String(b64Raw || "")));
-  const mime = String(mimeRaw || "application/pdf").toLowerCase().trim();
+  const mime = String(mimeRaw || "application/pdf")
+    .toLowerCase()
+    .trim();
 
   if (!isValidPdfMime(mime))
     throw Object.assign(new Error("contrato_prestacion_mime inválido (application/pdf)"), { statusCode: 400 });
@@ -461,45 +403,33 @@ function applyContratoRules(target: Record<string, any>) {
 
   const bytes = approxBytesFromBase64(b64);
   const MAX_PDF_BYTES = 3 * 1024 * 1024;
-  if (bytes > MAX_PDF_BYTES) throw Object.assign(new Error(`Contrato excede el máximo (${MAX_PDF_BYTES} bytes)`), { statusCode: 413 });
+  if (bytes > MAX_PDF_BYTES)
+    throw Object.assign(new Error(`Contrato excede el máximo (${MAX_PDF_BYTES} bytes)`), { statusCode: 413 });
 
   target.contrato_prestacion = b64;
   target.contrato_prestacion_mime = "application/pdf";
   (target as any).contrato_prestacion_updated_at = new Date();
 }
 
-async function ensureAuthIfRutApoderadoPresent(
-  rut_apoderado: any,
-  nombre_apoderado?: any
-): Promise<string | null> {
-  if (
-    rut_apoderado === null ||
-    rut_apoderado === undefined ||
-    rut_apoderado === ""
-  ) {
+async function ensureAuthIfRutApoderadoPresent(rut_apoderado: any, nombre_apoderado?: any): Promise<string | null> {
+  if (rut_apoderado === null || rut_apoderado === undefined || rut_apoderado === "") {
     return null;
   }
 
   const ensured = await ensureApoderadoAuth({
     rut_apoderado: String(rut_apoderado),
     nombre_apoderado:
-      nombre_apoderado === null || nombre_apoderado === undefined
-        ? undefined
-        : String(nombre_apoderado),
+      nombre_apoderado === null || nombre_apoderado === undefined ? undefined : String(nombre_apoderado),
   });
 
   if (!ensured.ok) {
-    throw Object.assign(
-      new Error(ensured.message || "RUT_APODERADO_INVALID"),
-      {
-        statusCode: 400,
-        field:
-          ensured.message === "NOMBRE_APODERADO_REQUIRED" ||
-            ensured.message === "NOMBRE_APODERADO_TOO_LONG"
-            ? "nombre_apoderado"
-            : "rut_apoderado",
-      }
-    );
+    throw Object.assign(new Error(ensured.message || "RUT_APODERADO_INVALID"), {
+      statusCode: 400,
+      field:
+        ensured.message === "NOMBRE_APODERADO_REQUIRED" || ensured.message === "NOMBRE_APODERADO_TOO_LONG"
+          ? "nombre_apoderado"
+          : "rut_apoderado",
+    });
   }
 
   return ensured.nombre_apoderado;
@@ -515,19 +445,13 @@ function normalizeSucursalIds(parsed: any): number[] {
   const raw: any[] =
     Array.isArray(parsed?.sucursales) && parsed.sucursales.length > 0
       ? parsed.sucursales
-      : parsed?.sucursal_id !== null &&
-        parsed?.sucursal_id !== undefined
+      : parsed?.sucursal_id !== null && parsed?.sucursal_id !== undefined
         ? [parsed.sucursal_id]
         : [];
 
   const ids: number[] = raw
     .map((v: any): number => Number(v))
-    .filter(
-      (v: number): v is number =>
-        Number.isFinite(v) &&
-        Number.isInteger(v) &&
-        v > 0
-    );
+    .filter((v: number): v is number => Number.isFinite(v) && Number.isInteger(v) && v > 0);
 
   return Array.from(new Set<number>(ids));
 }
@@ -537,11 +461,7 @@ function normalizeSucursalIds(parsed: any): number[] {
  * - existan;
  * - pertenezcan a la academia efectiva (tenant).
  */
-async function validateSucursalIdsForAcademia(
-  conn: any,
-  academiaId: number,
-  sucursalIds: number[]
-) {
+async function validateSucursalIdsForAcademia(conn: any, academiaId: number, sucursalIds: number[]) {
   if (!Array.isArray(sucursalIds) || sucursalIds.length === 0) {
     throw Object.assign(new Error("Debes seleccionar al menos una sucursal"), {
       statusCode: 400,
@@ -565,29 +485,36 @@ async function validateSucursalIdsForAcademia(
     });
   }
 
-  const fueraTenant = rows.some(
-    (r: any) => Number(r?.academia_id ?? 0) !== Number(academiaId)
-  );
+  const fueraTenant = rows.some((r: any) => Number(r?.academia_id ?? 0) !== Number(academiaId));
 
   if (fueraTenant) {
-    throw Object.assign(
-      new Error("Acceso denegado: una o más sucursales no pertenecen a tu academia"),
-      {
-        statusCode: 403,
-        field: "sucursales",
-      }
-    );
+    throw Object.assign(new Error("Acceso denegado: una o más sucursales no pertenecen a tu academia"), {
+      statusCode: 403,
+      field: "sucursales",
+    });
   }
 }
 
 async function validateForeignKeys(conn: any, data: Record<string, any>) {
   const fkChecks: Array<{ field: string; sql: string; val: any }> = [
     { field: "posicion_id", sql: "SELECT id, academia_id FROM posiciones WHERE id = ? LIMIT 1", val: data.posicion_id },
-    { field: "categoria_id", sql: "SELECT id, academia_id FROM categorias WHERE id = ? LIMIT 1", val: data.categoria_id },
+    {
+      field: "categoria_id",
+      sql: "SELECT id, academia_id FROM categorias WHERE id = ? LIMIT 1",
+      val: data.categoria_id,
+    },
     { field: "estado_id", sql: "SELECT id FROM estado WHERE id = ? LIMIT 1", val: data.estado_id },
     { field: "establec_educ_id", sql: "SELECT id FROM establec_educ WHERE id = ? LIMIT 1", val: data.establec_educ_id },
-    { field: "prevision_medica_id", sql: "SELECT id FROM prevision_medica WHERE id = ? LIMIT 1", val: data.prevision_medica_id },
-    { field: "sucursal_id", sql: "SELECT id, academia_id FROM sucursales_real WHERE id = ? LIMIT 1", val: data.sucursal_id },
+    {
+      field: "prevision_medica_id",
+      sql: "SELECT id FROM prevision_medica WHERE id = ? LIMIT 1",
+      val: data.prevision_medica_id,
+    },
+    {
+      field: "sucursal_id",
+      sql: "SELECT id, academia_id FROM sucursales_real WHERE id = ? LIMIT 1",
+      val: data.sucursal_id,
+    },
     { field: "comuna_id", sql: "SELECT id FROM comunas WHERE id = ? LIMIT 1", val: data.comuna_id },
   ];
 
@@ -793,79 +720,77 @@ export default async function jugadores(app: FastifyInstance) {
   });
 
   // ───────── Buscar apoderado por RUT para autocompletar (write 1/3) ─────────
-  app.get(
-    "/apoderado/rut/:rut",
-    { preHandler: canWrite },
-    async (req: FastifyRequest, reply: FastifyReply) => {
-      reply.header("Cache-Control", "no-store");
+  app.get("/apoderado/rut/:rut", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
+    reply.header("Cache-Control", "no-store");
 
-      const rawRut = String((req.params as any)?.rut ?? "")
-        .replace(/\D/g, "")
-        .trim();
+    const rawRut = String((req.params as any)?.rut ?? "")
+      .replace(/\D/g, "")
+      .trim();
 
-      // apoderados_auth trabaja con 8 dígitos sin DV.
-      if (!/^\d{8}$/.test(rawRut)) {
-        return reply.code(400).send({
-          ok: false,
-          message: "El RUT del apoderado debe tener 8 dígitos sin DV.",
-        });
-      }
+    // apoderados_auth trabaja con 8 dígitos sin DV.
+    if (!/^\d{8}$/.test(rawRut)) {
+      return reply.code(400).send({
+        ok: false,
+        message: "El RUT del apoderado debe tener 8 dígitos sin DV.",
+      });
+    }
 
-      try {
-        // Conserva la validación multiacademia existente.
-        // - superadmin: exige x-academia-id
-        // - admin: academia desde token
-        getEffectiveAcademiaId(req);
+    try {
+      // Tenant efectivo:
+      // - superadmin: x-academia-id obligatorio
+      // - admin: academia firmada en JWT
+      const academiaId = getEffectiveAcademiaId(req);
 
-        const [rows]: any = await db.query(
-          `
-          SELECT
-            apoderado_id,
-            rut_apoderado,
-            nombre_apoderado
-          FROM apoderados_auth
-          WHERE rut_apoderado = ?
+      /*
+       * El apoderado solo puede autocompletarse si ya está relacionado
+       * con al menos un jugador perteneciente a la academia efectiva.
+       * Esto evita filtrar identidades de apoderados entre tenants.
+       */
+      const [rows]: any = await db.query(
+        `
+          SELECT DISTINCT
+            aa.apoderado_id,
+            aa.rut_apoderado,
+            aa.nombre_apoderado
+          FROM apoderados_auth aa
+          INNER JOIN jugadores j
+            ON j.rut_apoderado = aa.rut_apoderado
+          WHERE aa.rut_apoderado = ?
+            AND j.academia_id = ?
           LIMIT 1
           `,
-          [rawRut]
-        );
+        [rawRut, academiaId]
+      );
 
-        if (!Array.isArray(rows) || rows.length === 0) {
-          return reply.code(404).send({
-            ok: false,
-            exists: false,
-            message: "Apoderado no encontrado",
-          });
-        }
-
-        const nombre = String(rows[0]?.nombre_apoderado ?? "").trim();
-
-        return reply.send({
-          ok: true,
-          exists: true,
-          item: {
-            apoderado_id: Number(rows[0]?.apoderado_id ?? 0),
-            rut_apoderado: String(rows[0]?.rut_apoderado ?? rawRut),
-            nombre_apoderado: nombre || null,
-          },
-        });
-      } catch (err: any) {
-        const code =
-          err?.statusCode && Number.isFinite(err.statusCode)
-            ? err.statusCode
-            : 500;
-
-        return reply.code(code).send({
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return reply.code(404).send({
           ok: false,
-          message:
-            code === 403
-              ? "Acceso denegado"
-              : "Error al buscar apoderado",
-          detail: err?.message,
+          exists: false,
+          message: "Apoderado no encontrado",
         });
       }
+
+      const nombre = String(rows[0]?.nombre_apoderado ?? "").trim();
+
+      return reply.send({
+        ok: true,
+        exists: true,
+        item: {
+          apoderado_id: Number(rows[0]?.apoderado_id ?? 0),
+          rut_apoderado: String(rows[0]?.rut_apoderado ?? rawRut),
+          nombre_apoderado: nombre || null,
+        },
+      });
+    } catch (err: any) {
+      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+
+      return reply.code(code).send({
+        ok: false,
+        message: code === 403 ? "Acceso denegado" : "Error al buscar apoderado",
+        detail: err?.message,
+      });
     }
-  );
+  });
 
   // ───────── GET por ID (read 1/2/3) ─────────
   app.get("/:id", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
@@ -905,7 +830,7 @@ export default async function jugadores(app: FastifyInstance) {
   // ───────── Crear (write 1/3) ─────────
   app.post("/", { preHandler: canWrite }, async (req: FastifyRequest, reply: FastifyReply) => {
     let conn: any = null;
-    let release: () => void = () => { };
+    let release: () => void = () => {};
 
     try {
       const parsed = CreateSchema.parse(req.body);
@@ -942,11 +867,7 @@ export default async function jugadores(app: FastifyInstance) {
 
       // La identidad canónica del apoderado vive en apoderados_auth.
       // Si el RUT ya existe, se reutiliza SIEMPRE su nombre real almacenado.
-      const nombreApoderadoCanonico =
-        await ensureAuthIfRutApoderadoPresent(
-          data.rut_apoderado,
-          data.nombre_apoderado
-        );
+      const nombreApoderadoCanonico = await ensureAuthIfRutApoderadoPresent(data.rut_apoderado, data.nombre_apoderado);
 
       if (nombreApoderadoCanonico) {
         data.nombre_apoderado = nombreApoderadoCanonico;
@@ -964,11 +885,7 @@ export default async function jugadores(app: FastifyInstance) {
       await assertBelongsToAcademia(conn, ctx.academia_id, data);
 
       // Valida TODAS las sucursales contra el tenant.
-      await validateSucursalIdsForAcademia(
-        conn,
-        ctx.academia_id,
-        sucursalIds
-      );
+      await validateSucursalIdsForAcademia(conn, ctx.academia_id, sucursalIds);
 
       data.academia_id = ctx.academia_id;
       data.deporte_id = ctx.deporte_id;
@@ -1010,10 +927,7 @@ export default async function jugadores(app: FastifyInstance) {
       // jugador + jugador_sucursal + estadística.
       await conn.beginTransaction();
 
-      const [resJug]: any = await conn.query(
-        "INSERT INTO jugadores SET ?",
-        [data]
-      );
+      const [resJug]: any = await conn.query("INSERT INTO jugadores SET ?", [data]);
 
       const jugadorId: number = Number(resJug.insertId);
 
@@ -1022,10 +936,7 @@ export default async function jugadores(app: FastifyInstance) {
       }
 
       // Inserta todas las relaciones jugador <-> sucursal.
-      const relaciones = sucursalIds.map((sucursalId) => [
-        jugadorId,
-        sucursalId,
-      ]);
+      const relaciones = sucursalIds.map((sucursalId) => [jugadorId, sucursalId]);
 
       await conn.query(
         `INSERT INTO jugador_sucursal (jugador_id, sucursal_id)
@@ -1034,21 +945,15 @@ export default async function jugadores(app: FastifyInstance) {
       );
 
       // estadistica_id = jugadorId
-      await conn.query(
-        "UPDATE jugadores SET estadistica_id = ? WHERE id = ? AND academia_id = ?",
-        [
-          jugadorId,
-          jugadorId,
-          data.academia_id,
-        ]
-      );
+      await conn.query("UPDATE jugadores SET estadistica_id = ? WHERE id = ? AND academia_id = ?", [
+        jugadorId,
+        jugadorId,
+        data.academia_id,
+      ]);
 
       // Crea estadística si no existe.
       try {
-        await conn.query(
-          "INSERT INTO estadisticas (estadistica_id) VALUES (?)",
-          [jugadorId]
-        );
+        await conn.query("INSERT INTO estadisticas (estadistica_id) VALUES (?)", [jugadorId]);
       } catch (e: any) {
         if (e?.errno !== 1062 && e?.code !== "ER_DUP_ENTRY") {
           throw e;
@@ -1079,7 +984,7 @@ export default async function jugadores(app: FastifyInstance) {
       if (conn) {
         try {
           await conn.rollback();
-        } catch { }
+        } catch {}
       }
 
       reply.header("Cache-Control", "no-store");
@@ -1093,9 +998,7 @@ export default async function jugadores(app: FastifyInstance) {
       }
 
       if (err instanceof ZodError) {
-        const detail = err.issues
-          .map((i) => `${i.path.join(".")}: ${i.message}`)
-          .join("; ");
+        const detail = err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
 
         return reply.code(400).send({
           ok: false,
@@ -1107,20 +1010,17 @@ export default async function jugadores(app: FastifyInstance) {
       if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
         const msg = String(err?.sqlMessage || "").toLowerCase();
 
-        const field =
-          msg.includes("rut_jugador")
-            ? "rut_jugador"
-            : msg.includes("email")
-              ? "email"
-              : msg.includes("jugador_sucursal")
-                ? "sucursales"
-                : undefined;
+        const field = msg.includes("rut_jugador")
+          ? "rut_jugador"
+          : msg.includes("email")
+            ? "email"
+            : msg.includes("jugador_sucursal")
+              ? "sucursales"
+              : undefined;
 
         return reply.code(409).send({
           ok: false,
-          message: field
-            ? `Duplicado: ${field} ya existe`
-            : "Duplicado: clave única violada",
+          message: field ? `Duplicado: ${field} ya existe` : "Duplicado: clave única violada",
           field,
           detail: err?.sqlMessage,
         });
@@ -1158,7 +1058,7 @@ export default async function jugadores(app: FastifyInstance) {
     } finally {
       try {
         release();
-      } catch { }
+      } catch {}
     }
   });
 
@@ -1173,7 +1073,7 @@ export default async function jugadores(app: FastifyInstance) {
     const id = Number(pid.data.id);
 
     let conn: any = null;
-    let release: () => void = () => { };
+    let release: () => void = () => {};
 
     try {
       const academiaId = getEffectiveAcademiaId(req);
@@ -1186,7 +1086,9 @@ export default async function jugadores(app: FastifyInstance) {
 
       if ("sucursal_id" in changes && (changes.sucursal_id === null || changes.sucursal_id === undefined)) {
         reply.header("Cache-Control", "no-store");
-        return reply.code(400).send({ ok: false, field: "sucursal_id", message: "No puedes dejar sucursal en blanco." });
+        return reply
+          .code(400)
+          .send({ ok: false, field: "sucursal_id", message: "No puedes dejar sucursal en blanco." });
       }
 
       if ("foto_base64" in changes || "foto_mime" in changes) applyFotoRules(changes);
@@ -1195,11 +1097,7 @@ export default async function jugadores(app: FastifyInstance) {
       if ("rut_apoderado" in changes || "nombre_apoderado" in changes) {
         let rutEfectivo = changes.rut_apoderado;
 
-        if (
-          rutEfectivo === null ||
-          rutEfectivo === undefined ||
-          rutEfectivo === ""
-        ) {
+        if (rutEfectivo === null || rutEfectivo === undefined || rutEfectivo === "") {
           const [actualRows]: any = await db.query(
             "SELECT rut_apoderado FROM jugadores WHERE id = ? AND academia_id = ? LIMIT 1",
             [id, academiaId]
@@ -1208,10 +1106,7 @@ export default async function jugadores(app: FastifyInstance) {
           rutEfectivo = actualRows?.[0]?.rut_apoderado;
         }
 
-        const nombreCanonico = await ensureAuthIfRutApoderadoPresent(
-          rutEfectivo,
-          changes.nombre_apoderado
-        );
+        const nombreCanonico = await ensureAuthIfRutApoderadoPresent(rutEfectivo, changes.nombre_apoderado);
 
         if (nombreCanonico) {
           changes.nombre_apoderado = nombreCanonico;
@@ -1230,10 +1125,11 @@ export default async function jugadores(app: FastifyInstance) {
       await validateForeignKeys(conn, changes);
       await assertBelongsToAcademia(conn, academiaId, changes);
 
-      const [result]: any = await conn.query(
-        "UPDATE jugadores SET ? WHERE id = ? AND academia_id = ?",
-        [changes, id, academiaId]
-      );
+      const [result]: any = await conn.query("UPDATE jugadores SET ? WHERE id = ? AND academia_id = ?", [
+        changes,
+        id,
+        academiaId,
+      ]);
 
       reply.header("Cache-Control", "no-store");
       if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
@@ -1265,7 +1161,9 @@ export default async function jugadores(app: FastifyInstance) {
 
       return reply.code(500).send({ ok: false, message: "Error al actualizar jugador", detail: err?.message });
     } finally {
-      try { release(); } catch { }
+      try {
+        release();
+      } catch {}
     }
   });
 
@@ -1280,7 +1178,7 @@ export default async function jugadores(app: FastifyInstance) {
     const rut = pr.data.rut;
 
     let conn: any = null;
-    let release: () => void = () => { };
+    let release: () => void = () => {};
 
     try {
       const academiaId = getEffectiveAcademiaId(req);
@@ -1293,7 +1191,9 @@ export default async function jugadores(app: FastifyInstance) {
 
       if ("sucursal_id" in changes && (changes.sucursal_id === null || changes.sucursal_id === undefined)) {
         reply.header("Cache-Control", "no-store");
-        return reply.code(400).send({ ok: false, field: "sucursal_id", message: "No puedes dejar sucursal en blanco." });
+        return reply
+          .code(400)
+          .send({ ok: false, field: "sucursal_id", message: "No puedes dejar sucursal en blanco." });
       }
 
       if ("foto_base64" in changes || "foto_mime" in changes) applyFotoRules(changes);
@@ -1302,11 +1202,7 @@ export default async function jugadores(app: FastifyInstance) {
       if ("rut_apoderado" in changes || "nombre_apoderado" in changes) {
         let rutEfectivo = changes.rut_apoderado;
 
-        if (
-          rutEfectivo === null ||
-          rutEfectivo === undefined ||
-          rutEfectivo === ""
-        ) {
+        if (rutEfectivo === null || rutEfectivo === undefined || rutEfectivo === "") {
           const [actualRows]: any = await db.query(
             "SELECT rut_apoderado FROM jugadores WHERE rut_jugador = ? AND academia_id = ? LIMIT 1",
             [rut, academiaId]
@@ -1315,10 +1211,7 @@ export default async function jugadores(app: FastifyInstance) {
           rutEfectivo = actualRows?.[0]?.rut_apoderado;
         }
 
-        const nombreCanonico = await ensureAuthIfRutApoderadoPresent(
-          rutEfectivo,
-          changes.nombre_apoderado
-        );
+        const nombreCanonico = await ensureAuthIfRutApoderadoPresent(rutEfectivo, changes.nombre_apoderado);
 
         if (nombreCanonico) {
           changes.nombre_apoderado = nombreCanonico;
@@ -1337,10 +1230,11 @@ export default async function jugadores(app: FastifyInstance) {
       await validateForeignKeys(conn, changes);
       await assertBelongsToAcademia(conn, academiaId, changes);
 
-      const [result]: any = await conn.query(
-        "UPDATE jugadores SET ? WHERE rut_jugador = ? AND academia_id = ?",
-        [changes, rut, academiaId]
-      );
+      const [result]: any = await conn.query("UPDATE jugadores SET ? WHERE rut_jugador = ? AND academia_id = ?", [
+        changes,
+        rut,
+        academiaId,
+      ]);
 
       reply.header("Cache-Control", "no-store");
       if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
@@ -1372,7 +1266,9 @@ export default async function jugadores(app: FastifyInstance) {
 
       return reply.code(500).send({ ok: false, message: "Error al actualizar jugador por RUT", detail: err?.message });
     } finally {
-      try { release(); } catch { }
+      try {
+        release();
+      } catch {}
     }
   });
 
@@ -1389,10 +1285,7 @@ export default async function jugadores(app: FastifyInstance) {
     try {
       const academiaId = getEffectiveAcademiaId(req);
 
-      const [result]: any = await db.query("DELETE FROM jugadores WHERE id = ? AND academia_id = ?", [
-        id,
-        academiaId,
-      ]);
+      const [result]: any = await db.query("DELETE FROM jugadores WHERE id = ? AND academia_id = ?", [id, academiaId]);
 
       reply.header("Cache-Control", "no-store");
       if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
@@ -1400,6 +1293,7 @@ export default async function jugadores(app: FastifyInstance) {
       return reply.send({ ok: true, deleted: id });
     } catch (err: any) {
       reply.header("Cache-Control", "no-store");
+
       if (err?.errno === 1451 || err?.code === "ER_ROW_IS_REFERENCED_2") {
         return reply.code(409).send({
           ok: false,
@@ -1407,7 +1301,19 @@ export default async function jugadores(app: FastifyInstance) {
           detail: err?.sqlMessage ?? err?.message,
         });
       }
-      return reply.code(500).send({ ok: false, message: "Error al eliminar jugador", detail: err?.message });
+
+      if (err?.statusCode && Number.isFinite(err.statusCode)) {
+        return reply.code(err.statusCode).send({
+          ok: false,
+          message: err?.message ?? "Acceso denegado",
+        });
+      }
+
+      return reply.code(500).send({
+        ok: false,
+        message: "Error al eliminar jugador",
+        detail: err?.message,
+      });
     }
   });
 }

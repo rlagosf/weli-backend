@@ -19,7 +19,7 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
  * - Multi-academia
  *
  * Seguridad:
- * - READ: roles 1,2,3
+ * - READ: roles 1,3
  * - WRITE: roles 1,3
  *
  * academia_id:
@@ -29,7 +29,7 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
  * Reglas:
  * - academia_id nunca se acepta desde el body.
  * - promocion_id debe pertenecer a la academia efectiva.
- * - tipo_pago_id debe ser global (academia_id NULL) o pertenecer a la academia efectiva.
+ * - tipo_pago_id pertenece al catálogo global y debe estar habilitado para la academia efectiva mediante academia_tipo_pago.
  * - no se permite duplicar promocion_id + tipo_pago_id.
  * - si la relación fue utilizada en cargos históricos, no puede modificarse ni eliminarse.
  */
@@ -138,10 +138,11 @@ async function getPromocionTipoPago(academiaId: number, id: number) {
 
     INNER JOIN tipo_pago tp
       ON tp.id = ptp.tipo_pago_id
-     AND (
-       tp.academia_id IS NULL
-       OR tp.academia_id = ptp.academia_id
-     )
+
+    INNER JOIN academia_tipo_pago atp
+      ON atp.academia_id = ptp.academia_id
+     AND atp.tipo_pago_id = ptp.tipo_pago_id
+     AND atp.estado_id = 1
 
     WHERE ptp.id = ?
       AND ptp.academia_id = ?
@@ -174,20 +175,23 @@ async function validatePromocion(academiaId: number, promocionId: number) {
 async function validateTipoPago(academiaId: number, tipoPagoId: number) {
   const [rows]: any = await db.query(
     `
-    SELECT id
-    FROM tipo_pago
-    WHERE id = ?
-      AND (
-        academia_id IS NULL
-        OR academia_id = ?
-      )
+    SELECT
+      tp.id
+    FROM tipo_pago tp
+
+    INNER JOIN academia_tipo_pago atp
+      ON atp.tipo_pago_id = tp.id
+     AND atp.academia_id = ?
+     AND atp.estado_id = 1
+
+    WHERE tp.id = ?
     LIMIT 1
     `,
-    [tipoPagoId, academiaId]
+    [academiaId, tipoPagoId]
   );
 
   if (!rows?.length) {
-    throw new Error("El tipo de pago no existe o no pertenece a la academia");
+    throw new Error("El tipo de pago no existe o no está habilitado para la academia");
   }
 }
 
@@ -252,7 +256,7 @@ function handleScopeError(reply: FastifyReply, err: any) {
 function isBusinessValidationError(err: any) {
   return [
     "La promoción no existe o no pertenece a la academia",
-    "El tipo de pago no existe o no pertenece a la academia",
+    "El tipo de pago no existe o no está habilitado para la academia",
   ].includes(String(err?.message ?? ""));
 }
 
@@ -261,7 +265,7 @@ function isBusinessValidationError(err: any) {
 ========================================================= */
 
 export default async function promocion_tipos_pago(app: FastifyInstance) {
-  const canRead = [requireAuth, requireRoles([1, 2, 3])];
+  const canRead = [requireAuth, requireRoles([1, 3])];
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
   /* =======================================================
@@ -343,10 +347,11 @@ export default async function promocion_tipos_pago(app: FastifyInstance) {
 
         INNER JOIN tipo_pago tp
           ON tp.id = ptp.tipo_pago_id
-         AND (
-           tp.academia_id IS NULL
-           OR tp.academia_id = ptp.academia_id
-         )
+
+        INNER JOIN academia_tipo_pago atp
+          ON atp.academia_id = ptp.academia_id
+         AND atp.tipo_pago_id = ptp.tipo_pago_id
+         AND atp.estado_id = 1
 
         WHERE ${where.join(" AND ")}
 

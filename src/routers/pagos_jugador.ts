@@ -2,7 +2,7 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { db } from "../db";
-import { requireAuth, requireRoles } from "../middlewares/authz";
+import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
 /**
  * Tabla: pagos_jugador
@@ -14,14 +14,16 @@ import { requireAuth, requireRoles } from "../middlewares/authz";
  * ✅ Multi-academia (WELI):
  * - pagos_jugador NO tiene academia_id directo.
  * - Scoping SIEMPRE vía JOIN jugadores (j.academia_id).
- * - Regla platino: todo vive en la academia efectiva.
+ * - tipo_pago es catálogo global.
+ * - el tipo_pago_id utilizado debe estar habilitado para la academia
+ *   mediante academia_tipo_pago.
+ * - situacion_pago se utiliza como catálogo de estado de la transacción.
  */
 
 /* ────────────────────────────────────────────────────────────── */
 /* Constantes de negocio                                         */
 /* ────────────────────────────────────────────────────────────── */
 
-const MENSUALIDAD_TIPO_PAGO_ID = 3; // ajusta según tu catálogo real
 const DIA_CORTE_VENCIDO = 5;
 
 /* ────────────────────────────────────────────────────────────── */
@@ -62,101 +64,62 @@ function normalizeBody(raw: any) {
   return norm;
 }
 
-/* ──────────────────────────────────────────────────────────────
-   Multi-academia helpers (WELI) — MISMO ESTÁNDAR que jugadores.ts
-   Regla final:
-   - Rol 3 (superadmin): x-academia-id obligatorio y define el tenant.
-   - Rol 1/2 (admin/staff): pueden enviar x-academia-id, pero SOLO si coincide con el token.
-   - Si no viene header: usa academia_id del token.
-────────────────────────────────────────────────────────────── */
+function resolveAcademiaId(req: FastifyRequest) {
+  const academiaId = Number(getEffectiveAcademiaId(req));
 
-type AuthLike = {
-  rol_id?: number;
-  role_id?: number;
-  role?: number;
-
-  academia_id?: number;
-  academy_id?: number;
-  academiaId?: number;
-  academyId?: number;
-  academia?: number;
-  academy?: number;
-};
-
-function getAuthLike(req: FastifyRequest): AuthLike {
-  const a: any = (req as any).auth;
-  const u: any = (req as any).user;
-  const ctx =
-    a && typeof a === "object"
-      ? a
-      : u && typeof u === "object"
-      ? u
-      : {};
-  return ctx as AuthLike;
-}
-
-function getRolId(req: FastifyRequest): number {
-  const ctx = getAuthLike(req);
-  const raw = ctx.rol_id ?? ctx.role_id ?? ctx.role ?? 0;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function getTokenAcademiaId(req: FastifyRequest): number {
-  const ctx = getAuthLike(req);
-  const raw =
-    ctx.academia_id ??
-    ctx.academy_id ??
-    ctx.academiaId ??
-    ctx.academyId ??
-    ctx.academia ??
-    ctx.academy ??
-    0;
-
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function getHeaderAcademiaId(req: FastifyRequest): number {
-  const hdr = req.headers["x-academia-id"];
-  const raw = Array.isArray(hdr) ? hdr[0] : hdr;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function getEffectiveAcademiaId(req: FastifyRequest): number {
-  const rol = getRolId(req);
-  const headerAcademia = getHeaderAcademiaId(req);
-  const tokenAcademia = getTokenAcademiaId(req);
-
-  // 1) Superadmin: header manda (obligatorio)
-  if (rol === 3) {
-    if (!headerAcademia || headerAcademia <= 0) {
-      throw Object.assign(new Error("FORBIDDEN: falta x-academia-id para superadmin"), {
-        statusCode: 403,
-      });
-    }
-    return headerAcademia;
+  if (!Number.isInteger(academiaId) || academiaId <= 0) {
+    const err: any = new Error("Academia efectiva inválida");
+    err.statusCode = 403;
+    throw err;
   }
 
-  // 2) Admin/Staff: si viene header, debe coincidir con token
-  if (headerAcademia && headerAcademia > 0) {
-    if (!tokenAcademia || tokenAcademia <= 0) {
-      throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
-    }
-    if (headerAcademia !== tokenAcademia) {
-      throw Object.assign(new Error("FORBIDDEN: x-academia-id no coincide con tu academia"), {
-        statusCode: 403,
-      });
-    }
-    return headerAcademia;
-  }
+  return academiaId;
+}
 
-  // 3) Fallback: token
-  if (!tokenAcademia || tokenAcademia <= 0) {
-    throw Object.assign(new Error("FORBIDDEN: token sin academia_id"), { statusCode: 403 });
+async function assertTipoPagoEnabledOrThrow(tipoPagoId: number, academiaId: number) {
+  const [rows]: any = await db.query(
+    `
+      SELECT tp.id
+      FROM tipo_pago tp
+      INNER JOIN academia_tipo_pago atp
+        ON atp.tipo_pago_id = tp.id
+       AND atp.academia_id = ?
+       AND atp.estado_id = 1
+      WHERE tp.id = ?
+      LIMIT 1
+    `,
+    [academiaId, tipoPagoId]
+  );
+
+  if (!rows?.length) {
+    throw Object.assign(
+      new Error("El tipo de pago no existe o no está habilitado para la academia"),
+      { statusCode: 400 }
+    );
   }
-  return tokenAcademia;
+}
+
+async function assertSituacionPagoExistsOrThrow(situacionPagoId: number, academiaId: number) {
+  const [rows]: any = await db.query(
+    `
+      SELECT id
+      FROM situacion_pago
+      WHERE id = ?
+        AND (
+          academia_id IS NULL
+          OR academia_id = ?
+        )
+      LIMIT 1
+    `,
+    [situacionPagoId, academiaId]
+  );
+
+  if (!rows?.length) {
+    throw Object.assign(
+      new Error("La situación de pago no existe o no corresponde a la academia"),
+      { statusCode: 400 }
+    );
+  }
 }
 
 /**
@@ -229,7 +192,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
   // Health
   app.get("/health", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const academia_id = getEffectiveAcademiaId(req);
+      const academia_id = resolveAcademiaId(req);
       reply.header("Cache-Control", "no-store");
       return {
         module: "pagos_jugador",
@@ -255,13 +218,27 @@ export default async function pagos_jugador(app: FastifyInstance) {
     const { limit, offset, year, month, tipo_pago_id, jugador_rut } = queryParsed.data;
 
     try {
-      const academia_id = getEffectiveAcademiaId(req);
+      const academia_id = resolveAcademiaId(req);
 
       let sql = `
-        SELECT p.*
-          FROM pagos_jugador p
-          JOIN jugadores j ON j.rut_jugador = p.jugador_rut
-         WHERE j.academia_id = ?
+        SELECT
+          p.*,
+          tp.nombre AS tipo_pago_nombre,
+          sp.nombre AS situacion_pago_nombre,
+          mp.nombre AS medio_pago_nombre
+        FROM pagos_jugador p
+        JOIN jugadores j
+          ON j.rut_jugador = p.jugador_rut
+        LEFT JOIN tipo_pago tp
+          ON tp.id = p.tipo_pago_id
+        LEFT JOIN academia_tipo_pago atp
+          ON atp.academia_id = j.academia_id
+         AND atp.tipo_pago_id = p.tipo_pago_id
+        LEFT JOIN situacion_pago sp
+          ON sp.id = p.situacion_pago_id
+        LEFT JOIN medio_pago mp
+          ON mp.id = p.medio_pago_id
+        WHERE j.academia_id = ?
       `;
       const params: any[] = [academia_id];
 
@@ -302,199 +279,52 @@ export default async function pagos_jugador(app: FastifyInstance) {
   /* ───────── GET estado de cuenta (SCOPED) ───────── */
   app.get("/estado-cuenta", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const academia_id = getEffectiveAcademiaId(req);
+      const academia_id = resolveAcademiaId(req);
 
-      const now = new Date();
-      const currentYear = now.getFullYear();
-      const currentMonth = now.getMonth() + 1;
-      const currentDay = now.getDate();
-
-      const baseEstadoSinPago: "PAGADO" | "VENCIDO" = currentDay <= DIA_CORTE_VENCIDO ? "PAGADO" : "VENCIDO";
-
-      const [jugRows]: any = await db.query(
-        `SELECT j.*,
-                c.nombre AS categoria_nombre
-           FROM jugadores j
-           LEFT JOIN categorias c ON c.id = j.categoria_id
-          WHERE j.academia_id = ?`,
+      const [rows]: any = await db.query(
+        `
+          SELECT
+            p.*,
+            j.nombre_jugador,
+            c.nombre AS categoria_nombre,
+            tp.nombre AS tipo_pago_nombre,
+            sp.nombre AS situacion_pago_nombre,
+            mp.nombre AS medio_pago_nombre
+          FROM pagos_jugador p
+          JOIN jugadores j
+            ON j.rut_jugador = p.jugador_rut
+          LEFT JOIN categorias c
+            ON c.id = j.categoria_id
+          LEFT JOIN tipo_pago tp
+            ON tp.id = p.tipo_pago_id
+          LEFT JOIN academia_tipo_pago atp
+            ON atp.academia_id = j.academia_id
+           AND atp.tipo_pago_id = p.tipo_pago_id
+          LEFT JOIN situacion_pago sp
+            ON sp.id = p.situacion_pago_id
+          LEFT JOIN medio_pago mp
+            ON mp.id = p.medio_pago_id
+          WHERE j.academia_id = ?
+          ORDER BY p.fecha_pago DESC, p.id DESC
+        `,
         [academia_id]
       );
-
-      const [pagoRows]: any = await db.query(
-        `SELECT p.*,
-                tp.id     AS tp_id,
-                tp.nombre AS tp_nombre,
-                mp.id     AS mp_id,
-                mp.nombre AS mp_nombre,
-                sp.id     AS sp_id,
-                sp.nombre AS sp_nombre
-           FROM pagos_jugador p
-           JOIN jugadores j ON j.rut_jugador = p.jugador_rut
-           LEFT JOIN tipo_pago tp      ON tp.id = p.tipo_pago_id
-           LEFT JOIN medio_pago mp     ON mp.id = p.medio_pago_id
-           LEFT JOIN situacion_pago sp ON sp.id = p.situacion_pago_id
-          WHERE j.academia_id = ?`,
-        [academia_id]
-      );
-
-      const pagos = (pagoRows || []).map((r: any) => ({
-        id: r.id,
-        jugador_rut: r.jugador_rut,
-        monto: Number(r.monto || 0),
-        fecha_pago: r.fecha_pago,
-        tipo_pago: { id: r.tp_id ?? r.tipo_pago_id, nombre: r.tp_nombre ?? null },
-        medio_pago: { id: r.mp_id ?? r.medio_pago_id, nombre: r.mp_nombre ?? null },
-        situacion_pago: { id: r.sp_id ?? r.situacion_pago_id, nombre: r.sp_nombre ?? null },
-        comprobante_url: r.comprobante_url ?? null,
-        observaciones: r.observaciones ?? null,
-      }));
-
-      type PagoEnvuelto = { pago: any; year: number | null; month: number | null };
-      const pagosPorRut = new Map<string, PagoEnvuelto[]>();
-
-      for (const p of pagos) {
-        const rut = String(p.jugador_rut ?? "");
-        if (!rut) continue;
-
-        const d = p.fecha_pago ? new Date(p.fecha_pago) : null;
-        const year = d && !Number.isNaN(d.getTime()) ? d.getFullYear() : null;
-        const month = d && !Number.isNaN(d.getTime()) ? d.getMonth() + 1 : null;
-
-        const arr = pagosPorRut.get(rut) || [];
-        arr.push({ pago: p, year, month });
-        pagosPorRut.set(rut, arr);
-      }
-
-      const filas = (jugRows || []).map((j: any) => {
-        const rut = String(j.rut_jugador ?? j.rut ?? "");
-        const nombre = j.nombre_jugador ?? j.nombre ?? j.nombre_completo ?? "—";
-        const categoria = j.categoria_nombre ?? j.categoria ?? "Sin categoría";
-
-        const arrAll = rut ? pagosPorRut.get(rut) || [] : [];
-        const arrMensual = arrAll.filter((x) => Number(x.pago?.tipo_pago?.id) === MENSUALIDAD_TIPO_PAGO_ID);
-
-        const pagosMensualMesActual = arrMensual.filter((x) => x.year === currentYear && x.month === currentMonth);
-
-        let estadoMensualidad: "PAGADO" | "VENCIDO" = baseEstadoSinPago;
-        if (pagosMensualMesActual.length > 0) estadoMensualidad = "PAGADO";
-
-        let lastPago: any = null;
-        if (arrAll.length > 0) {
-          arrAll.sort((a, b) => {
-            const da = a.pago.fecha_pago ? new Date(a.pago.fecha_pago).getTime() : 0;
-            const dbt = b.pago.fecha_pago ? new Date(b.pago.fecha_pago).getTime() : 0;
-            return dbt - da;
-          });
-          lastPago = arrAll[0].pago;
-        }
-
-        return { rut, nombre, categoria, estadoMensualidad, lastPago };
-      });
-
-      const mesLabel = new Intl.DateTimeFormat("es-CL", { month: "long", year: "numeric" }).format(now);
 
       reply.header("Cache-Control", "no-store");
+
       return reply.send({
         ok: true,
         academia_id,
-        filas,
-        pagos,
-        mes: { year: currentYear, month: currentMonth, dia_corte: DIA_CORTE_VENCIDO, label: mesLabel },
+        items: rows ?? [],
       });
     } catch (err: any) {
       const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
       reply.header("Cache-Control", "no-store");
-      return reply.code(code).send({ ok: false, message: "Error al calcular estado de cuenta", detail: err?.message });
-    }
-  });
-
-  /* ───────── GET estado mensualidad (solo deudores) (SCOPED) ───────── */
-  app.get("/mensualidad-estado", { preHandler: canRead }, async (req: FastifyRequest, reply: FastifyReply) => {
-    try {
-      const academia_id = getEffectiveAcademiaId(req);
-
-      const now = new Date();
-      const currentYear = now.getFullYear();
-      const currentMonth = now.getMonth() + 1;
-      const currentDay = now.getDate();
-
-      const [jugRows]: any = await db.query(
-        `SELECT j.*,
-                c.nombre AS categoria_nombre
-           FROM jugadores j
-           LEFT JOIN categorias c ON c.id = j.categoria_id
-          WHERE j.academia_id = ?`,
-        [academia_id]
-      );
-
-      const [mensRows]: any = await db.query(
-        `SELECT p.jugador_rut,
-                MAX(p.fecha_pago) AS last_fecha
-           FROM pagos_jugador p
-           JOIN jugadores j ON j.rut_jugador = p.jugador_rut
-          WHERE p.tipo_pago_id = ?
-            AND j.academia_id = ?
-          GROUP BY p.jugador_rut`,
-        [MENSUALIDAD_TIPO_PAGO_ID, academia_id]
-      );
-
-      const lastMensPorRut = new Map<string, string | null>();
-      for (const r of mensRows || []) {
-        if (!r.jugador_rut) continue;
-
-        let fechaStr: string | null = null;
-        if (r.last_fecha instanceof Date) fechaStr = r.last_fecha.toISOString().slice(0, 10);
-        else if (typeof r.last_fecha === "string") fechaStr = r.last_fecha.slice(0, 10);
-
-        lastMensPorRut.set(String(r.jugador_rut), fechaStr);
-      }
-
-      const filas: any[] = [];
-
-      for (const j of jugRows || []) {
-        const rut = String(j.rut_jugador ?? j.rut ?? "");
-        const nombre = j.nombre_jugador ?? j.nombre ?? j.nombre_completo ?? "—";
-        const categoria = j.categoria_nombre ?? j.categoria ?? "Sin categoría";
-
-        const lastFechaRaw = rut ? lastMensPorRut.get(rut) ?? null : null;
-
-        let lastMensualidadFecha: string | null = null;
-        let tieneMensualidadMesActual = false;
-
-        if (lastFechaRaw) {
-          const s = String(lastFechaRaw).slice(0, 10);
-          const [yStr, mStr] = s.split("-");
-          const y = Number(yStr);
-          const m = Number(mStr);
-
-          if (!Number.isNaN(y) && !Number.isNaN(m)) {
-            lastMensualidadFecha = s;
-            if (y === currentYear && m === currentMonth) tieneMensualidadMesActual = true;
-          }
-        }
-
-        let estadoMensualidad: "PAGADO" | "VENCIDO";
-        if (currentDay <= DIA_CORTE_VENCIDO) estadoMensualidad = "PAGADO";
-        else estadoMensualidad = tieneMensualidadMesActual ? "PAGADO" : "VENCIDO";
-
-        if (estadoMensualidad !== "VENCIDO") continue;
-
-        filas.push({ rut, nombre, categoria, estadoMensualidad, lastMensualidadFecha, tieneMensualidadMesActual });
-      }
-
-      const mesLabel = new Intl.DateTimeFormat("es-CL", { month: "long", year: "numeric" }).format(now);
-
-      reply.header("Cache-Control", "no-store");
-      return reply.send({
-        ok: true,
-        academia_id,
-        mes: { year: currentYear, month: currentMonth, dia_corte: DIA_CORTE_VENCIDO, label: mesLabel },
-        filas,
+      return reply.code(code).send({
+        ok: false,
+        message: "Error al obtener estado de cuenta",
+        detail: err?.message,
       });
-    } catch (err: any) {
-      const code = err?.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
-      reply.header("Cache-Control", "no-store");
-      return reply.code(code).send({ ok: false, message: "Error al calcular estado de mensualidad", detail: err?.message });
     }
   });
 
@@ -507,16 +337,27 @@ export default async function pagos_jugador(app: FastifyInstance) {
     }
 
     try {
-      const academia_id = getEffectiveAcademiaId(req);
+      const academia_id = resolveAcademiaId(req);
 
       const [rows] = await db.query(
         `
-        SELECT p.*
-          FROM pagos_jugador p
-          JOIN jugadores j ON j.rut_jugador = p.jugador_rut
-         WHERE p.jugador_rut = ?
-           AND j.academia_id = ?
-         ORDER BY p.fecha_pago DESC, p.id DESC
+        SELECT
+          p.*,
+          tp.nombre AS tipo_pago_nombre,
+          sp.nombre AS situacion_pago_nombre,
+          mp.nombre AS medio_pago_nombre
+        FROM pagos_jugador p
+        JOIN jugadores j
+          ON j.rut_jugador = p.jugador_rut
+        LEFT JOIN tipo_pago tp
+          ON tp.id = p.tipo_pago_id
+        LEFT JOIN situacion_pago sp
+          ON sp.id = p.situacion_pago_id
+        LEFT JOIN medio_pago mp
+          ON mp.id = p.medio_pago_id
+        WHERE p.jugador_rut = ?
+          AND j.academia_id = ?
+        ORDER BY p.fecha_pago DESC, p.id DESC
         `,
         [parsed.data.jugador_rut, academia_id]
       );
@@ -539,16 +380,27 @@ export default async function pagos_jugador(app: FastifyInstance) {
     }
 
     try {
-      const academia_id = getEffectiveAcademiaId(req);
+      const academia_id = resolveAcademiaId(req);
 
       const [rows]: any = await db.query(
         `
-        SELECT p.*
-          FROM pagos_jugador p
-          JOIN jugadores j ON j.rut_jugador = p.jugador_rut
-         WHERE p.id = ?
-           AND j.academia_id = ?
-         LIMIT 1
+        SELECT
+          p.*,
+          tp.nombre AS tipo_pago_nombre,
+          sp.nombre AS situacion_pago_nombre,
+          mp.nombre AS medio_pago_nombre
+        FROM pagos_jugador p
+        JOIN jugadores j
+          ON j.rut_jugador = p.jugador_rut
+        LEFT JOIN tipo_pago tp
+          ON tp.id = p.tipo_pago_id
+        LEFT JOIN situacion_pago sp
+          ON sp.id = p.situacion_pago_id
+        LEFT JOIN medio_pago mp
+          ON mp.id = p.medio_pago_id
+        WHERE p.id = ?
+          AND j.academia_id = ?
+        LIMIT 1
         `,
         [parsed.data.id, academia_id]
       );
@@ -585,9 +437,11 @@ export default async function pagos_jugador(app: FastifyInstance) {
     data.fecha_pago = sqlDate;
 
     try {
-      const academia_id = getEffectiveAcademiaId(req);
+      const academia_id = resolveAcademiaId(req);
 
       await assertJugadorInAcademiaOrThrow(data.jugador_rut, academia_id);
+      await assertTipoPagoEnabledOrThrow(data.tipo_pago_id, academia_id);
+      await assertSituacionPagoExistsOrThrow(data.situacion_pago_id, academia_id);
 
       const [result]: any = await db.query("INSERT INTO pagos_jugador SET ?", [data]);
 
@@ -636,7 +490,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
     }
 
     try {
-      const academia_id = getEffectiveAcademiaId(req);
+      const academia_id = resolveAcademiaId(req);
 
       // Asegura que el pago a editar pertenece a la academia efectiva
       const [exists]: any = await db.query(
@@ -658,6 +512,14 @@ export default async function pagos_jugador(app: FastifyInstance) {
       // Si quieren mover el pago a otro jugador: valida pertenencia
       if (data.jugador_rut) {
         await assertJugadorInAcademiaOrThrow(Number(data.jugador_rut), academia_id);
+      }
+
+      if (data.tipo_pago_id) {
+        await assertTipoPagoEnabledOrThrow(Number(data.tipo_pago_id), academia_id);
+      }
+
+      if (data.situacion_pago_id) {
+        await assertSituacionPagoExistsOrThrow(Number(data.situacion_pago_id), academia_id);
       }
 
       const [result]: any = await db.query("UPDATE pagos_jugador SET ? WHERE id = ?", [data, id]);
@@ -683,7 +545,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
     }
 
     try {
-      const academia_id = getEffectiveAcademiaId(req);
+      const academia_id = resolveAcademiaId(req);
 
       const [result]: any = await db.query(
         `
