@@ -1,7 +1,8 @@
 // src/routers/academias.ts
 
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
+
 import { db } from "../db";
 import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
@@ -11,17 +12,11 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
 
 const MAX_SUCURSALES = 50;
 const MAX_TIPOS_PAGO = 50;
-const MAX_PLANES = 20;
-const MAX_TARIFAS_PLAN = 20;
+const MAX_PLANES = 50;
 const MAX_NOMBRE_SUCURSAL = 100;
 
-/*
- * TRANSICIÓN:
- * periodicidad dejó de formar parte del contrato comercial.
- * Se conserva internamente mientras planes_academia siga
- * requiriendo un valor NOT NULL.
- */
-const LEGACY_PERIODICIDAD = "MENSUAL";
+const ESTADO_ACTIVO = 1;
+const ESTADO_INACTIVO = 2;
 
 /* =========================================================
    SCHEMAS BASE
@@ -33,38 +28,13 @@ const IdParam = z.object({
 
 const EstadoSchema = z.coerce.number().int().positive();
 
-const SucursalRelationSchema = z.union([
-  z.number().int().positive(),
-  z.string().trim().min(2).max(MAX_NOMBRE_SUCURSAL),
-]);
-
-const TipoPagoIdSchema = z.coerce.number().int().positive();
-
-/* =========================================================
-   TARIFAS
-========================================================= */
-
-const CreateTarifaSchema = z
+const TipoPagoConfigSchema = z
   .object({
-    tipo_pago_id: TipoPagoIdSchema,
-    monto: z.coerce.number().finite().nonnegative().max(999999999.99),
-    sucursales: z
-      .array(z.string().trim().min(2).max(MAX_NOMBRE_SUCURSAL))
-      .min(1, "Cada tarifa debe aplicar al menos en una sucursal")
-      .max(MAX_SUCURSALES),
-  })
-  .strict();
+    tipo_pago_id: z.coerce.number().int().positive(),
 
-const UpdateTarifaSchema = z
-  .object({
-    id: z.coerce.number().int().positive().optional(),
-    tipo_pago_id: TipoPagoIdSchema,
     monto: z.coerce.number().finite().nonnegative().max(999999999.99),
-    estado_id: EstadoSchema.optional(),
-    sucursales: z
-      .array(SucursalRelationSchema)
-      .min(1, "Cada tarifa debe aplicar al menos en una sucursal")
-      .max(MAX_SUCURSALES),
+
+    estado_id: EstadoSchema.optional().default(ESTADO_ACTIVO),
   })
   .strict();
 
@@ -72,34 +42,37 @@ const UpdateTarifaSchema = z
    CREATE
 ========================================================= */
 
-const CreatePlanSchema = z
-  .object({
-    nombre: z.string().trim().min(2).max(120),
-    descripcion: z.string().trim().max(500).nullable().optional(),
-    estado_id: EstadoSchema.default(1),
-    sucursales: z
-      .array(z.string().trim().min(2).max(MAX_NOMBRE_SUCURSAL))
-      .min(1, "Cada plan debe estar disponible al menos en una sucursal")
-      .max(MAX_SUCURSALES),
-    tarifas: z.array(CreateTarifaSchema).min(1, "Cada plan debe registrar al menos una tarifa").max(MAX_TARIFAS_PLAN),
-  })
-  .strict();
-
 const CreateSchema = z
   .object({
     nombre: z.string().trim().min(2).max(120),
+
     rut_academia: z.coerce.number().int().positive().max(99_999_999),
+
     deporte_id: z.coerce.number().int().positive(),
-    estado_id: EstadoSchema.optional(),
+
+    estado_id: EstadoSchema.optional().default(ESTADO_ACTIVO),
+
     sucursales: z
       .array(z.string().trim().min(2).max(MAX_NOMBRE_SUCURSAL))
       .min(1, "Debe registrar al menos una sucursal")
       .max(MAX_SUCURSALES, `No se pueden registrar más de ${MAX_SUCURSALES} sucursales`),
+
+    /*
+     * Cada concepto proviene del catálogo global tipo_pago,
+     * pero el monto pertenece exclusivamente a la academia.
+     */
     tipos_pago: z
-      .array(TipoPagoIdSchema)
-      .min(1, "Debe seleccionar al menos un tipo de pago")
-      .max(MAX_TIPOS_PAGO, `No se pueden seleccionar más de ${MAX_TIPOS_PAGO} tipos de pago`),
-    planes: z.array(CreatePlanSchema).min(1, "Debe registrar al menos un plan").max(MAX_PLANES),
+      .array(TipoPagoConfigSchema)
+      .min(1, "Debe configurar al menos un tipo de pago")
+      .max(MAX_TIPOS_PAGO, `No se pueden configurar más de ${MAX_TIPOS_PAGO} tipos de pago`),
+
+    /*
+     * IDs provenientes exclusivamente de planes_catalogo.
+     *
+     * SIN BENEFICIO será agregado automáticamente aunque
+     * el frontend no lo envíe.
+     */
+    planes: z.array(z.coerce.number().int().positive()).max(MAX_PLANES).optional().default([]),
   })
   .strict();
 
@@ -110,33 +83,26 @@ const CreateSchema = z
 const UpdateSucursalSchema = z
   .object({
     id: z.coerce.number().int().positive().optional(),
-    nombre: z.string().trim().min(2).max(MAX_NOMBRE_SUCURSAL),
-  })
-  .strict();
 
-const UpdatePlanSchema = z
-  .object({
-    id: z.coerce.number().int().positive().optional(),
-    nombre: z.string().trim().min(2).max(120),
-    descripcion: z.string().trim().max(500).nullable().optional(),
-    estado_id: EstadoSchema.default(1),
-    sucursales: z
-      .array(SucursalRelationSchema)
-      .min(1, "Cada plan debe estar disponible al menos en una sucursal")
-      .max(MAX_SUCURSALES),
-    tarifas: z.array(UpdateTarifaSchema).min(1, "Cada plan debe tener al menos una tarifa").max(MAX_TARIFAS_PLAN),
+    nombre: z.string().trim().min(2).max(MAX_NOMBRE_SUCURSAL),
   })
   .strict();
 
 const UpdateSchema = z
   .object({
     nombre: z.string().trim().min(2).max(120).optional(),
+
     rut_academia: z.coerce.number().int().positive().max(99_999_999).optional(),
+
     deporte_id: z.coerce.number().int().positive().optional(),
+
     estado_id: EstadoSchema.optional(),
+
     sucursales: z.array(UpdateSucursalSchema).min(1).max(MAX_SUCURSALES).optional(),
-    tipos_pago: z.array(TipoPagoIdSchema).min(1).max(MAX_TIPOS_PAGO).optional(),
-    planes: z.array(UpdatePlanSchema).max(MAX_PLANES).optional(),
+
+    tipos_pago: z.array(TipoPagoConfigSchema).min(1).max(MAX_TIPOS_PAGO).optional(),
+
+    planes: z.array(z.coerce.number().int().positive()).max(MAX_PLANES).optional(),
   })
   .strict();
 
@@ -146,14 +112,18 @@ const UpdateSchema = z
 
 const ListQuery = z.object({
   limit: z.coerce.number().int().positive().max(500).default(100),
+
   offset: z.coerce.number().int().nonnegative().default(0),
+
   q: z.string().trim().min(1).optional(),
+
   estado_id: z.coerce.number().int().positive().optional(),
+
   deporte_id: z.coerce.number().int().positive().optional(),
 });
 
 /* =========================================================
-   HELPERS
+   HELPERS GENERALES
 ========================================================= */
 
 function normalizeName(value: string): string {
@@ -166,31 +136,70 @@ function comparableName(value: string): string {
   return normalizeName(value).toLocaleLowerCase("es");
 }
 
-function todayMysqlDate(): string {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
+function badRequest(message: string): never {
+  const error: any = new Error(message);
+  error.statusCode = 400;
+  throw error;
+}
+
+function conflict(message: string): never {
+  const error: any = new Error(message);
+  error.statusCode = 409;
+  throw error;
 }
 
 function extractRole(req: any): number {
   const raw = req?.user?.rol_id ?? req?.user?.role_id ?? req?.user?.role ?? req?.user?.rol ?? req?.rol_id ?? 0;
-  const rol = Number(raw);
-  return Number.isInteger(rol) ? rol : 0;
+
+  const role = Number(raw);
+
+  return Number.isInteger(role) ? role : 0;
 }
 
-function mysqlError(error: any): { status: number; message: string } {
+function resolveAcademiaId(req: FastifyRequest): number {
+  const academiaId = Number(getEffectiveAcademiaId(req));
+
+  if (!Number.isInteger(academiaId) || academiaId <= 0) {
+    const error: any = new Error("Academia efectiva inválida");
+    error.statusCode = 403;
+    throw error;
+  }
+
+  return academiaId;
+}
+
+function mysqlError(error: any): {
+  status: number;
+  message: string;
+} {
+  if (error instanceof z.ZodError) {
+    const first = error.issues?.[0];
+
+    return {
+      status: 400,
+      message: first?.message ?? "Datos inválidos",
+    };
+  }
+
   if (error?.code === "ER_DUP_ENTRY") {
-    return { status: 409, message: "Ya existe un registro con los mismos datos" };
+    return {
+      status: 409,
+      message: "Ya existe un registro con los mismos datos",
+    };
   }
 
   if (error?.code === "ER_NO_REFERENCED_ROW_2") {
-    return { status: 400, message: "Uno de los datos relacionados no existe o no es válido" };
+    return {
+      status: 400,
+      message: "Uno de los datos relacionados no existe o no es válido",
+    };
   }
 
   if (error?.code === "ER_ROW_IS_REFERENCED_2") {
-    return { status: 409, message: "El registro no puede eliminarse porque posee información relacionada" };
+    return {
+      status: 409,
+      message: "El registro posee información relacionada y no puede eliminarse",
+    };
   }
 
   return {
@@ -199,148 +208,196 @@ function mysqlError(error: any): { status: number; message: string } {
   };
 }
 
-function badRequest(message: string): never {
-  const error: any = new Error(message);
-  error.statusCode = 400;
-  throw error;
-}
-
 function assertUniqueNames(values: string[], label: string): void {
   const normalized = values.map(comparableName);
+
   if (new Set(normalized).size !== normalized.length) {
     badRequest(`No se pueden registrar ${label} duplicados`);
   }
 }
 
 function assertUniquePositiveIds(values: number[], label: string): void {
-  const normalized = values.map(Number);
+  const ids = values.map(Number);
 
-  if (normalized.some((id) => !Number.isInteger(id) || id <= 0)) {
+  if (ids.some((id) => !Number.isInteger(id) || id <= 0)) {
     badRequest(`Hay ${label} inválidos`);
   }
 
-  if (new Set(normalized).size !== normalized.length) {
+  if (new Set(ids).size !== ids.length) {
     badRequest(`No se pueden registrar ${label} duplicados`);
   }
 }
 
+function assertUniqueTiposPago(items: Array<{ tipo_pago_id: number }>): void {
+  assertUniquePositiveIds(
+    items.map((item) => Number(item.tipo_pago_id)),
+    "tipos de pago"
+  );
+}
+
 /* =========================================================
-   TIPO_PAGO / ACADEMIA_TIPO_PAGO HELPERS
+   CATÁLOGO TIPO_PAGO
 ========================================================= */
 
 async function validateTiposPagoCatalogo(conn: any, ids: number[]): Promise<void> {
-  const uniqueIds = [...new Set(ids.map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  const uniqueIds = [...new Set(ids.map(Number))];
 
-  if (!uniqueIds.length) return;
+  if (!uniqueIds.length) {
+    return;
+  }
 
   const placeholders = uniqueIds.map(() => "?").join(", ");
 
   const [rows]: any = await conn.query(
-    `SELECT id
-     FROM tipo_pago
-     WHERE id IN (${placeholders})`,
-    uniqueIds
+    `
+      SELECT id
+      FROM tipo_pago
+      WHERE id IN (${placeholders})
+        AND estado_id = ?
+    `,
+    [...uniqueIds, ESTADO_ACTIVO]
   );
 
-  const valid = new Set<number>((rows ?? []).map((row: any) => Number(row.id)));
+  const validIds = new Set<number>((rows ?? []).map((row: any) => Number(row.id)));
 
-  const invalid = uniqueIds.find((id) => !valid.has(id));
-
-  if (invalid !== undefined) {
-    badRequest(`El tipo de pago ${invalid} no existe en el catálogo global`);
-  }
-}
-
-async function getAcademiaTipoPagoIds(conn: any, academiaId: number): Promise<number[]> {
-  const [rows]: any = await conn.query(
-    `SELECT tipo_pago_id
-     FROM academia_tipo_pago
-     WHERE academia_id = ?
-     ORDER BY tipo_pago_id ASC`,
-    [academiaId]
-  );
-
-  return (rows ?? [])
-    .map((row: any) => Number(row.tipo_pago_id))
-    .filter((id: number) => Number.isInteger(id) && id > 0);
-}
-
-async function insertAcademiaTiposPago(conn: any, academiaId: number, ids: number[]): Promise<void> {
-  if (!ids.length) return;
-
-  await conn.query(
-    `INSERT INTO academia_tipo_pago (
-       academia_id,
-       tipo_pago_id,
-       estado_id
-     )
-     VALUES ?`,
-    [ids.map((tipoPagoId) => [academiaId, tipoPagoId, 1])]
-  );
-}
-
-function assertTarifasUseAllowedTiposPago(
-  planes: Array<{
-    nombre: string;
-    tarifas: Array<{
-      tipo_pago_id: number;
-    }>;
-  }>,
-  allowedIds: Set<number>
-): void {
-  for (const plan of planes) {
-    for (const tarifa of plan.tarifas) {
-      const tipoPagoId = Number(tarifa.tipo_pago_id);
-
-      if (!allowedIds.has(tipoPagoId)) {
-        badRequest(`El tipo de pago ${tipoPagoId} no está habilitado para la academia en el plan "${plan.nombre}"`);
-      }
+  for (const id of uniqueIds) {
+    if (!validIds.has(id)) {
+      badRequest(`El tipo de pago ${id} no existe o no está activo en el catálogo global`);
     }
   }
 }
 
 /* =========================================================
-   SUCURSALES HELPERS
+   CATÁLOGO PLANES
 ========================================================= */
 
-function buildSucursalMaps(rows: any[]) {
-  const byId = new Map<number, any>();
-  const byName = new Map<string, any>();
+async function getSinBeneficioPlanId(conn: any): Promise<number> {
+  const [rows]: any = await conn.query(
+    `
+      SELECT id
+      FROM planes_catalogo
+      WHERE UPPER(TRIM(nombre)) = 'SIN BENEFICIO'
+        AND estado_id = ?
+      LIMIT 1
+    `,
+    [ESTADO_ACTIVO]
+  );
 
-  for (const row of rows ?? []) {
-    const id = Number(row.id);
+  const id = Number(rows?.[0]?.id);
 
-    if (Number.isInteger(id) && id > 0) {
-      byId.set(id, row);
-      byName.set(comparableName(row.nombre), row);
-    }
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error('El catálogo global no contiene un plan activo "SIN BENEFICIO"');
   }
 
-  return {
-    byId,
-    byName,
-  };
+  return id;
 }
 
-function resolveSucursalIds(refs: Array<number | string>, sucursales: any[]): number[] {
-  const { byId, byName } = buildSucursalMaps(sucursales);
-  const ids: number[] = [];
+async function validatePlanesCatalogo(conn: any, ids: number[]): Promise<void> {
+  const uniqueIds = [...new Set(ids.map(Number))];
 
-  for (const ref of refs) {
-    const row = typeof ref === "number" ? byId.get(ref) : byName.get(comparableName(ref));
-
-    if (!row) {
-      badRequest(`Sucursal inválida o no perteneciente a la academia: ${String(ref)}`);
-    }
-
-    const id = Number(row.id);
-
-    if (!ids.includes(id)) {
-      ids.push(id);
-    }
+  if (!uniqueIds.length) {
+    return;
   }
 
-  return ids;
+  const placeholders = uniqueIds.map(() => "?").join(", ");
+
+  const [rows]: any = await conn.query(
+    `
+      SELECT id
+      FROM planes_catalogo
+      WHERE id IN (${placeholders})
+        AND estado_id = ?
+    `,
+    [...uniqueIds, ESTADO_ACTIVO]
+  );
+
+  const validIds = new Set<number>((rows ?? []).map((row: any) => Number(row.id)));
+
+  for (const id of uniqueIds) {
+    if (!validIds.has(id)) {
+      badRequest(`El plan ${id} no existe o no está activo en el catálogo global`);
+    }
+  }
+}
+
+async function normalizePlanesAcademia(conn: any, requestedIds: number[]): Promise<number[]> {
+  assertUniquePositiveIds(requestedIds, "planes");
+
+  await validatePlanesCatalogo(conn, requestedIds);
+
+  const sinBeneficioId = await getSinBeneficioPlanId(conn);
+
+  return [...new Set([sinBeneficioId, ...requestedIds.map(Number)])];
+}
+
+/* =========================================================
+   UPSERT CONFIGURACIÓN FINANCIERA
+========================================================= */
+
+async function upsertTipoPagoAcademia(
+  conn: any,
+  academiaId: number,
+  tipoPagoId: number,
+  estadoId: number
+): Promise<void> {
+  await conn.query(
+    `
+      INSERT INTO academia_tipo_pago (
+        academia_id,
+        tipo_pago_id,
+        estado_id
+      )
+      VALUES (?, ?, ?)
+
+      ON DUPLICATE KEY UPDATE
+        estado_id = VALUES(estado_id)
+    `,
+    [academiaId, tipoPagoId, estadoId]
+  );
+}
+
+async function upsertTarifaAcademia(
+  conn: any,
+  academiaId: number,
+  tipoPagoId: number,
+  monto: number,
+  estadoId: number
+): Promise<void> {
+  await conn.query(
+    `
+      INSERT INTO tarifas_academia (
+        academia_id,
+        tipo_pago_id,
+        monto,
+        estado_id
+      )
+      VALUES (?, ?, ?, ?)
+
+      ON DUPLICATE KEY UPDATE
+        monto = VALUES(monto),
+        estado_id = VALUES(estado_id),
+        updated_at = CURRENT_TIMESTAMP
+    `,
+    [academiaId, tipoPagoId, monto, estadoId]
+  );
+}
+
+async function upsertAcademiaPlan(conn: any, academiaId: number, planId: number, estadoId: number): Promise<void> {
+  await conn.query(
+    `
+      INSERT INTO academia_plan (
+        academia_id,
+        plan_id,
+        estado_id
+      )
+      VALUES (?, ?, ?)
+
+      ON DUPLICATE KEY UPDATE
+        estado_id = VALUES(estado_id),
+        updated_at = CURRENT_TIMESTAMP
+    `,
+    [academiaId, planId, estadoId]
+  );
 }
 
 /* =========================================================
@@ -416,32 +473,35 @@ export default async function academias(app: FastifyInstance) {
               a.created_at,
               a.updated_at
             FROM academias a
+
             LEFT JOIN deportes d
               ON d.id = a.deporte_id
+
             LEFT JOIN estado_academia ea
               ON ea.id = a.estado_id
+
             ${whereSql}
+
             ORDER BY a.id DESC
+
             LIMIT ?
             OFFSET ?
           `,
           [...params, limit, offset]
         );
 
-        const [countRows] = await db.query(
+        const [countRows]: any = await db.query(
           `
-            SELECT COUNT(*) AS total
-            FROM academias a
-            ${whereSql}
-          `,
+              SELECT COUNT(*) AS total
+              FROM academias a
+              ${whereSql}
+            `,
           params
         );
 
-        const total = Array.isArray(countRows) ? ((countRows as any)[0]?.total ?? 0) : 0;
-
         return reply.send({
           ok: true,
-          total,
+          total: Number(countRows?.[0]?.total ?? 0),
           limit,
           offset,
           data: rows,
@@ -468,55 +528,66 @@ export default async function academias(app: FastifyInstance) {
       preHandler: canReadOwnAcademia,
     },
     async (req, reply) => {
-      const parsed = IdParam.safeParse((req as any).params);
+      const paramsParsed = IdParam.safeParse((req as any).params);
 
-      if (!parsed.success) {
+      if (!paramsParsed.success) {
         return reply.code(400).send({
           ok: false,
           message: "ID inválido",
         });
       }
 
-      const { id } = parsed.data;
-
       try {
-        const rol = extractRole(req);
+        const requestedId = paramsParsed.data.id;
 
-        let academiaId = id;
+        const role = extractRole(req);
 
-        if (rol !== 3) {
-          const effective = getEffectiveAcademiaId(req);
+        let academiaId = requestedId;
 
-          if (Number(id) !== Number(effective)) {
+        /*
+         * Admin y Staff solo pueden consultar
+         * la academia de su JWT.
+         *
+         * Superadmin puede consultar por ID desde
+         * el módulo global de academias.
+         */
+        if (role !== 3) {
+          const effectiveAcademiaId = resolveAcademiaId(req);
+
+          if (Number(requestedId) !== Number(effectiveAcademiaId)) {
             return reply.code(403).send({
               ok: false,
               message: "FORBIDDEN_ACADEMIA",
             });
           }
 
-          academiaId = Number(effective);
+          academiaId = effectiveAcademiaId;
         }
 
         const [academiaRows]: any = await db.query(
           `
-            SELECT
-              a.id,
-              a.nombre,
-              a.rut_academia,
-              a.deporte_id,
-              d.nombre AS deporte_nombre,
-              a.estado_id,
-              ea.nombre AS estado_nombre,
-              a.created_at,
-              a.updated_at
-            FROM academias a
-            LEFT JOIN deportes d
-              ON d.id = a.deporte_id
-            LEFT JOIN estado_academia ea
-              ON ea.id = a.estado_id
-            WHERE a.id = ?
-            LIMIT 1
-          `,
+              SELECT
+                a.id,
+                a.nombre,
+                a.rut_academia,
+                a.deporte_id,
+                d.nombre AS deporte_nombre,
+                a.estado_id,
+                ea.nombre AS estado_nombre,
+                a.created_at,
+                a.updated_at
+              FROM academias a
+
+              LEFT JOIN deportes d
+                ON d.id = a.deporte_id
+
+              LEFT JOIN estado_academia ea
+                ON ea.id = a.estado_id
+
+              WHERE a.id = ?
+
+              LIMIT 1
+            `,
           [academiaId]
         );
 
@@ -527,150 +598,164 @@ export default async function academias(app: FastifyInstance) {
           });
         }
 
+        /* -----------------------------
+           SUCURSALES
+        ----------------------------- */
+
         const [sucursales]: any = await db.query(
           `
-            SELECT
-              id,
-              academia_id,
-              nombre
-            FROM sucursales_real
-            WHERE academia_id = ?
-            ORDER BY id ASC
-          `,
+              SELECT
+                id,
+                academia_id,
+                nombre
+              FROM sucursales_real
+              WHERE academia_id = ?
+              ORDER BY id ASC
+            `,
           [academiaId]
         );
+
+        /* -----------------------------
+           TIPOS DE PAGO + TARIFAS
+        ----------------------------- */
 
         const [tiposPago]: any = await db.query(
           `
-            SELECT
-              atp.id AS relacion_id,
-              atp.academia_id,
-              atp.tipo_pago_id AS id,
-              tp.nombre,
-              tp.descripcion,
-              atp.estado_id
-            FROM academia_tipo_pago atp
-            INNER JOIN tipo_pago tp
-              ON tp.id = atp.tipo_pago_id
-            WHERE atp.academia_id = ?
-            ORDER BY
-              tp.nombre ASC,
-              tp.id ASC
-          `,
+              SELECT
+                atp.id AS relacion_id,
+                atp.academia_id,
+
+                tp.id AS tipo_pago_id,
+                tp.nombre,
+                tp.descripcion,
+
+                atp.estado_id,
+
+                ta.id AS tarifa_id,
+                ta.monto,
+                ta.estado_id AS tarifa_estado_id,
+                ta.created_at AS tarifa_created_at,
+                ta.updated_at AS tarifa_updated_at
+
+              FROM academia_tipo_pago atp
+
+              INNER JOIN tipo_pago tp
+                ON tp.id = atp.tipo_pago_id
+
+              LEFT JOIN tarifas_academia ta
+                ON ta.academia_id = atp.academia_id
+               AND ta.tipo_pago_id = atp.tipo_pago_id
+
+              WHERE atp.academia_id = ?
+
+              ORDER BY
+                tp.nombre ASC,
+                tp.id ASC
+            `,
           [academiaId]
         );
+
+        /* -----------------------------
+           PLANES GLOBALES HABILITADOS
+        ----------------------------- */
 
         const [planesRows]: any = await db.query(
           `
-            SELECT
-              p.id,
-              p.academia_id,
-              p.nombre,
-              p.descripcion,
-              p.estado_id,
-              p.created_at,
-              p.updated_at
-            FROM planes_academia p
-            WHERE p.academia_id = ?
-            ORDER BY p.id ASC
-          `,
+              SELECT
+                ap.id AS relacion_id,
+                ap.academia_id,
+
+                pc.id AS plan_id,
+                pc.nombre,
+                pc.descripcion,
+
+                ap.estado_id,
+
+                pc.created_at,
+                pc.updated_at
+
+              FROM academia_plan ap
+
+              INNER JOIN planes_catalogo pc
+                ON pc.id = ap.plan_id
+
+              WHERE ap.academia_id = ?
+
+              ORDER BY
+                pc.nombre ASC,
+                pc.id ASC
+            `,
           [academiaId]
         );
 
-        const [planSucursalRows]: any = await db.query(
-          `
-            SELECT
-              ps.plan_id,
-              ps.sucursal_id
-            FROM plan_sucursal ps
-            WHERE ps.academia_id = ?
-            ORDER BY
-              ps.plan_id,
-              ps.sucursal_id
-          `,
-          [academiaId]
-        );
+        /* -----------------------------
+           REGLAS DE LOS PLANES
+        ----------------------------- */
 
-        const [tarifaRows]: any = await db.query(
-          `
-            SELECT
-              pt.id,
-              pt.academia_id,
-              pt.plan_id,
-              pt.tipo_pago_id,
-              tp.nombre AS tipo_pago_nombre,
-              tp.descripcion AS tipo_pago_descripcion,
-              pt.nombre,
-              pt.monto,
-              pt.vigencia_desde,
-              pt.vigencia_hasta,
-              pt.estado_id
-            FROM plan_tarifas pt
-            INNER JOIN tipo_pago tp
-              ON tp.id = pt.tipo_pago_id
-            INNER JOIN academia_tipo_pago atp
-              ON atp.academia_id = pt.academia_id
-             AND atp.tipo_pago_id = pt.tipo_pago_id
-            WHERE pt.academia_id = ?
-            ORDER BY
-              pt.plan_id,
-              pt.id
-          `,
-          [academiaId]
-        );
+        const planIds = (planesRows ?? [])
+          .map((row: any) => Number(row.plan_id))
+          .filter((id: number) => Number.isInteger(id) && id > 0);
 
-        const [tarifaSucursalRows]: any = await db.query(
-          `
-            SELECT
-              ts.tarifa_id,
-              ts.sucursal_id
-            FROM tarifa_sucursal ts
-            WHERE ts.academia_id = ?
-            ORDER BY
-              ts.tarifa_id,
-              ts.sucursal_id
-          `,
-          [academiaId]
-        );
+        let reglasRows: any[] = [];
 
-        const planes = (planesRows ?? []).map((plan: any) => {
-          const planId = Number(plan.id);
+        if (planIds.length) {
+          const placeholders = planIds.map(() => "?").join(", ");
 
-          const sucursalesPlan = (planSucursalRows ?? [])
-            .filter((row: any) => Number(row.plan_id) === planId)
-            .map((row: any) => Number(row.sucursal_id));
+          const [rows]: any = await db.query(
+            `
+                SELECT
+                  pr.id,
+                  pr.plan_id,
+                  pr.tipo_pago_id,
+                  tp.nombre AS tipo_pago_nombre,
+                  pr.tipo_beneficio,
+                  pr.valor,
+                  pr.estado_id,
+                  pr.created_at,
+                  pr.updated_at
 
-          const tarifas = (tarifaRows ?? [])
-            .filter((tarifa: any) => Number(tarifa.plan_id) === planId)
-            .map((tarifa: any) => ({
-              ...tarifa,
-              sucursales: (tarifaSucursalRows ?? [])
-                .filter((row: any) => Number(row.tarifa_id) === Number(tarifa.id))
-                .map((row: any) => Number(row.sucursal_id)),
-            }));
+                FROM plan_reglas pr
 
-          return {
-            ...plan,
-            sucursales: sucursalesPlan,
-            tarifas,
-          };
-        });
+                LEFT JOIN tipo_pago tp
+                  ON tp.id = pr.tipo_pago_id
+
+                WHERE pr.plan_id IN (${placeholders})
+
+                ORDER BY
+                  pr.plan_id ASC,
+                  pr.id ASC
+              `,
+            planIds
+          );
+
+          reglasRows = rows ?? [];
+        }
+
+        const planes = (planesRows ?? []).map((plan: any) => ({
+          ...plan,
+
+          reglas: reglasRows.filter((regla: any) => Number(regla.plan_id) === Number(plan.plan_id)),
+        }));
 
         return reply.send({
           ok: true,
+
           item: {
             ...academiaRows[0],
+
             sucursales: sucursales ?? [],
+
             tipos_pago: tiposPago ?? [],
+
             planes,
           },
         });
       } catch (error: any) {
-        const parsedError = mysqlError(error);
+        const parsed = mysqlError(error);
 
-        return reply.code(parsedError.status).send({
+        return reply.code(parsed.status).send({
           ok: false,
-          message: parsedError.message,
+          message: parsed.message,
         });
       }
     }
@@ -695,84 +780,40 @@ export default async function academias(app: FastifyInstance) {
         const body = CreateSchema.parse(req.body);
 
         const nombre = normalizeName(body.nombre);
-        const rut_academia = body.rut_academia;
-        const deporte_id = body.deporte_id;
-        const estado_id = body.estado_id ?? 1;
 
         const sucursales = body.sucursales.map(normalizeName);
-        const tiposPagoIds = body.tipos_pago.map(Number);
 
-        const planes = body.planes.map((plan) => ({
-          nombre: normalizeName(plan.nombre),
+        const tiposPago = body.tipos_pago.map((item) => ({
+          tipo_pago_id: Number(item.tipo_pago_id),
 
-          descripcion: plan.descripcion ? normalizeName(plan.descripcion) : null,
+          monto: Number(item.monto),
 
-          estado_id: plan.estado_id,
-
-          sucursales: plan.sucursales.map(normalizeName),
-
-          tarifas: plan.tarifas.map((tarifa) => ({
-            tipo_pago_id: Number(tarifa.tipo_pago_id),
-            monto: Number(tarifa.monto),
-            sucursales: tarifa.sucursales.map(normalizeName),
-          })),
+          estado_id: Number(item.estado_id ?? ESTADO_ACTIVO),
         }));
 
         assertUniqueNames(sucursales, "sucursales");
 
-        assertUniquePositiveIds(tiposPagoIds, "tipos de pago");
+        assertUniqueTiposPago(tiposPago);
 
-        assertUniqueNames(
-          planes.map((plan) => plan.nombre),
-          "planes"
+        await validateTiposPagoCatalogo(
+          conn,
+          tiposPago.map((item) => item.tipo_pago_id)
         );
 
-        const sucursalesValidas = new Set(sucursales.map(comparableName));
+        const planes = await normalizePlanesAcademia(conn, body.planes.map(Number));
 
-        for (const plan of planes) {
-          assertUniqueNames(plan.sucursales, `sucursales dentro del plan "${plan.nombre}"`);
-
-          const planSucursales = new Set(plan.sucursales.map(comparableName));
-
-          for (const sucursal of plan.sucursales) {
-            if (!sucursalesValidas.has(comparableName(sucursal))) {
-              badRequest(`La sucursal "${sucursal}" no pertenece a la academia que se está creando`);
-            }
-          }
-
-          for (const tarifa of plan.tarifas) {
-            assertUniqueNames(tarifa.sucursales, `sucursales dentro de una tarifa del plan "${plan.nombre}"`);
-
-            for (const sucursal of tarifa.sucursales) {
-              const comparable = comparableName(sucursal);
-
-              if (!sucursalesValidas.has(comparable)) {
-                badRequest(`La sucursal "${sucursal}" no pertenece a la academia`);
-              }
-
-              if (!planSucursales.has(comparable)) {
-                badRequest(
-                  `La tarifa del plan "${plan.nombre}" no puede aplicarse en "${sucursal}" porque el plan no está disponible en esa sucursal`
-                );
-              }
-            }
-          }
-        }
-
-        await validateTiposPagoCatalogo(conn, tiposPagoIds);
-
-        const allowedTipoPagoIds = new Set(tiposPagoIds);
-
-        assertTarifasUseAllowedTiposPago(planes, allowedTipoPagoIds);
+        /* -----------------------------
+           RUT ÚNICO
+        ----------------------------- */
 
         const [rutRows]: any = await conn.query(
           `
-            SELECT id
-            FROM academias
-            WHERE rut_academia = ?
-            LIMIT 1
-          `,
-          [rut_academia]
+              SELECT id
+              FROM academias
+              WHERE rut_academia = ?
+              LIMIT 1
+            `,
+          [body.rut_academia]
         );
 
         if (rutRows?.length) {
@@ -782,21 +823,28 @@ export default async function academias(app: FastifyInstance) {
           });
         }
 
-        await conn.beginTransaction();
+        /* -----------------------------
+           TRANSACCIÓN
+        ----------------------------- */
 
+        await conn.beginTransaction();
         transactionStarted = true;
+
+        /* -----------------------------
+           1. ACADEMIA
+        ----------------------------- */
 
         const [resultAcademia]: any = await conn.query(
           `
-            INSERT INTO academias (
-              nombre,
-              rut_academia,
-              deporte_id,
-              estado_id
-            )
-            VALUES (?, ?, ?, ?)
-          `,
-          [nombre, rut_academia, deporte_id, estado_id]
+              INSERT INTO academias (
+                nombre,
+                rut_academia,
+                deporte_id,
+                estado_id
+              )
+              VALUES (?, ?, ?, ?)
+            `,
+          [nombre, body.rut_academia, body.deporte_id, body.estado_id]
         );
 
         const academiaId = Number(resultAcademia.insertId);
@@ -804,6 +852,10 @@ export default async function academias(app: FastifyInstance) {
         if (!Number.isInteger(academiaId) || academiaId <= 0) {
           throw new Error("No fue posible obtener el ID de la academia creada");
         }
+
+        /* -----------------------------
+           2. SUCURSALES
+        ----------------------------- */
 
         for (const nombreSucursal of sucursales) {
           await conn.query(
@@ -818,193 +870,110 @@ export default async function academias(app: FastifyInstance) {
           );
         }
 
-        const [sucursalesCreadas]: any = await conn.query(
-          `
-            SELECT
-              id,
-              academia_id,
-              nombre
-            FROM sucursales_real
-            WHERE academia_id = ?
-            ORDER BY id ASC
-          `,
-          [academiaId]
-        );
+        /* -----------------------------
+           3. TIPO_PAGO + TARIFAS
+        ----------------------------- */
 
-        if ((sucursalesCreadas ?? []).length !== sucursales.length) {
-          throw new Error("No fue posible confirmar todas las sucursales creadas");
+        for (const config of tiposPago) {
+          await upsertTipoPagoAcademia(conn, academiaId, config.tipo_pago_id, config.estado_id);
+
+          await upsertTarifaAcademia(conn, academiaId, config.tipo_pago_id, config.monto, config.estado_id);
         }
 
-        const { byName: sucursalByName } = buildSucursalMaps(sucursalesCreadas);
+        /* -----------------------------
+           4. PLANES GLOBALES
+        ----------------------------- */
 
-        await insertAcademiaTiposPago(conn, academiaId, tiposPagoIds);
-
-        const [tiposPagoAsociados]: any = await conn.query(
-          `
-            SELECT
-              atp.id AS relacion_id,
-              atp.academia_id,
-              atp.tipo_pago_id AS id,
-              tp.nombre,
-              tp.descripcion,
-              atp.estado_id
-            FROM academia_tipo_pago atp
-            INNER JOIN tipo_pago tp
-              ON tp.id = atp.tipo_pago_id
-            WHERE atp.academia_id = ?
-            ORDER BY
-              tp.nombre ASC,
-              tp.id ASC
-          `,
-          [academiaId]
-        );
-
-        const planesCreados: any[] = [];
-
-        const vigenciaDesde = todayMysqlDate();
-
-        for (const plan of planes) {
-          const [resultPlan]: any = await conn.query(
-            `
-              INSERT INTO planes_academia (
-                academia_id,
-                nombre,
-                descripcion,
-                periodicidad,
-                estado_id
-              )
-              VALUES (?, ?, ?, ?, ?)
-            `,
-            [academiaId, plan.nombre, plan.descripcion, LEGACY_PERIODICIDAD, plan.estado_id]
-          );
-
-          const planId = Number(resultPlan.insertId);
-
-          if (!Number.isInteger(planId) || planId <= 0) {
-            throw new Error("No fue posible obtener el ID del plan creado");
-          }
-
-          const planSucursalIds = plan.sucursales.map((nombreSucursal) => {
-            const row = sucursalByName.get(comparableName(nombreSucursal));
-
-            if (!row) {
-              throw new Error(`Sucursal no encontrada: ${nombreSucursal}`);
-            }
-
-            return Number(row.id);
-          });
-
-          if (planSucursalIds.length) {
-            await conn.query(
-              `
-                INSERT INTO plan_sucursal (
-                  academia_id,
-                  plan_id,
-                  sucursal_id
-                )
-                VALUES ?
-              `,
-              [planSucursalIds.map((sucursalId) => [academiaId, planId, sucursalId])]
-            );
-          }
-
-          const tarifasCreadas: any[] = [];
-
-          for (const tarifa of plan.tarifas) {
-            const tipoPagoId = Number(tarifa.tipo_pago_id);
-
-            if (!allowedTipoPagoIds.has(tipoPagoId)) {
-              badRequest(`El tipo de pago ${tipoPagoId} no está habilitado para esta academia`);
-            }
-
-            const [resultTarifa]: any = await conn.query(
-              `
-                INSERT INTO plan_tarifas (
-                  academia_id,
-                  plan_id,
-                  tipo_pago_id,
-                  nombre,
-                  monto,
-                  vigencia_desde,
-                  vigencia_hasta,
-                  estado_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
-              `,
-              [academiaId, planId, tipoPagoId, plan.nombre, tarifa.monto, vigenciaDesde, plan.estado_id]
-            );
-
-            const tarifaId = Number(resultTarifa.insertId);
-
-            if (!Number.isInteger(tarifaId) || tarifaId <= 0) {
-              throw new Error("No fue posible obtener el ID de la tarifa creada");
-            }
-
-            const tarifaSucursalIds = tarifa.sucursales.map((nombreSucursal) => {
-              const row = sucursalByName.get(comparableName(nombreSucursal));
-
-              if (!row) {
-                throw new Error(`Sucursal no encontrada: ${nombreSucursal}`);
-              }
-
-              return Number(row.id);
-            });
-
-            if (tarifaSucursalIds.length) {
-              await conn.query(
-                `
-                  INSERT INTO tarifa_sucursal (
-                    academia_id,
-                    tarifa_id,
-                    sucursal_id
-                  )
-                  VALUES ?
-                `,
-                [tarifaSucursalIds.map((sucursalId) => [academiaId, tarifaId, sucursalId])]
-              );
-            }
-
-            tarifasCreadas.push({
-              id: tarifaId,
-              academia_id: academiaId,
-              plan_id: planId,
-              tipo_pago_id: tipoPagoId,
-              nombre: plan.nombre,
-              monto: tarifa.monto,
-              vigencia_desde: vigenciaDesde,
-              vigencia_hasta: null,
-              estado_id: plan.estado_id,
-              sucursales: tarifaSucursalIds,
-            });
-          }
-
-          planesCreados.push({
-            id: planId,
-            academia_id: academiaId,
-            nombre: plan.nombre,
-            descripcion: plan.descripcion,
-            estado_id: plan.estado_id,
-            sucursales: planSucursalIds,
-            tarifas: tarifasCreadas,
-          });
+        for (const planId of planes) {
+          await upsertAcademiaPlan(conn, academiaId, planId, ESTADO_ACTIVO);
         }
 
         await conn.commit();
-
         transactionStarted = false;
+
+        /* -----------------------------
+           RESPUESTA COMPLETA
+        ----------------------------- */
+
+        const [sucursalesCreadas]: any = await conn.query(
+          `
+              SELECT
+                id,
+                academia_id,
+                nombre
+              FROM sucursales_real
+              WHERE academia_id = ?
+              ORDER BY id ASC
+            `,
+          [academiaId]
+        );
+
+        const [tiposPagoCreados]: any = await conn.query(
+          `
+              SELECT
+                atp.id AS relacion_id,
+                tp.id AS tipo_pago_id,
+                tp.nombre,
+                tp.descripcion,
+                atp.estado_id,
+                ta.id AS tarifa_id,
+                ta.monto,
+                ta.estado_id AS tarifa_estado_id
+
+              FROM academia_tipo_pago atp
+
+              INNER JOIN tipo_pago tp
+                ON tp.id = atp.tipo_pago_id
+
+              INNER JOIN tarifas_academia ta
+                ON ta.academia_id = atp.academia_id
+               AND ta.tipo_pago_id = atp.tipo_pago_id
+
+              WHERE atp.academia_id = ?
+
+              ORDER BY tp.nombre ASC
+            `,
+          [academiaId]
+        );
+
+        const [planesCreados]: any = await conn.query(
+          `
+              SELECT
+                ap.id AS relacion_id,
+                pc.id AS plan_id,
+                pc.nombre,
+                pc.descripcion,
+                ap.estado_id
+
+              FROM academia_plan ap
+
+              INNER JOIN planes_catalogo pc
+                ON pc.id = ap.plan_id
+
+              WHERE ap.academia_id = ?
+
+              ORDER BY pc.nombre ASC
+            `,
+          [academiaId]
+        );
 
         return reply.code(201).send({
           ok: true,
+
           message: "Academia creada correctamente",
+
           academia: {
             id: academiaId,
             nombre,
-            rut_academia,
-            deporte_id,
-            estado_id,
-            sucursales: sucursalesCreadas,
-            tipos_pago: tiposPagoAsociados ?? [],
-            planes: planesCreados,
+            rut_academia: body.rut_academia,
+            deporte_id: body.deporte_id,
+            estado_id: body.estado_id,
+
+            sucursales: sucursalesCreadas ?? [],
+
+            tipos_pago: tiposPagoCreados ?? [],
+
+            planes: planesCreados ?? [],
           },
         });
       } catch (error: any) {
@@ -1014,11 +983,11 @@ export default async function academias(app: FastifyInstance) {
           } catch {}
         }
 
-        const parsedError = mysqlError(error);
+        const parsed = mysqlError(error);
 
-        return reply.code(parsedError.status).send({
+        return reply.code(parsed.status).send({
           ok: false,
-          message: parsedError.message,
+          message: parsed.message,
         });
       } finally {
         conn.release();
@@ -1037,16 +1006,16 @@ export default async function academias(app: FastifyInstance) {
       preHandler: onlySuper,
     },
     async (req, reply) => {
-      const parsed = IdParam.safeParse((req as any).params);
+      const paramsParsed = IdParam.safeParse((req as any).params);
 
-      if (!parsed.success) {
+      if (!paramsParsed.success) {
         return reply.code(400).send({
           ok: false,
           message: "ID inválido",
         });
       }
 
-      const { id: academiaId } = parsed.data;
+      const academiaId = paramsParsed.data.id;
 
       const conn = await db.getConnection();
 
@@ -1072,11 +1041,11 @@ export default async function academias(app: FastifyInstance) {
 
         const [academiaRows]: any = await conn.query(
           `
-            SELECT id
-            FROM academias
-            WHERE id = ?
-            LIMIT 1
-          `,
+              SELECT id
+              FROM academias
+              WHERE id = ?
+              LIMIT 1
+            `,
           [academiaId]
         );
 
@@ -1087,15 +1056,19 @@ export default async function academias(app: FastifyInstance) {
           });
         }
 
+        /* -----------------------------
+           VALIDAR RUT
+        ----------------------------- */
+
         if (body.rut_academia !== undefined) {
           const [rutRows]: any = await conn.query(
             `
-              SELECT id
-              FROM academias
-              WHERE rut_academia = ?
-                AND id <> ?
-              LIMIT 1
-            `,
+                SELECT id
+                FROM academias
+                WHERE rut_academia = ?
+                  AND id <> ?
+                LIMIT 1
+              `,
             [body.rut_academia, academiaId]
           );
 
@@ -1107,46 +1080,61 @@ export default async function academias(app: FastifyInstance) {
           }
         }
 
+        /* -----------------------------
+           VALIDAR SUCURSALES
+        ----------------------------- */
+
         if (body.sucursales) {
           assertUniqueNames(
-            body.sucursales.map((sucursal) => normalizeName(sucursal.nombre)),
+            body.sucursales.map((item) => normalizeName(item.nombre)),
             "sucursales"
           );
         }
 
+        /* -----------------------------
+           VALIDAR TIPOS + TARIFAS
+        ----------------------------- */
+
+        let tiposPago:
+          | Array<{
+              tipo_pago_id: number;
+              monto: number;
+              estado_id: number;
+            }>
+          | undefined;
+
         if (body.tipos_pago) {
-          assertUniquePositiveIds(body.tipos_pago, "tipos de pago");
+          tiposPago = body.tipos_pago.map((item) => ({
+            tipo_pago_id: Number(item.tipo_pago_id),
 
-          await validateTiposPagoCatalogo(conn, body.tipos_pago);
-        }
+            monto: Number(item.monto),
 
-        if (body.planes) {
-          assertUniqueNames(
-            body.planes.map((plan) => normalizeName(plan.nombre)),
-            "planes"
+            estado_id: Number(item.estado_id ?? ESTADO_ACTIVO),
+          }));
+
+          assertUniqueTiposPago(tiposPago);
+
+          await validateTiposPagoCatalogo(
+            conn,
+            tiposPago.map((item) => item.tipo_pago_id)
           );
         }
 
-        const currentTipoPagoIds = await getAcademiaTipoPagoIds(conn, academiaId);
+        /* -----------------------------
+           VALIDAR PLANES
+        ----------------------------- */
 
-        const desiredTipoPagoIds = body.tipos_pago ? body.tipos_pago.map(Number) : currentTipoPagoIds;
-
-        const allowedTipoPagoIds = new Set(desiredTipoPagoIds);
+        let desiredPlanIds: number[] | undefined;
 
         if (body.planes) {
-          assertTarifasUseAllowedTiposPago(
-            body.planes.map((plan) => ({
-              nombre: normalizeName(plan.nombre),
-              tarifas: plan.tarifas.map((tarifa) => ({
-                tipo_pago_id: Number(tarifa.tipo_pago_id),
-              })),
-            })),
-            allowedTipoPagoIds
-          );
+          desiredPlanIds = await normalizePlanesAcademia(conn, body.planes.map(Number));
         }
+
+        /* -----------------------------
+           TRANSACCIÓN
+        ----------------------------- */
 
         await conn.beginTransaction();
-
         transactionStarted = true;
 
         /* =================================================
@@ -1154,30 +1142,34 @@ export default async function academias(app: FastifyInstance) {
         ================================================= */
 
         const sets: string[] = [];
-        const params: any[] = [];
+        const updateParams: any[] = [];
 
         if (body.nombre !== undefined) {
           sets.push("nombre = ?");
-          params.push(normalizeName(body.nombre));
+
+          updateParams.push(normalizeName(body.nombre));
         }
 
         if (body.rut_academia !== undefined) {
           sets.push("rut_academia = ?");
-          params.push(body.rut_academia);
+
+          updateParams.push(body.rut_academia);
         }
 
         if (body.deporte_id !== undefined) {
           sets.push("deporte_id = ?");
-          params.push(body.deporte_id);
+
+          updateParams.push(body.deporte_id);
         }
 
         if (body.estado_id !== undefined) {
           sets.push("estado_id = ?");
-          params.push(body.estado_id);
+
+          updateParams.push(body.estado_id);
         }
 
         if (sets.length) {
-          params.push(academiaId);
+          updateParams.push(academiaId);
 
           await conn.query(
             `
@@ -1185,7 +1177,7 @@ export default async function academias(app: FastifyInstance) {
               SET ${sets.join(", ")}
               WHERE id = ?
             `,
-            params
+            updateParams
           );
         }
 
@@ -1193,23 +1185,22 @@ export default async function academias(app: FastifyInstance) {
            2. SUCURSALES
         ================================================= */
 
-        const [sucursalesAntes]: any = await conn.query(
-          `
-              SELECT
-                id,
-                academia_id,
-                nombre
-              FROM sucursales_real
-              WHERE academia_id = ?
-              ORDER BY id ASC
-            `,
-          [academiaId]
-        );
-
-        const existingSucursalIds = new Set<number>((sucursalesAntes ?? []).map((row: any) => Number(row.id)));
-
         if (body.sucursales) {
-          const desiredSucursalIds = new Set<number>();
+          const [existingRows]: any = await conn.query(
+            `
+                SELECT
+                  id,
+                  nombre
+                FROM sucursales_real
+                WHERE academia_id = ?
+                ORDER BY id ASC
+              `,
+            [academiaId]
+          );
+
+          const existingIds = new Set<number>((existingRows ?? []).map((row: any) => Number(row.id)));
+
+          const desiredIds = new Set<number>();
 
           for (const sucursal of body.sucursales) {
             const nombreSucursal = normalizeName(sucursal.nombre);
@@ -1217,7 +1208,7 @@ export default async function academias(app: FastifyInstance) {
             if (sucursal.id) {
               const sucursalId = Number(sucursal.id);
 
-              if (!existingSucursalIds.has(sucursalId)) {
+              if (!existingIds.has(sucursalId)) {
                 badRequest(`La sucursal ${sucursalId} no pertenece a esta academia`);
               }
 
@@ -1231,9 +1222,9 @@ export default async function academias(app: FastifyInstance) {
                 [nombreSucursal, sucursalId, academiaId]
               );
 
-              desiredSucursalIds.add(sucursalId);
+              desiredIds.add(sucursalId);
             } else {
-              const [resultSucursal]: any = await conn.query(
+              const [result]: any = await conn.query(
                 `
                     INSERT INTO sucursales_real (
                       academia_id,
@@ -1244,37 +1235,26 @@ export default async function academias(app: FastifyInstance) {
                 [academiaId, nombreSucursal]
               );
 
-              const newId = Number(resultSucursal.insertId);
+              const newId = Number(result.insertId);
 
               if (!Number.isInteger(newId) || newId <= 0) {
                 throw new Error("No fue posible crear la nueva sucursal");
               }
 
-              desiredSucursalIds.add(newId);
+              desiredIds.add(newId);
             }
           }
 
-          const removedSucursalIds = [...existingSucursalIds].filter((id) => !desiredSucursalIds.has(id));
+          /*
+           * La lista enviada es autoritativa.
+           *
+           * Si una sucursal omitida ya tiene jugadores,
+           * pagos u otra información relacionada,
+           * la FK RESTRICT impedirá eliminarla.
+           */
+          const removedIds = [...existingIds].filter((id) => !desiredIds.has(id));
 
-          for (const sucursalId of removedSucursalIds) {
-            await conn.query(
-              `
-                DELETE FROM tarifa_sucursal
-                WHERE academia_id = ?
-                  AND sucursal_id = ?
-              `,
-              [academiaId, sucursalId]
-            );
-
-            await conn.query(
-              `
-                DELETE FROM plan_sucursal
-                WHERE academia_id = ?
-                  AND sucursal_id = ?
-              `,
-              [academiaId, sucursalId]
-            );
-
+          for (const sucursalId of removedIds) {
             await conn.query(
               `
                 DELETE FROM sucursales_real
@@ -1286,348 +1266,68 @@ export default async function academias(app: FastifyInstance) {
           }
         }
 
-        const [sucursalesActuales]: any = await conn.query(
-          `
-              SELECT
-                id,
-                academia_id,
-                nombre
-              FROM sucursales_real
+        /* =================================================
+           3. TIPOS DE PAGO + TARIFAS
+        ================================================= */
+
+        if (tiposPago) {
+          /*
+           * No borramos configuraciones históricas.
+           *
+           * Primero dejamos las existentes inactivas y
+           * luego reactivamos/configuramos las recibidas.
+           *
+           * Esto preserva tarifa_id para pago_detalle.
+           */
+          await conn.query(
+            `
+              UPDATE academia_tipo_pago
+              SET estado_id = ?
               WHERE academia_id = ?
-              ORDER BY id ASC
             `,
-          [academiaId]
-        );
-
-        /* =================================================
-           3. PLANES + TARIFAS
-        ================================================= */
-
-        if (body.planes) {
-          const [planesAntes]: any = await conn.query(
-            `
-                SELECT id
-                FROM planes_academia
-                WHERE academia_id = ?
-              `,
-            [academiaId]
+            [ESTADO_INACTIVO, academiaId]
           );
-
-          const existingPlanIds = new Set<number>((planesAntes ?? []).map((row: any) => Number(row.id)));
-
-          const desiredPlanIds = new Set<number>();
-
-          for (const plan of body.planes) {
-            const nombrePlan = normalizeName(plan.nombre);
-
-            const descripcion = plan.descripcion ? normalizeName(plan.descripcion) : null;
-
-            const planSucursalIds = resolveSucursalIds(plan.sucursales, sucursalesActuales);
-
-            let planId: number;
-
-            if (plan.id) {
-              planId = Number(plan.id);
-
-              if (!existingPlanIds.has(planId)) {
-                badRequest(`El plan ${planId} no pertenece a esta academia`);
-              }
-
-              await conn.query(
-                `
-                  UPDATE planes_academia
-                  SET
-                    nombre = ?,
-                    descripcion = ?,
-                    estado_id = ?
-                  WHERE id = ?
-                    AND academia_id = ?
-                `,
-                [nombrePlan, descripcion, plan.estado_id, planId, academiaId]
-              );
-            } else {
-              const [resultPlan]: any = await conn.query(
-                `
-                    INSERT INTO planes_academia (
-                      academia_id,
-                      nombre,
-                      descripcion,
-                      periodicidad,
-                      estado_id
-                    )
-                    VALUES (?, ?, ?, ?, ?)
-                  `,
-                [academiaId, nombrePlan, descripcion, LEGACY_PERIODICIDAD, plan.estado_id]
-              );
-
-              planId = Number(resultPlan.insertId);
-
-              if (!Number.isInteger(planId) || planId <= 0) {
-                throw new Error("No fue posible crear el nuevo plan");
-              }
-            }
-
-            desiredPlanIds.add(planId);
-
-            await conn.query(
-              `
-                DELETE FROM plan_sucursal
-                WHERE academia_id = ?
-                  AND plan_id = ?
-              `,
-              [academiaId, planId]
-            );
-
-            if (planSucursalIds.length) {
-              await conn.query(
-                `
-                  INSERT INTO plan_sucursal (
-                    academia_id,
-                    plan_id,
-                    sucursal_id
-                  )
-                  VALUES ?
-                `,
-                [planSucursalIds.map((sucursalId) => [academiaId, planId, sucursalId])]
-              );
-            }
-
-            const [tarifasAntes]: any = await conn.query(
-              `
-                  SELECT id
-                  FROM plan_tarifas
-                  WHERE academia_id = ?
-                    AND plan_id = ?
-                `,
-              [academiaId, planId]
-            );
-
-            const existingTarifaIds = new Set<number>((tarifasAntes ?? []).map((row: any) => Number(row.id)));
-
-            const desiredTarifaIds = new Set<number>();
-
-            for (const tarifa of plan.tarifas) {
-              const tarifaSucursalIds = resolveSucursalIds(tarifa.sucursales, sucursalesActuales);
-
-              for (const sucursalId of tarifaSucursalIds) {
-                if (!planSucursalIds.includes(sucursalId)) {
-                  badRequest(
-                    `Una tarifa del plan "${nombrePlan}" está vinculada a una sucursal donde el plan no está disponible`
-                  );
-                }
-              }
-
-              const tipoPagoId = Number(tarifa.tipo_pago_id);
-
-              if (!allowedTipoPagoIds.has(tipoPagoId)) {
-                badRequest(`El tipo de pago ${tipoPagoId} no está habilitado para esta academia`);
-              }
-
-              let tarifaId: number;
-
-              if (tarifa.id) {
-                tarifaId = Number(tarifa.id);
-
-                if (!existingTarifaIds.has(tarifaId)) {
-                  badRequest(`La tarifa ${tarifaId} no pertenece al plan ${planId}`);
-                }
-
-                await conn.query(
-                  `
-                    UPDATE plan_tarifas
-                    SET
-                      tipo_pago_id = ?,
-                      nombre = ?,
-                      monto = ?,
-                      estado_id = ?
-                    WHERE id = ?
-                      AND academia_id = ?
-                      AND plan_id = ?
-                  `,
-                  [
-                    tipoPagoId,
-                    nombrePlan,
-                    tarifa.monto,
-                    tarifa.estado_id ?? plan.estado_id,
-                    tarifaId,
-                    academiaId,
-                    planId,
-                  ]
-                );
-              } else {
-                const [resultTarifa]: any = await conn.query(
-                  `
-                      INSERT INTO plan_tarifas (
-                        academia_id,
-                        plan_id,
-                        tipo_pago_id,
-                        nombre,
-                        monto,
-                        vigencia_desde,
-                        vigencia_hasta,
-                        estado_id
-                      )
-                      VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
-                    `,
-                  [
-                    academiaId,
-                    planId,
-                    tipoPagoId,
-                    nombrePlan,
-                    tarifa.monto,
-                    todayMysqlDate(),
-                    tarifa.estado_id ?? plan.estado_id,
-                  ]
-                );
-
-                tarifaId = Number(resultTarifa.insertId);
-
-                if (!Number.isInteger(tarifaId) || tarifaId <= 0) {
-                  throw new Error("No fue posible crear la nueva tarifa");
-                }
-              }
-
-              desiredTarifaIds.add(tarifaId);
-
-              await conn.query(
-                `
-                  DELETE FROM tarifa_sucursal
-                  WHERE academia_id = ?
-                    AND tarifa_id = ?
-                `,
-                [academiaId, tarifaId]
-              );
-
-              if (tarifaSucursalIds.length) {
-                await conn.query(
-                  `
-                    INSERT INTO tarifa_sucursal (
-                      academia_id,
-                      tarifa_id,
-                      sucursal_id
-                    )
-                    VALUES ?
-                  `,
-                  [tarifaSucursalIds.map((sucursalId) => [academiaId, tarifaId, sucursalId])]
-                );
-              }
-            }
-
-            const removedTarifaIds = [...existingTarifaIds].filter((tarifaId) => !desiredTarifaIds.has(tarifaId));
-
-            for (const tarifaId of removedTarifaIds) {
-              await conn.query(
-                `
-                  DELETE FROM tarifa_sucursal
-                  WHERE academia_id = ?
-                    AND tarifa_id = ?
-                `,
-                [academiaId, tarifaId]
-              );
-
-              await conn.query(
-                `
-                  DELETE FROM plan_tarifas
-                  WHERE academia_id = ?
-                    AND plan_id = ?
-                    AND id = ?
-                `,
-                [academiaId, planId, tarifaId]
-              );
-            }
-          }
-
-          const removedPlanIds = [...existingPlanIds].filter((planId) => !desiredPlanIds.has(planId));
-
-          for (const planId of removedPlanIds) {
-            const [tarifasPlan]: any = await conn.query(
-              `
-                  SELECT id
-                  FROM plan_tarifas
-                  WHERE academia_id = ?
-                    AND plan_id = ?
-                `,
-              [academiaId, planId]
-            );
-
-            for (const tarifa of tarifasPlan ?? []) {
-              await conn.query(
-                `
-                  DELETE FROM tarifa_sucursal
-                  WHERE academia_id = ?
-                    AND tarifa_id = ?
-                `,
-                [academiaId, Number(tarifa.id)]
-              );
-            }
-
-            await conn.query(
-              `
-                DELETE FROM plan_tarifas
-                WHERE academia_id = ?
-                  AND plan_id = ?
-              `,
-              [academiaId, planId]
-            );
-
-            await conn.query(
-              `
-                DELETE FROM plan_sucursal
-                WHERE academia_id = ?
-                  AND plan_id = ?
-              `,
-              [academiaId, planId]
-            );
-
-            await conn.query(
-              `
-                DELETE FROM planes_academia
-                WHERE academia_id = ?
-                  AND id = ?
-              `,
-              [academiaId, planId]
-            );
-          }
-        }
-
-        /* =================================================
-           4. ACADEMIA ↔ TIPO_PAGO
-        ================================================= */
-
-        if (body.tipos_pago) {
-          const [stillUsedRows]: any = await conn.query(
-            `
-                SELECT DISTINCT
-                  tipo_pago_id
-                FROM plan_tarifas
-                WHERE academia_id = ?
-              `,
-            [academiaId]
-          );
-
-          const stillUsedIds = (stillUsedRows ?? []).map((row: any) => Number(row.tipo_pago_id));
-
-          const invalidUsed = stillUsedIds.find((tipoPagoId: number) => !allowedTipoPagoIds.has(tipoPagoId));
-
-          if (invalidUsed !== undefined) {
-            badRequest(
-              `No puedes quitar el tipo de pago ${invalidUsed} porque todavía está utilizado por una tarifa de la academia`
-            );
-          }
 
           await conn.query(
             `
-              DELETE FROM academia_tipo_pago
+              UPDATE tarifas_academia
+              SET estado_id = ?
               WHERE academia_id = ?
             `,
-            [academiaId]
+            [ESTADO_INACTIVO, academiaId]
           );
 
-          await insertAcademiaTiposPago(conn, academiaId, desiredTipoPagoIds);
+          for (const config of tiposPago) {
+            await upsertTipoPagoAcademia(conn, academiaId, config.tipo_pago_id, config.estado_id);
+
+            await upsertTarifaAcademia(conn, academiaId, config.tipo_pago_id, config.monto, config.estado_id);
+          }
+        }
+
+        /* =================================================
+           4. PLANES
+        ================================================= */
+
+        if (desiredPlanIds) {
+          /*
+           * Igual que con las tarifas:
+           * no eliminamos relaciones históricas.
+           */
+          await conn.query(
+            `
+              UPDATE academia_plan
+              SET estado_id = ?
+              WHERE academia_id = ?
+            `,
+            [ESTADO_INACTIVO, academiaId]
+          );
+
+          for (const planId of desiredPlanIds) {
+            await upsertAcademiaPlan(conn, academiaId, planId, ESTADO_ACTIVO);
+          }
         }
 
         await conn.commit();
-
         transactionStarted = false;
 
         return reply.send({
@@ -1642,11 +1342,11 @@ export default async function academias(app: FastifyInstance) {
           } catch {}
         }
 
-        const parsedError = mysqlError(error);
+        const parsed = mysqlError(error);
 
-        return reply.code(parsedError.status).send({
+        return reply.code(parsed.status).send({
           ok: false,
-          message: parsedError.message,
+          message: parsed.message,
         });
       } finally {
         conn.release();
@@ -1665,16 +1365,16 @@ export default async function academias(app: FastifyInstance) {
       preHandler: onlySuper,
     },
     async (req, reply) => {
-      const parsed = IdParam.safeParse((req as any).params);
+      const paramsParsed = IdParam.safeParse((req as any).params);
 
-      if (!parsed.success) {
+      if (!paramsParsed.success) {
         return reply.code(400).send({
           ok: false,
           message: "ID inválido",
         });
       }
 
-      const { id: academiaId } = parsed.data;
+      const academiaId = paramsParsed.data.id;
 
       const conn = await db.getConnection();
 
@@ -1699,45 +1399,41 @@ export default async function academias(app: FastifyInstance) {
         }
 
         await conn.beginTransaction();
-
         transactionStarted = true;
 
-        await conn.query(
-          `
-            DELETE FROM tarifa_sucursal
-            WHERE academia_id = ?
-          `,
-          [academiaId]
-        );
+        /*
+         * Se eliminan solamente configuraciones propias
+         * de la academia.
+         *
+         * JAMÁS se elimina:
+         * - tipo_pago
+         * - planes_catalogo
+         * - plan_reglas
+         */
 
         await conn.query(
           `
-            DELETE FROM plan_tarifas
-            WHERE academia_id = ?
-          `,
-          [academiaId]
-        );
-
-        await conn.query(
-          `
-            DELETE FROM plan_sucursal
-            WHERE academia_id = ?
-          `,
-          [academiaId]
-        );
-
-        await conn.query(
-          `
-            DELETE FROM planes_academia
+            DELETE FROM academia_plan
             WHERE academia_id = ?
           `,
           [academiaId]
         );
 
         /*
-         * Se elimina solamente la relación con el catálogo.
-         * Nunca se eliminan filas de tipo_pago.
+         * tarifas_academia podría estar referenciada
+         * desde pago_detalle.tarifa_id.
+         *
+         * Si existen pagos históricos, la FK RESTRICT
+         * impedirá la eliminación y devolveremos 409.
          */
+        await conn.query(
+          `
+            DELETE FROM tarifas_academia
+            WHERE academia_id = ?
+          `,
+          [academiaId]
+        );
+
         await conn.query(
           `
             DELETE FROM academia_tipo_pago
@@ -1746,6 +1442,11 @@ export default async function academias(app: FastifyInstance) {
           [academiaId]
         );
 
+        /*
+         * Si las sucursales ya poseen jugadores,
+         * pagos u otra información relacionada,
+         * tampoco serán eliminables.
+         */
         await conn.query(
           `
             DELETE FROM sucursales_real
@@ -1767,7 +1468,6 @@ export default async function academias(app: FastifyInstance) {
         }
 
         await conn.commit();
-
         transactionStarted = false;
 
         return reply.send({
@@ -1786,15 +1486,15 @@ export default async function academias(app: FastifyInstance) {
           return reply.code(409).send({
             ok: false,
             message:
-              "La academia contiene información asociada y no puede eliminarse definitivamente todavía. Desactívala o elimina primero sus dependencias.",
+              "La academia posee información operacional o histórica asociada y no puede eliminarse definitivamente. Desactívala si necesitas conservar sus registros.",
           });
         }
 
-        const parsedError = mysqlError(error);
+        const parsed = mysqlError(error);
 
-        return reply.code(parsedError.status).send({
+        return reply.code(parsed.status).send({
           ok: false,
-          message: parsedError.message,
+          message: parsed.message,
         });
       } finally {
         conn.release();

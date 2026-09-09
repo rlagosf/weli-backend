@@ -8,48 +8,53 @@ import { db } from "../db";
 
 import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
-const LEGACY_PERIODICIDAD = "MENSUAL";
-
 /**
- * Tabla: planes_academia
+ * Tablas:
  *
- * Campos:
- * - id
- * - academia_id
- * - nombre
- * - descripcion
- * - periodicidad (legacy interno; no forma parte del contrato API)
- * - estado_id
- * - created_at
- * - updated_at
+ * - planes_catalogo
+ * - academia_plan
+ * - plan_reglas
  *
- * Scope:
- * - Multi-academia
+ * Modelo:
+ *
+ * planes_catalogo
+ *      Catálogo GLOBAL de planes/beneficios.
+ *
+ * academia_plan
+ *      Determina qué planes están habilitados
+ *      para una academia.
+ *
+ * plan_reglas
+ *      Define las reglas globales de beneficio.
  *
  * Seguridad:
  * - READ: roles 1, 3
  * - WRITE: roles 1, 3
  *
  * academia_id:
- * - Admin: JWT firmado
- * - Superadmin: x-academia-id validado
+ * - Admin: academia firmada en JWT.
+ * - Superadmin: x-academia-id validado.
  *
- * Nunca se confía en academia_id proveniente del body.
+ * Nunca se recibe academia_id desde el body.
  */
 
 /* =========================================================
-   Schemas
+   SCHEMAS
 ========================================================= */
 
 const IdParam = z.object({
   id: z.coerce.number().int().positive(),
 });
 
+/*
+ * id corresponde al ID de la relación academia_plan.
+ *
+ * plan_id corresponde al ID global de planes_catalogo.
+ */
+
 const CreateSchema = z
   .object({
-    nombre: z.string().trim().min(2, "Debe tener al menos 2 caracteres").max(120),
-
-    descripcion: z.string().trim().max(500).nullable().optional(),
+    plan_id: z.coerce.number().int().positive(),
 
     estado_id: z.coerce.number().int().positive().max(255).default(1),
   })
@@ -57,9 +62,7 @@ const CreateSchema = z
 
 const PutSchema = z
   .object({
-    nombre: z.string().trim().min(2, "Debe tener al menos 2 caracteres").max(120),
-
-    descripcion: z.string().trim().max(500).nullable(),
+    plan_id: z.coerce.number().int().positive(),
 
     estado_id: z.coerce.number().int().positive().max(255),
   })
@@ -67,51 +70,25 @@ const PutSchema = z
 
 const PatchSchema = z
   .object({
-    nombre: z.string().trim().min(2, "Debe tener al menos 2 caracteres").max(120).optional(),
-
-    descripcion: z.string().trim().max(500).nullable().optional(),
+    plan_id: z.coerce.number().int().positive().optional(),
 
     estado_id: z.coerce.number().int().positive().max(255).optional(),
   })
   .strict();
 
 /* =========================================================
-   Helpers
+   HELPERS
 ========================================================= */
 
-function zodDetail(err: ZodError) {
+function zodDetail(err: ZodError): string {
   return err.issues.map((issue) => `${issue.path.join(".") || "field"}: ${issue.message}`).join("; ");
 }
 
-function normalize(row: any) {
-  return {
-    id: Number(row.id),
+/* =========================================================
+   ACADEMIA EFECTIVA
+========================================================= */
 
-    academia_id: Number(row.academia_id),
-
-    nombre: String(row.nombre ?? ""),
-
-    descripcion: row.descripcion == null ? null : String(row.descripcion),
-
-    estado_id: Number(row.estado_id),
-
-    created_at: row.created_at ?? null,
-
-    updated_at: row.updated_at ?? null,
-  };
-}
-
-/**
- * Obtiene academia efectiva utilizando exclusivamente
- * el contexto autenticado.
- *
- * Admin:
- * JWT.
- *
- * Superadmin:
- * x-academia-id.
- */
-function resolveAcademiaId(req: FastifyRequest) {
+function resolveAcademiaId(req: FastifyRequest): number {
   const academiaId = Number(getEffectiveAcademiaId(req));
 
   if (!Number.isInteger(academiaId) || academiaId <= 0) {
@@ -125,71 +102,250 @@ function resolveAcademiaId(req: FastifyRequest) {
   return academiaId;
 }
 
+/* =========================================================
+   NORMALIZACIÓN
+========================================================= */
 
-function normalizeDescripcion(value: string | null | undefined) {
-  if (value === null || value === undefined) {
-    return null;
-  }
+function normalize(row: any) {
+  return {
+    /*
+     * ID de academia_plan.
+     */
+    id: Number(row.id),
 
-  const text = String(value).trim();
+    academia_id: Number(row.academia_id),
 
-  return text || null;
+    /*
+     * ID del catálogo global.
+     */
+    plan_id: Number(row.plan_id),
+
+    nombre: String(row.nombre ?? ""),
+
+    descripcion: row.descripcion == null ? null : String(row.descripcion),
+
+    estado_id: Number(row.estado_id),
+
+    catalogo_estado_id: row.catalogo_estado_id == null ? null : Number(row.catalogo_estado_id),
+
+    created_at: row.created_at ?? null,
+
+    updated_at: row.updated_at ?? null,
+  };
 }
 
-async function existsByNombre(academiaId: number, nombre: string, excludeId?: number) {
-  const normalizedNombre = String(nombre ?? "").trim();
+/* =========================================================
+   PLAN GLOBAL
+========================================================= */
 
-  if (!normalizedNombre) {
-    return false;
-  }
-
-  if (excludeId) {
-    const [rows]: any = await db.query(
-      `
-        SELECT id
-        FROM planes_academia
-        WHERE academia_id = ?
-          AND LOWER(TRIM(nombre)) = LOWER(?)
-          AND id <> ?
-        LIMIT 1
-        `,
-      [academiaId, normalizedNombre, excludeId]
-    );
-
-    return Array.isArray(rows) && rows.length > 0;
-  }
-
+async function validatePlanGlobal(planId: number) {
   const [rows]: any = await db.query(
     `
-      SELECT id
-      FROM planes_academia
-      WHERE academia_id = ?
-        AND LOWER(TRIM(nombre)) = LOWER(?)
-      LIMIT 1
+        SELECT
+          id
+
+        FROM planes_catalogo
+
+        WHERE id = ?
+
+        LIMIT 1
       `,
-    [academiaId, normalizedNombre]
+    [planId]
   );
 
-  return Array.isArray(rows) && rows.length > 0;
+  if (!rows?.length) {
+    throw new Error("El plan no existe en el catálogo global");
+  }
 }
 
-async function existsById(academiaId: number, id: number) {
+/* =========================================================
+   RELACIÓN ACADEMIA_PLAN
+========================================================= */
+
+async function getRelacion(academiaId: number, id: number) {
   const [rows]: any = await db.query(
     `
-      SELECT id
-      FROM planes_academia
-      WHERE id = ?
-        AND academia_id = ?
-      LIMIT 1
+        SELECT
+          ap.id,
+          ap.academia_id,
+          ap.plan_id,
+          ap.estado_id,
+
+          ap.created_at,
+          ap.updated_at,
+
+          pc.nombre,
+          pc.descripcion,
+
+          pc.estado_id
+            AS catalogo_estado_id
+
+        FROM academia_plan ap
+
+        INNER JOIN planes_catalogo pc
+          ON pc.id =
+             ap.plan_id
+
+        WHERE ap.id = ?
+          AND ap.academia_id = ?
+
+        LIMIT 1
       `,
     [id, academiaId]
   );
+
+  return rows?.length ? rows[0] : null;
+}
+
+async function existsRelation(academiaId: number, planId: number, excludeId?: number): Promise<boolean> {
+  const values: any[] = [academiaId, planId];
+
+  let sql = `
+    SELECT id
+
+    FROM academia_plan
+
+    WHERE academia_id = ?
+      AND plan_id = ?
+  `;
+
+  if (excludeId !== undefined) {
+    sql += `
+      AND id <> ?
+    `;
+
+    values.push(excludeId);
+  }
+
+  sql += `
+    LIMIT 1
+  `;
+
+  const [rows]: any = await db.query(sql, values);
 
   return Array.isArray(rows) && rows.length > 0;
 }
 
 /* =========================================================
-   Manejo común de errores
+   REGLAS DEL PLAN
+========================================================= */
+
+async function getPlanReglas(planId: number) {
+  const [rows]: any = await db.query(
+    `
+        SELECT
+          pr.id,
+          pr.plan_id,
+          pr.tipo_pago_id,
+
+          tp.nombre
+            AS tipo_pago_nombre,
+
+          pr.tipo_beneficio,
+          pr.valor,
+          pr.estado_id,
+          pr.created_at,
+          pr.updated_at
+
+        FROM plan_reglas pr
+
+        LEFT JOIN tipo_pago tp
+          ON tp.id =
+             pr.tipo_pago_id
+
+        WHERE pr.plan_id = ?
+
+        ORDER BY
+          pr.id ASC
+      `,
+    [planId]
+  );
+
+  return rows ?? [];
+}
+
+/* =========================================================
+   DEPENDENCIAS
+========================================================= */
+
+/**
+ * Si una academia ya utilizó el plan para:
+ *
+ * - asignarlo a un jugador
+ * - registrar un pago
+ *
+ * no permitimos transformar esa misma relación
+ * academia_plan hacia otro plan global.
+ *
+ * Desactivar la relación sigue siendo posible
+ * modificando estado_id.
+ */
+
+async function relationHasDependencies(
+  academiaId: number,
+  planId: number
+): Promise<{
+  used: boolean;
+  source: string | null;
+}> {
+  /* -------------------------------------------------------
+     PLAN ASIGNADO A JUGADOR
+  ------------------------------------------------------- */
+
+  const [jugadores]: any = await db.query(
+    `
+        SELECT id
+
+        FROM jugador_plan_catalogo
+
+        WHERE academia_id = ?
+          AND plan_id = ?
+
+        LIMIT 1
+      `,
+    [academiaId, planId]
+  );
+
+  if (jugadores?.length) {
+    return {
+      used: true,
+      source: "jugador_plan_catalogo",
+    };
+  }
+
+  /* -------------------------------------------------------
+     PLAN REGISTRADO EN PAGOS
+  ------------------------------------------------------- */
+
+  const [pagos]: any = await db.query(
+    `
+        SELECT id
+
+        FROM pagos_jugador
+
+        WHERE academia_id = ?
+          AND plan_catalogo_id = ?
+
+        LIMIT 1
+      `,
+    [academiaId, planId]
+  );
+
+  if (pagos?.length) {
+    return {
+      used: true,
+      source: "pagos_jugador",
+    };
+  }
+
+  return {
+    used: false,
+    source: null,
+  };
+}
+
+/* =========================================================
+   ERRORES DE SCOPE
 ========================================================= */
 
 function scopeError(reply: FastifyReply, err: any) {
@@ -200,6 +356,7 @@ function scopeError(reply: FastifyReply, err: any) {
 
     return reply.code(status).send({
       ok: false,
+
       message: err?.message || "No fue posible determinar la academia efectiva",
     });
   }
@@ -208,20 +365,25 @@ function scopeError(reply: FastifyReply, err: any) {
 }
 
 /* =========================================================
-   Router
+   ERRORES DE NEGOCIO
+========================================================= */
+
+function isBusinessValidationError(err: any) {
+  return ["El plan no existe en el catálogo global"].includes(String(err?.message ?? ""));
+}
+
+/* =========================================================
+   ROUTER
 ========================================================= */
 
 export default async function planes(app: FastifyInstance) {
   /*
-   * Lectura:
-   * Admin, Superadmin.
+   * Seguridad conservada exactamente
+   * según router original.
    */
+
   const canRead = [requireAuth, requireRoles([1, 3])];
 
-  /*
-   * Escritura:
-   * Admin, Superadmin.
-   */
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
   /* =======================================================
@@ -240,7 +402,7 @@ export default async function planes(app: FastifyInstance) {
         reply.header("Cache-Control", "no-store");
 
         return reply.send({
-          module: "planes_academia",
+          module: "academia_plan",
 
           status: "ready",
 
@@ -259,6 +421,7 @@ export default async function planes(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
+
           message: "Error en módulo de planes",
         });
       }
@@ -267,6 +430,7 @@ export default async function planes(app: FastifyInstance) {
 
   /* =======================================================
      GET /
+     PLANES HABILITADOS PARA LA ACADEMIA
   ======================================================= */
 
   app.get(
@@ -280,32 +444,60 @@ export default async function planes(app: FastifyInstance) {
 
         const [rows]: any = await db.query(
           `
-            SELECT
-              id,
-              academia_id,
-              nombre,
-              descripcion,
-              estado_id,
-              created_at,
-              updated_at
-            FROM planes_academia
-            WHERE academia_id = ?
-            ORDER BY
-              estado_id ASC,
-              nombre ASC,
-              id ASC
+              SELECT
+                ap.id,
+                ap.academia_id,
+                ap.plan_id,
+                ap.estado_id,
+
+                ap.created_at,
+                ap.updated_at,
+
+                pc.nombre,
+                pc.descripcion,
+
+                pc.estado_id
+                  AS catalogo_estado_id
+
+              FROM academia_plan ap
+
+              INNER JOIN planes_catalogo pc
+                ON pc.id =
+                   ap.plan_id
+
+              WHERE ap.academia_id = ?
+
+              ORDER BY
+                ap.estado_id ASC,
+                pc.nombre ASC,
+                pc.id ASC
             `,
           [academiaId]
         );
+
+        const items: any[] = [];
+
+        for (const row of rows ?? []) {
+          const item = normalize(row);
+
+          const reglas = await getPlanReglas(item.plan_id);
+
+          items.push({
+            ...item,
+            reglas,
+          });
+        }
 
         reply.header("Cache-Control", "no-store");
 
         return reply.send({
           ok: true,
 
-          count: rows?.length ?? 0,
+          academia_id: academiaId,
 
-          items: (rows ?? []).map(normalize),
+          count: items.length,
+
+          items,
         });
       } catch (err: any) {
         const handled = scopeError(reply, err);
@@ -328,7 +520,84 @@ export default async function planes(app: FastifyInstance) {
   );
 
   /* =======================================================
+   GET /catalogo
+   CATÁLOGO GLOBAL DE PLANES
+======================================================= */
+
+  app.get(
+    "/catalogo",
+    {
+      preHandler: canRead,
+    },
+    async (_req: FastifyRequest, reply: FastifyReply) => {
+      try {
+        const [rows]: any = await db.query(
+          `
+            SELECT
+              pc.id,
+              pc.nombre,
+              pc.descripcion,
+              pc.estado_id,
+              pc.created_at,
+              pc.updated_at
+
+            FROM planes_catalogo pc
+
+            ORDER BY
+              pc.estado_id ASC,
+              pc.nombre ASC,
+              pc.id ASC
+          `
+        );
+
+        const items: any[] = [];
+
+        for (const row of rows ?? []) {
+          const reglas = await getPlanReglas(Number(row.id));
+
+          items.push({
+            id: Number(row.id),
+
+            nombre: String(row.nombre ?? ""),
+
+            descripcion: row.descripcion == null ? null : String(row.descripcion),
+
+            estado_id: Number(row.estado_id),
+
+            created_at: row.created_at ?? null,
+
+            updated_at: row.updated_at ?? null,
+
+            reglas,
+          });
+        }
+
+        reply.header("Cache-Control", "no-store");
+
+        return reply.send({
+          ok: true,
+
+          count: items.length,
+
+          items,
+        });
+      } catch (err: any) {
+        reply.header("Cache-Control", "no-store");
+
+        return reply.code(500).send({
+          ok: false,
+
+          message: "Error al listar catálogo global de planes",
+
+          detail: err?.message,
+        });
+      }
+    }
+  );
+
+  /* =======================================================
      GET /:id
+     RELACIÓN ACADEMIA_PLAN
   ======================================================= */
 
   app.get(
@@ -344,6 +613,7 @@ export default async function planes(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
+
           message: "ID inválido",
         });
       }
@@ -353,37 +623,29 @@ export default async function planes(app: FastifyInstance) {
 
         const id = parsed.data.id;
 
-        const [rows]: any = await db.query(
-          `
-            SELECT
-              id,
-              academia_id,
-              nombre,
-              descripcion,
-              estado_id,
-              created_at,
-              updated_at
-            FROM planes_academia
-            WHERE id = ?
-              AND academia_id = ?
-            LIMIT 1
-            `,
-          [id, academiaId]
-        );
+        const row = await getRelacion(academiaId, id);
 
         reply.header("Cache-Control", "no-store");
 
-        if (!rows?.length) {
+        if (!row) {
           return reply.code(404).send({
             ok: false,
+
             message: "Plan no encontrado",
           });
         }
 
+        const item = normalize(row);
+
+        const reglas = await getPlanReglas(item.plan_id);
+
         return reply.send({
           ok: true,
 
-          item: normalize(rows[0]),
+          item: {
+            ...item,
+            reglas,
+          },
         });
       } catch (err: any) {
         const handled = scopeError(reply, err);
@@ -407,6 +669,7 @@ export default async function planes(app: FastifyInstance) {
 
   /* =======================================================
      POST /
+     HABILITAR PLAN GLOBAL EN ACADEMIA
   ======================================================= */
 
   app.post(
@@ -419,23 +682,20 @@ export default async function planes(app: FastifyInstance) {
         const academiaId = resolveAcademiaId(req);
 
         /*
-         * CreateSchema es strict().
+         * Schema strict().
          *
-         * Si frontend intenta mandar:
-         *
-         * academia_id
-         *
-         * el payload será rechazado.
+         * academia_id nunca se acepta
+         * desde el body.
          */
         const body = CreateSchema.parse(req.body);
 
-        const nombre = body.nombre.trim();
-
-        const descripcion = normalizeDescripcion(body.descripcion);
+        const planId = Number(body.plan_id);
 
         const estadoId = Number(body.estado_id);
 
-        const duplicate = await existsByNombre(academiaId, nombre);
+        await validatePlanGlobal(planId);
+
+        const duplicate = await existsRelation(academiaId, planId);
 
         if (duplicate) {
           reply.header("Cache-Control", "no-store");
@@ -443,70 +703,60 @@ export default async function planes(app: FastifyInstance) {
           return reply.code(409).send({
             ok: false,
 
-            message: "Ya existe un plan con ese nombre en esta academia",
+            message: "Este plan ya se encuentra asociado a la academia",
           });
         }
 
         const [result]: any = await db.query(
           `
-            INSERT INTO planes_academia
-            (
-              academia_id,
-              nombre,
-              descripcion,
-              estado_id
-            )
-            VALUES (?, ?, ?, ?, ?)
+              INSERT INTO academia_plan (
+                academia_id,
+                plan_id,
+                estado_id
+              )
+
+              VALUES (?, ?, ?)
             `,
-          [academiaId, nombre, descripcion, LEGACY_PERIODICIDAD, estadoId]
+          [academiaId, planId, estadoId]
         );
 
         const insertId = Number(result?.insertId);
 
-        /*
-         * Recuperamos el registro realmente
-         * almacenado para responder con
-         * timestamps y valores definitivos.
-         */
-        const [rows]: any = await db.query(
-          `
-            SELECT
-              id,
-              academia_id,
-              nombre,
-              descripcion,
-              estado_id,
-              created_at,
-              updated_at
-            FROM planes_academia
-            WHERE id = ?
-              AND academia_id = ?
-            LIMIT 1
-            `,
-          [insertId, academiaId]
-        );
+        const row = await getRelacion(academiaId, insertId);
 
         reply.header("Cache-Control", "no-store");
+
+        if (row) {
+          const item = normalize(row);
+
+          const reglas = await getPlanReglas(item.plan_id);
+
+          return reply.code(201).send({
+            ok: true,
+
+            id: insertId,
+
+            item: {
+              ...item,
+              reglas,
+            },
+          });
+        }
 
         return reply.code(201).send({
           ok: true,
 
           id: insertId,
 
-          item: rows?.length
-            ? normalize(rows[0])
-            : {
-                id: insertId,
+          item: {
+            id: insertId,
 
-                academia_id: academiaId,
+            academia_id: academiaId,
 
-                nombre,
+            plan_id: planId,
 
-                descripcion,
-
-  
-                estado_id: estadoId,
-              },
+            estado_id: estadoId,
+          },
         });
       } catch (err: any) {
         reply.header("Cache-Control", "no-store");
@@ -531,7 +781,7 @@ export default async function planes(app: FastifyInstance) {
           return reply.code(409).send({
             ok: false,
 
-            message: "Ya existe un plan con ese nombre en esta academia",
+            message: "Este plan ya se encuentra asociado a la academia",
           });
         }
 
@@ -539,14 +789,22 @@ export default async function planes(app: FastifyInstance) {
           return reply.code(409).send({
             ok: false,
 
-            message: "La academia o alguno de los datos relacionados no existe",
+            message: "La academia o el plan indicado no existe",
+          });
+        }
+
+        if (isBusinessValidationError(err)) {
+          return reply.code(400).send({
+            ok: false,
+
+            message: err.message,
           });
         }
 
         return reply.code(500).send({
           ok: false,
 
-          message: "Error al crear plan",
+          message: "Error al asociar plan con academia",
 
           detail: err?.message,
         });
@@ -556,6 +814,7 @@ export default async function planes(app: FastifyInstance) {
 
   /* =======================================================
      PUT /:id
+     REEMPLAZO DE RELACIÓN
   ======================================================= */
 
   app.put(
@@ -581,9 +840,9 @@ export default async function planes(app: FastifyInstance) {
 
         const id = parsedId.data.id;
 
-        const exists = await existsById(academiaId, id);
+        const current = await getRelacion(academiaId, id);
 
-        if (!exists) {
+        if (!current) {
           reply.header("Cache-Control", "no-store");
 
           return reply.code(404).send({
@@ -595,13 +854,37 @@ export default async function planes(app: FastifyInstance) {
 
         const body = PutSchema.parse(req.body);
 
-        const nombre = body.nombre.trim();
-
-        const descripcion = normalizeDescripcion(body.descripcion);
+        const planId = Number(body.plan_id);
 
         const estadoId = Number(body.estado_id);
 
-        const duplicate = await existsByNombre(academiaId, nombre, id);
+        const changingPlan = planId !== Number(current.plan_id);
+
+        /*
+         * Si el plan ya fue utilizado,
+         * no permitimos transformar la relación
+         * hacia otro plan del catálogo.
+         *
+         * Cambiar únicamente estado_id sí es válido.
+         */
+        if (changingPlan) {
+          const dependencies = await relationHasDependencies(academiaId, Number(current.plan_id));
+
+          if (dependencies.used) {
+            reply.header("Cache-Control", "no-store");
+
+            return reply.code(409).send({
+              ok: false,
+
+              message:
+                "La asociación actual está siendo utilizada y no puede cambiarse a otro plan. Puede desactivarse mediante estado_id",
+            });
+          }
+        }
+
+        await validatePlanGlobal(planId);
+
+        const duplicate = await existsRelation(academiaId, planId, id);
 
         if (duplicate) {
           reply.header("Cache-Control", "no-store");
@@ -609,22 +892,24 @@ export default async function planes(app: FastifyInstance) {
           return reply.code(409).send({
             ok: false,
 
-            message: "Ya existe otro plan con ese nombre en esta academia",
+            message: "Ya existe otra asociación de esta academia con ese plan",
           });
         }
 
         const [result]: any = await db.query(
           `
-            UPDATE planes_academia
-            SET
-              nombre = ?,
-              descripcion = ?,
-              estado_id = ?
-            WHERE id = ?
-              AND academia_id = ?
-            LIMIT 1
+              UPDATE academia_plan
+
+              SET
+                plan_id = ?,
+                estado_id = ?
+
+              WHERE id = ?
+                AND academia_id = ?
+
+              LIMIT 1
             `,
-          [nombre, descripcion, estadoId, id, academiaId]
+          [planId, estadoId, id, academiaId]
         );
 
         reply.header("Cache-Control", "no-store");
@@ -637,36 +922,35 @@ export default async function planes(app: FastifyInstance) {
           });
         }
 
-        const [rows]: any = await db.query(
-          `
-            SELECT
-              id,
-              academia_id,
-              nombre,
-              descripcion,
-              estado_id,
-              created_at,
-              updated_at
-            FROM planes_academia
-            WHERE id = ?
-              AND academia_id = ?
-            LIMIT 1
-            `,
-          [id, academiaId]
-        );
+        const row = await getRelacion(academiaId, id);
+
+        if (row) {
+          const item = normalize(row);
+
+          const reglas = await getPlanReglas(item.plan_id);
+
+          return reply.send({
+            ok: true,
+
+            updated: {
+              ...item,
+              reglas,
+            },
+          });
+        }
 
         return reply.send({
           ok: true,
 
-          updated: rows?.length
-            ? normalize(rows[0])
-            : {
-                id,
-                academia_id: academiaId,
-                nombre,
-                descripcion,
-                  estado_id: estadoId,
-              },
+          updated: {
+            id,
+
+            academia_id: academiaId,
+
+            plan_id: planId,
+
+            estado_id: estadoId,
+          },
         });
       } catch (err: any) {
         reply.header("Cache-Control", "no-store");
@@ -691,7 +975,23 @@ export default async function planes(app: FastifyInstance) {
           return reply.code(409).send({
             ok: false,
 
-            message: "Ya existe otro plan con ese nombre en esta academia",
+            message: "Ya existe otra asociación de esta academia con ese plan",
+          });
+        }
+
+        if (err?.errno === 1452 || err?.code === "ER_NO_REFERENCED_ROW_2") {
+          return reply.code(409).send({
+            ok: false,
+
+            message: "La academia o el plan indicado no existe",
+          });
+        }
+
+        if (isBusinessValidationError(err)) {
+          return reply.code(400).send({
+            ok: false,
+
+            message: err.message,
           });
         }
 
@@ -723,6 +1023,7 @@ export default async function planes(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
+
           message: "ID inválido",
         });
       }
@@ -732,13 +1033,14 @@ export default async function planes(app: FastifyInstance) {
 
         const id = parsedId.data.id;
 
-        const exists = await existsById(academiaId, id);
+        const current = await getRelacion(academiaId, id);
 
-        if (!exists) {
+        if (!current) {
           reply.header("Cache-Control", "no-store");
 
           return reply.code(404).send({
             ok: false,
+
             message: "Plan no encontrado",
           });
         }
@@ -755,8 +1057,29 @@ export default async function planes(app: FastifyInstance) {
           });
         }
 
-        if (body.nombre !== undefined) {
-          const duplicate = await existsByNombre(academiaId, body.nombre, id);
+        const planId = body.plan_id !== undefined ? Number(body.plan_id) : Number(current.plan_id);
+
+        const estadoId = body.estado_id !== undefined ? Number(body.estado_id) : Number(current.estado_id);
+
+        const changingPlan = planId !== Number(current.plan_id);
+
+        if (changingPlan) {
+          const dependencies = await relationHasDependencies(academiaId, Number(current.plan_id));
+
+          if (dependencies.used) {
+            reply.header("Cache-Control", "no-store");
+
+            return reply.code(409).send({
+              ok: false,
+
+              message:
+                "La asociación actual está siendo utilizada y no puede cambiarse a otro plan. Puede desactivarse mediante estado_id",
+            });
+          }
+
+          await validatePlanGlobal(planId);
+
+          const duplicate = await existsRelation(academiaId, planId, id);
 
           if (duplicate) {
             reply.header("Cache-Control", "no-store");
@@ -764,39 +1087,25 @@ export default async function planes(app: FastifyInstance) {
             return reply.code(409).send({
               ok: false,
 
-              message: "Ya existe otro plan con ese nombre en esta academia",
+              message: "Ya existe otra asociación de esta academia con ese plan",
             });
           }
         }
 
-        /*
-         * Construcción dinámica segura.
-         *
-         * Los nombres de columnas NO vienen del usuario.
-         * Sólo añadimos columnas explícitamente permitidas.
-         *
-         * Los valores siguen siendo parametrizados.
-         */
         const fields: string[] = [];
 
         const values: any[] = [];
 
-        if (body.nombre !== undefined) {
-          fields.push("nombre = ?");
+        if (body.plan_id !== undefined) {
+          fields.push("plan_id = ?");
 
-          values.push(body.nombre.trim());
-        }
-
-        if (body.descripcion !== undefined) {
-          fields.push("descripcion = ?");
-
-          values.push(normalizeDescripcion(body.descripcion));
+          values.push(planId);
         }
 
         if (body.estado_id !== undefined) {
           fields.push("estado_id = ?");
 
-          values.push(Number(body.estado_id));
+          values.push(estadoId);
         }
 
         if (fields.length === 0) {
@@ -813,11 +1122,15 @@ export default async function planes(app: FastifyInstance) {
 
         const [result]: any = await db.query(
           `
-            UPDATE planes_academia
-            SET ${fields.join(", ")}
-            WHERE id = ?
-              AND academia_id = ?
-            LIMIT 1
+              UPDATE academia_plan
+
+              SET
+                ${fields.join(", ")}
+
+              WHERE id = ?
+                AND academia_id = ?
+
+              LIMIT 1
             `,
           values
         );
@@ -832,33 +1145,30 @@ export default async function planes(app: FastifyInstance) {
           });
         }
 
-        const [rows]: any = await db.query(
-          `
-            SELECT
-              id,
-              academia_id,
-              nombre,
-              descripcion,
-              estado_id,
-              created_at,
-              updated_at
-            FROM planes_academia
-            WHERE id = ?
-              AND academia_id = ?
-            LIMIT 1
-            `,
-          [id, academiaId]
-        );
+        const row = await getRelacion(academiaId, id);
+
+        if (row) {
+          const item = normalize(row);
+
+          const reglas = await getPlanReglas(item.plan_id);
+
+          return reply.send({
+            ok: true,
+
+            updated: {
+              ...item,
+              reglas,
+            },
+          });
+        }
 
         return reply.send({
           ok: true,
 
-          updated: rows?.length
-            ? normalize(rows[0])
-            : {
-                id,
-                academia_id: academiaId,
-              },
+          updated: {
+            id,
+            academia_id: academiaId,
+          },
         });
       } catch (err: any) {
         reply.header("Cache-Control", "no-store");
@@ -883,7 +1193,23 @@ export default async function planes(app: FastifyInstance) {
           return reply.code(409).send({
             ok: false,
 
-            message: "Ya existe otro plan con ese nombre en esta academia",
+            message: "Ya existe otra asociación de esta academia con ese plan",
+          });
+        }
+
+        if (err?.errno === 1452 || err?.code === "ER_NO_REFERENCED_ROW_2") {
+          return reply.code(409).send({
+            ok: false,
+
+            message: "La academia o el plan indicado no existe",
+          });
+        }
+
+        if (isBusinessValidationError(err)) {
+          return reply.code(400).send({
+            ok: false,
+
+            message: err.message,
           });
         }
 
@@ -915,6 +1241,7 @@ export default async function planes(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
+
           message: "ID inválido",
         });
       }
@@ -924,13 +1251,40 @@ export default async function planes(app: FastifyInstance) {
 
         const id = parsed.data.id;
 
+        const current = await getRelacion(academiaId, id);
+
+        if (!current) {
+          reply.header("Cache-Control", "no-store");
+
+          return reply.code(404).send({
+            ok: false,
+
+            message: "Plan no encontrado",
+          });
+        }
+
+        const dependencies = await relationHasDependencies(academiaId, Number(current.plan_id));
+
+        if (dependencies.used) {
+          reply.header("Cache-Control", "no-store");
+
+          return reply.code(409).send({
+            ok: false,
+
+            message:
+              "El plan está siendo utilizado por jugadores o pagos y no puede eliminarse de la academia. Debe desactivarse mediante estado_id",
+          });
+        }
+
         const [result]: any = await db.query(
           `
-            DELETE
-            FROM planes_academia
-            WHERE id = ?
-              AND academia_id = ?
-            LIMIT 1
+              DELETE
+              FROM academia_plan
+
+              WHERE id = ?
+                AND academia_id = ?
+
+              LIMIT 1
             `,
           [id, academiaId]
         );
@@ -947,6 +1301,7 @@ export default async function planes(app: FastifyInstance) {
 
         return reply.send({
           ok: true,
+
           deleted: id,
         });
       } catch (err: any) {
@@ -958,12 +1313,7 @@ export default async function planes(app: FastifyInstance) {
           return handled;
         }
 
-        /*
-         * Un plan utilizado por tarifas,
-         * jugadores, promociones, etc.
-         * no debe eliminarse físicamente.
-         */
-        if (err?.errno === 1451 || String(err?.code || "").includes("ER_ROW_IS_REFERENCED")) {
+        if (err?.errno === 1451 || String(err?.code ?? "").includes("ER_ROW_IS_REFERENCED")) {
           return reply.code(409).send({
             ok: false,
 

@@ -1,8 +1,11 @@
 // src/routers/academia_tipo_pago.ts
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+
 import { z, ZodError } from "zod";
+
 import { db } from "../db";
+
 import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
 /**
@@ -29,15 +32,17 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
  *
  * Reglas:
  * - tipo_pago_id referencia el catálogo GLOBAL tipo_pago.
- * - La misma academia no puede asociar dos veces el mismo tipo_pago_id.
- * - estado_id = 1 representa asociación habilitada según la política actual.
- * - Deshabilitar una asociación no elimina el tipo_pago global.
- * - No se permite eliminar una asociación utilizada por configuración comercial
- *   o registros operacionales dependientes.
+ * - La misma academia no puede asociar dos veces
+ *   el mismo tipo_pago_id.
+ * - estado_id = 1 representa asociación habilitada.
+ * - Deshabilitar una asociación NO elimina tipo_pago.
+ * - El precio propio de la academia vive en tarifas_academia.
+ * - No se elimina/cambia una relación cuando posee
+ *   configuración tarifaria o historial de pagos asociado.
  */
 
 /* =========================================================
-   Schemas
+   SCHEMAS
 ========================================================= */
 
 const IdParam = z.object({
@@ -47,6 +52,7 @@ const IdParam = z.object({
 const CreateSchema = z
   .object({
     tipo_pago_id: z.coerce.number().int().positive(),
+
     estado_id: z.coerce.number().int().positive().max(255).default(1),
   })
   .strict();
@@ -54,6 +60,7 @@ const CreateSchema = z
 const PutSchema = z
   .object({
     tipo_pago_id: z.coerce.number().int().positive(),
+
     estado_id: z.coerce.number().int().positive().max(255),
   })
   .strict();
@@ -61,6 +68,7 @@ const PutSchema = z
 const PatchSchema = z
   .object({
     tipo_pago_id: z.coerce.number().int().positive().optional(),
+
     estado_id: z.coerce.number().int().positive().max(255).optional(),
   })
   .strict();
@@ -68,80 +76,131 @@ const PatchSchema = z
 const QuerySchema = z
   .object({
     tipo_pago_id: z.coerce.number().int().positive().optional(),
+
     estado_id: z.coerce.number().int().positive().max(255).optional(),
+
     limit: z.coerce.number().int().min(1).max(500).default(200),
   })
   .strict();
 
 /* =========================================================
-   Helpers
+   HELPERS
 ========================================================= */
 
-function zodDetail(err: ZodError) {
+function zodDetail(err: ZodError): string {
   return err.issues.map((issue) => `${issue.path.join(".") || "field"}: ${issue.message}`).join("; ");
 }
 
-function resolveAcademiaId(req: FastifyRequest) {
+/* =========================================================
+   ACADEMIA EFECTIVA
+========================================================= */
+
+function resolveAcademiaId(req: FastifyRequest): number {
   const academiaId = Number(getEffectiveAcademiaId(req));
 
   if (!Number.isInteger(academiaId) || academiaId <= 0) {
     const err: any = new Error("Academia efectiva inválida");
+
     err.statusCode = 403;
+
     throw err;
   }
 
   return academiaId;
 }
 
+/* =========================================================
+   NORMALIZACIÓN
+========================================================= */
+
 function normalize(row: any) {
   return {
     id: Number(row.id),
+
     academia_id: Number(row.academia_id),
+
     tipo_pago_id: Number(row.tipo_pago_id),
+
     estado_id: Number(row.estado_id),
 
     tipo_pago_nombre: row.tipo_pago_nombre == null ? undefined : String(row.tipo_pago_nombre),
 
     tipo_pago_descripcion: row.tipo_pago_descripcion == null ? null : String(row.tipo_pago_descripcion),
+
+    tarifa_id: row.tarifa_id == null ? null : Number(row.tarifa_id),
+
+    monto: row.monto == null ? null : Number(row.monto),
+
+    tarifa_estado_id: row.tarifa_estado_id == null ? null : Number(row.tarifa_estado_id),
   };
 }
+
+/* =========================================================
+   OBTENER RELACIÓN
+========================================================= */
 
 async function getRelacion(academiaId: number, id: number) {
   const [rows]: any = await db.query(
     `
-      SELECT
-        atp.id,
-        atp.academia_id,
-        atp.tipo_pago_id,
-        atp.estado_id,
+        SELECT
+          atp.id,
+          atp.academia_id,
+          atp.tipo_pago_id,
+          atp.estado_id,
 
-        tp.nombre AS tipo_pago_nombre,
-        tp.descripcion AS tipo_pago_descripcion
+          tp.nombre
+            AS tipo_pago_nombre,
 
-      FROM academia_tipo_pago atp
+          tp.descripcion
+            AS tipo_pago_descripcion,
 
-      INNER JOIN tipo_pago tp
-        ON tp.id = atp.tipo_pago_id
+          ta.id
+            AS tarifa_id,
 
-      WHERE atp.id = ?
-        AND atp.academia_id = ?
+          ta.monto,
 
-      LIMIT 1
-    `,
+          ta.estado_id
+            AS tarifa_estado_id
+
+        FROM academia_tipo_pago atp
+
+        INNER JOIN tipo_pago tp
+          ON tp.id =
+             atp.tipo_pago_id
+
+        LEFT JOIN tarifas_academia ta
+          ON ta.academia_id =
+             atp.academia_id
+
+         AND ta.tipo_pago_id =
+             atp.tipo_pago_id
+
+        WHERE atp.id = ?
+          AND atp.academia_id = ?
+
+        LIMIT 1
+      `,
     [id, academiaId]
   );
 
   return rows?.length ? rows[0] : null;
 }
 
+/* =========================================================
+   VALIDAR CATÁLOGO GLOBAL
+========================================================= */
+
 async function validateTipoPagoGlobal(tipoPagoId: number) {
   const [rows]: any = await db.query(
     `
-      SELECT id
-      FROM tipo_pago
-      WHERE id = ?
-      LIMIT 1
-    `,
+        SELECT
+          id
+        FROM tipo_pago
+
+        WHERE id = ?
+
+        LIMIT 1
+      `,
     [tipoPagoId]
   );
 
@@ -150,95 +209,116 @@ async function validateTipoPagoGlobal(tipoPagoId: number) {
   }
 }
 
+/* =========================================================
+   DUPLICIDAD DE RELACIÓN
+========================================================= */
+
 async function existsRelation(academiaId: number, tipoPagoId: number, excludeId?: number) {
   const values: any[] = [academiaId, tipoPagoId];
 
   let sql = `
     SELECT id
     FROM academia_tipo_pago
+
     WHERE academia_id = ?
       AND tipo_pago_id = ?
   `;
 
   if (excludeId) {
-    sql += ` AND id <> ?`;
+    sql += `
+      AND id <> ?
+    `;
+
     values.push(excludeId);
   }
 
-  sql += ` LIMIT 1`;
+  sql += `
+    LIMIT 1
+  `;
 
   const [rows]: any = await db.query(sql, values);
 
   return Array.isArray(rows) && rows.length > 0;
 }
 
+/* =========================================================
+   DEPENDENCIAS
+========================================================= */
+
 /**
- * Protege relaciones que ya están utilizadas.
+ * Revisa exclusivamente dependencias pertenecientes
+ * al modelo financiero actual:
  *
- * Se revisan únicamente tablas que forman parte de la arquitectura
- * comercial acordada para WELI.
+ * academia_tipo_pago
+ *       │
+ *       ├── tarifas_academia
+ *       │
+ *       └── pago_detalle
+ *               │
+ *               └── pagos_jugador
+ *
+ * La relación no debe cambiar de tipo_pago_id ni eliminarse
+ * cuando ya posee configuración tarifaria o historial.
  */
-async function relationHasDependencies(academiaId: number, tipoPagoId: number) {
+
+async function relationHasDependencies(
+  academiaId: number,
+  tipoPagoId: number
+): Promise<{
+  used: boolean;
+  source: string | null;
+}> {
+  /* -------------------------------------------------------
+     TARIFA DE LA ACADEMIA
+  ------------------------------------------------------- */
+
   const [tarifas]: any = await db.query(
     `
-      SELECT id
-      FROM plan_tarifas
-      WHERE academia_id = ?
-        AND tipo_pago_id = ?
-      LIMIT 1
-    `,
+        SELECT id
+
+        FROM tarifas_academia
+
+        WHERE academia_id = ?
+          AND tipo_pago_id = ?
+
+        LIMIT 1
+      `,
     [academiaId, tipoPagoId]
   );
 
   if (tarifas?.length) {
     return {
       used: true,
-      source: "plan_tarifas",
+      source: "tarifas_academia",
     };
   }
 
-  const [promociones]: any = await db.query(
-    `
-      SELECT id
-      FROM promocion_tipo_pago
-      WHERE academia_id = ?
-        AND tipo_pago_id = ?
-      LIMIT 1
-    `,
-    [academiaId, tipoPagoId]
-  );
+  /* -------------------------------------------------------
+     HISTORIAL EN PAGO_DETALLE
+  ------------------------------------------------------- */
 
-  if (promociones?.length) {
-    return {
-      used: true,
-      source: "promocion_tipo_pago",
-    };
-  }
-
-  /*
-   * pagos_jugador no posee academia_id.
-   * El scope se obtiene mediante jugadores.
-   */
   const [pagos]: any = await db.query(
     `
-      SELECT p.id
-      FROM pagos_jugador p
+        SELECT
+          pd.id
 
-      INNER JOIN jugadores j
-        ON j.rut_jugador = p.jugador_rut
+        FROM pago_detalle pd
 
-      WHERE j.academia_id = ?
-        AND p.tipo_pago_id = ?
+        INNER JOIN pagos_jugador p
+          ON p.id = pd.pago_id
 
-      LIMIT 1
-    `,
+        WHERE p.academia_id = ?
+          AND pd.tipo_pago_id = ?
+
+        LIMIT 1
+      `,
     [academiaId, tipoPagoId]
   );
 
   if (pagos?.length) {
     return {
       used: true,
-      source: "pagos_jugador",
+      source: "pago_detalle",
     };
   }
 
@@ -248,6 +328,10 @@ async function relationHasDependencies(academiaId: number, tipoPagoId: number) {
   };
 }
 
+/* =========================================================
+   ERRORES DE SCOPE
+========================================================= */
+
 function handleScopeError(reply: FastifyReply, err: any) {
   const status = Number(err?.statusCode ?? 0);
 
@@ -256,6 +340,7 @@ function handleScopeError(reply: FastifyReply, err: any) {
 
     return reply.code(status).send({
       ok: false,
+
       message: err?.message ?? "No fue posible determinar la academia efectiva",
     });
   }
@@ -263,15 +348,32 @@ function handleScopeError(reply: FastifyReply, err: any) {
   return null;
 }
 
+/* =========================================================
+   ERRORES DE NEGOCIO
+========================================================= */
+
 function isBusinessValidationError(err: any) {
   return ["El tipo de pago no existe en el catálogo global"].includes(String(err?.message ?? ""));
 }
 
 /* =========================================================
-   Router
+   ROUTER
 ========================================================= */
 
 export default async function academia_tipo_pago(app: FastifyInstance) {
+  /*
+   * Admin:
+   * - lectura y administración
+   *   dentro de su academia.
+   *
+   * Superadmin:
+   * - lectura y administración
+   *   de la academia seleccionada.
+   *
+   * Staff:
+   * - sin acceso.
+   */
+
   const canRead = [requireAuth, requireRoles([1, 3])];
 
   const canWrite = [requireAuth, requireRoles([1, 3])];
@@ -293,8 +395,11 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
         return reply.send({
           module: "academia_tipo_pago",
+
           status: "ready",
+
           academia_id: academiaId,
+
           timestamp: new Date().toISOString(),
         });
       } catch (err: any) {
@@ -308,6 +413,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
+
           message: "Error en módulo academia_tipo_pago",
         });
       }
@@ -326,6 +432,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
     async (req: FastifyRequest, reply: FastifyReply) => {
       try {
         const academiaId = resolveAcademiaId(req);
+
         const query = QuerySchema.parse(req.query);
 
         const where: string[] = ["atp.academia_id = ?"];
@@ -334,11 +441,13 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
         if (query.tipo_pago_id !== undefined) {
           where.push("atp.tipo_pago_id = ?");
+
           values.push(query.tipo_pago_id);
         }
 
         if (query.estado_id !== undefined) {
           where.push("atp.estado_id = ?");
+
           values.push(query.estado_id);
         }
 
@@ -346,28 +455,48 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
         const [rows]: any = await db.query(
           `
-            SELECT
-              atp.id,
-              atp.academia_id,
-              atp.tipo_pago_id,
-              atp.estado_id,
+              SELECT
+                atp.id,
+                atp.academia_id,
+                atp.tipo_pago_id,
+                atp.estado_id,
 
-              tp.nombre AS tipo_pago_nombre,
-              tp.descripcion AS tipo_pago_descripcion
+                tp.nombre
+                  AS tipo_pago_nombre,
 
-            FROM academia_tipo_pago atp
+                tp.descripcion
+                  AS tipo_pago_descripcion,
 
-            INNER JOIN tipo_pago tp
-              ON tp.id = atp.tipo_pago_id
+                ta.id
+                  AS tarifa_id,
 
-            WHERE ${where.join(" AND ")}
+                ta.monto,
 
-            ORDER BY
-              tp.nombre ASC,
-              atp.id ASC
+                ta.estado_id
+                  AS tarifa_estado_id
 
-            LIMIT ?
-          `,
+              FROM academia_tipo_pago atp
+
+              INNER JOIN tipo_pago tp
+                ON tp.id =
+                   atp.tipo_pago_id
+
+              LEFT JOIN tarifas_academia ta
+                ON ta.academia_id =
+                   atp.academia_id
+
+               AND ta.tipo_pago_id =
+                   atp.tipo_pago_id
+
+              WHERE
+                ${where.join(" AND ")}
+
+              ORDER BY
+                tp.nombre ASC,
+                atp.id ASC
+
+              LIMIT ?
+            `,
           values
         );
 
@@ -375,8 +504,11 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
         return reply.send({
           ok: true,
+
           academia_id: academiaId,
+
           count: rows?.length ?? 0,
+
           items: (rows ?? []).map(normalize),
         });
       } catch (err: any) {
@@ -385,7 +517,9 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (err instanceof ZodError) {
           return reply.code(400).send({
             ok: false,
+
             message: "Parámetros inválidos",
+
             detail: zodDetail(err),
           });
         }
@@ -398,6 +532,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
+
           message: "Error al listar tipos de pago de la academia",
         });
       }
@@ -435,6 +570,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (!row) {
           return reply.code(404).send({
             ok: false,
+
             message: "Relación academia-tipo de pago no encontrada",
           });
         }
@@ -454,6 +590,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
+
           message: "Error al obtener tipo de pago de la academia",
         });
       }
@@ -472,6 +609,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
     async (req: FastifyRequest, reply: FastifyReply) => {
       try {
         const academiaId = resolveAcademiaId(req);
+
         const body = CreateSchema.parse(req.body);
 
         await validateTipoPagoGlobal(body.tipo_pago_id);
@@ -483,20 +621,20 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
           return reply.code(409).send({
             ok: false,
+
             message: "Este tipo de pago ya se encuentra asociado a la academia",
           });
         }
 
         const [result]: any = await db.query(
           `
-            INSERT INTO academia_tipo_pago
-            (
-              academia_id,
-              tipo_pago_id,
-              estado_id
-            )
-            VALUES (?, ?, ?)
-          `,
+              INSERT INTO academia_tipo_pago (
+                academia_id,
+                tipo_pago_id,
+                estado_id
+              )
+              VALUES (?, ?, ?)
+            `,
           [academiaId, body.tipo_pago_id, body.estado_id]
         );
 
@@ -508,15 +646,25 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
         return reply.code(201).send({
           ok: true,
+
           id: insertId,
 
           item: row
             ? normalize(row)
             : {
                 id: insertId,
+
                 academia_id: academiaId,
+
                 tipo_pago_id: body.tipo_pago_id,
+
                 estado_id: body.estado_id,
+
+                tarifa_id: null,
+
+                monto: null,
+
+                tarifa_estado_id: null,
               },
         });
       } catch (err: any) {
@@ -525,7 +673,9 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (err instanceof ZodError) {
           return reply.code(400).send({
             ok: false,
+
             message: "Payload inválido",
+
             detail: zodDetail(err),
           });
         }
@@ -539,6 +689,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
           return reply.code(409).send({
             ok: false,
+
             message: "Este tipo de pago ya se encuentra asociado a la academia",
           });
         }
@@ -546,6 +697,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (err?.errno === 1452 || err?.code === "ER_NO_REFERENCED_ROW_2") {
           return reply.code(409).send({
             ok: false,
+
             message: "La academia o el tipo de pago indicado no existe",
           });
         }
@@ -559,6 +711,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
+
           message: "Error al asociar tipo de pago con academia",
         });
       }
@@ -588,6 +741,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
       try {
         const academiaId = resolveAcademiaId(req);
+
         const id = parsed.data.id;
 
         const current = await getRelacion(academiaId, id);
@@ -597,14 +751,22 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
           return reply.code(404).send({
             ok: false,
+
             message: "Relación academia-tipo de pago no encontrada",
           });
         }
 
         const body = PutSchema.parse(req.body);
 
-        const changingTipoPago = body.tipo_pago_id !== Number(current.tipo_pago_id);
+        const changingTipoPago = Number(body.tipo_pago_id) !== Number(current.tipo_pago_id);
 
+        /*
+         * Cambiar tipo_pago_id significa cambiar
+         * la identidad conceptual de la relación.
+         *
+         * Si ya existe tarifa o historial,
+         * eso queda bloqueado.
+         */
         if (changingTipoPago) {
           const dependencies = await relationHasDependencies(academiaId, Number(current.tipo_pago_id));
 
@@ -613,7 +775,8 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
             return reply.code(409).send({
               ok: false,
-              message: "La asociación actual está siendo utilizada y no puede cambiar de tipo de pago",
+
+              message: "La asociación actual posee tarifa o historial financiero y no puede cambiar de tipo de pago",
             });
           }
         }
@@ -627,20 +790,24 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
           return reply.code(409).send({
             ok: false,
+
             message: "Ya existe otra asociación de esta academia con ese tipo de pago",
           });
         }
 
         const [result]: any = await db.query(
           `
-            UPDATE academia_tipo_pago
-            SET
-              tipo_pago_id = ?,
-              estado_id = ?
-            WHERE id = ?
-              AND academia_id = ?
-            LIMIT 1
-          `,
+              UPDATE academia_tipo_pago
+
+              SET
+                tipo_pago_id = ?,
+                estado_id = ?
+
+              WHERE id = ?
+                AND academia_id = ?
+
+              LIMIT 1
+            `,
           [body.tipo_pago_id, body.estado_id, id, academiaId]
         );
 
@@ -649,6 +816,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (Number(result?.affectedRows ?? 0) === 0) {
           return reply.code(404).send({
             ok: false,
+
             message: "Relación academia-tipo de pago no encontrada",
           });
         }
@@ -662,8 +830,11 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
             ? normalize(updated)
             : {
                 id,
+
                 academia_id: academiaId,
+
                 tipo_pago_id: body.tipo_pago_id,
+
                 estado_id: body.estado_id,
               },
         });
@@ -673,7 +844,9 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (err instanceof ZodError) {
           return reply.code(400).send({
             ok: false,
+
             message: "Payload inválido",
+
             detail: zodDetail(err),
           });
         }
@@ -687,6 +860,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
           return reply.code(409).send({
             ok: false,
+
             message: "Ya existe otra asociación de esta academia con ese tipo de pago",
           });
         }
@@ -694,6 +868,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (err?.errno === 1452 || err?.code === "ER_NO_REFERENCED_ROW_2") {
           return reply.code(409).send({
             ok: false,
+
             message: "La academia o el tipo de pago indicado no existe",
           });
         }
@@ -707,6 +882,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
+
           message: "Error al actualizar tipo de pago de academia",
         });
       }
@@ -736,6 +912,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
       try {
         const academiaId = resolveAcademiaId(req);
+
         const id = parsed.data.id;
 
         const current = await getRelacion(academiaId, id);
@@ -745,6 +922,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
           return reply.code(404).send({
             ok: false,
+
             message: "Relación academia-tipo de pago no encontrada",
           });
         }
@@ -756,6 +934,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
           return reply.code(400).send({
             ok: false,
+
             message: "No hay campos para actualizar",
           });
         }
@@ -766,7 +945,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
           estado_id: body.estado_id ?? Number(current.estado_id),
         };
 
-        const changingTipoPago = merged.tipo_pago_id !== Number(current.tipo_pago_id);
+        const changingTipoPago = Number(merged.tipo_pago_id) !== Number(current.tipo_pago_id);
 
         if (changingTipoPago) {
           const dependencies = await relationHasDependencies(academiaId, Number(current.tipo_pago_id));
@@ -776,7 +955,8 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
             return reply.code(409).send({
               ok: false,
-              message: "La asociación actual está siendo utilizada y no puede cambiar de tipo de pago",
+
+              message: "La asociación actual posee tarifa o historial financiero y no puede cambiar de tipo de pago",
             });
           }
         }
@@ -790,20 +970,24 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
           return reply.code(409).send({
             ok: false,
+
             message: "Ya existe otra asociación de esta academia con ese tipo de pago",
           });
         }
 
         const [result]: any = await db.query(
           `
-            UPDATE academia_tipo_pago
-            SET
-              tipo_pago_id = ?,
-              estado_id = ?
-            WHERE id = ?
-              AND academia_id = ?
-            LIMIT 1
-          `,
+              UPDATE academia_tipo_pago
+
+              SET
+                tipo_pago_id = ?,
+                estado_id = ?
+
+              WHERE id = ?
+                AND academia_id = ?
+
+              LIMIT 1
+            `,
           [merged.tipo_pago_id, merged.estado_id, id, academiaId]
         );
 
@@ -812,6 +996,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (Number(result?.affectedRows ?? 0) === 0) {
           return reply.code(404).send({
             ok: false,
+
             message: "Relación academia-tipo de pago no encontrada",
           });
         }
@@ -825,8 +1010,11 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
             ? normalize(updated)
             : {
                 id,
+
                 academia_id: academiaId,
+
                 tipo_pago_id: merged.tipo_pago_id,
+
                 estado_id: merged.estado_id,
               },
         });
@@ -836,7 +1024,9 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (err instanceof ZodError) {
           return reply.code(400).send({
             ok: false,
+
             message: "Payload inválido",
+
             detail: zodDetail(err),
           });
         }
@@ -850,6 +1040,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
           return reply.code(409).send({
             ok: false,
+
             message: "Ya existe otra asociación de esta academia con ese tipo de pago",
           });
         }
@@ -857,6 +1048,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (err?.errno === 1452 || err?.code === "ER_NO_REFERENCED_ROW_2") {
           return reply.code(409).send({
             ok: false,
+
             message: "La academia o el tipo de pago indicado no existe",
           });
         }
@@ -870,6 +1062,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
         return reply.code(500).send({
           ok: false,
+
           message: "Error al actualizar tipo de pago de academia",
         });
       }
@@ -899,6 +1092,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
       try {
         const academiaId = resolveAcademiaId(req);
+
         const id = parsed.data.id;
 
         const current = await getRelacion(academiaId, id);
@@ -908,6 +1102,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
           return reply.code(404).send({
             ok: false,
+
             message: "Relación academia-tipo de pago no encontrada",
           });
         }
@@ -919,18 +1114,22 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
 
           return reply.code(409).send({
             ok: false,
+
             message:
-              "El tipo de pago está siendo utilizado por la academia y no puede eliminarse. Debe desactivarse mediante estado_id",
+              "El tipo de pago posee tarifa o historial financiero asociado y no puede eliminarse. Debe desactivarse mediante estado_id",
           });
         }
 
         const [result]: any = await db.query(
           `
-            DELETE FROM academia_tipo_pago
-            WHERE id = ?
-              AND academia_id = ?
-            LIMIT 1
-          `,
+              DELETE
+              FROM academia_tipo_pago
+
+              WHERE id = ?
+                AND academia_id = ?
+
+              LIMIT 1
+            `,
           [id, academiaId]
         );
 
@@ -939,6 +1138,7 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
         if (Number(result?.affectedRows ?? 0) === 0) {
           return reply.code(404).send({
             ok: false,
+
             message: "Relación academia-tipo de pago no encontrada",
           });
         }
@@ -956,16 +1156,19 @@ export default async function academia_tipo_pago(app: FastifyInstance) {
           return handled;
         }
 
-        if (err?.errno === 1451 || String(err?.code || "").includes("ER_ROW_IS_REFERENCED")) {
+        if (err?.errno === 1451 || String(err?.code ?? "").includes("ER_ROW_IS_REFERENCED")) {
           return reply.code(409).send({
             ok: false,
-            message: "No se puede eliminar la asociación porque está en uso",
+
+            message: "No se puede eliminar la asociación porque posee información relacionada",
+
             detail: err?.sqlMessage ?? err?.message,
           });
         }
 
         return reply.code(500).send({
           ok: false,
+
           message: "Error al eliminar tipo de pago de academia",
         });
       }

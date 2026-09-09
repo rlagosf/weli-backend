@@ -1,7 +1,9 @@
 // src/routers/tipo_pago.ts
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+
 import { z, ZodError } from "zod";
+
 import { db } from "../db";
 import { requireAuth, requireRoles } from "../middlewares/authz";
 
@@ -23,8 +25,10 @@ import { requireAuth, requireRoles } from "../middlewares/authz";
  * Reglas:
  * - tipo_pago NO pertenece directamente a una academia.
  * - tipo_pago NO contiene academia_id.
- * - la habilitación de conceptos por academia corresponde a
- *   academia_tipo_pago.
+ * - la habilitación de conceptos por academia corresponde
+ *   a academia_tipo_pago.
+ * - el valor monetario de cada concepto corresponde
+ *   a tarifas_academia.
  * - el nombre del tipo de pago es único globalmente.
  */
 
@@ -94,15 +98,22 @@ function normalizeDescription(value: unknown): string | null {
 function normalize(row: any) {
   return {
     id: Number(row.id),
+
     nombre: String(row.nombre ?? ""),
+
     descripcion: row.descripcion == null ? null : String(row.descripcion),
+
     estado_id: Number(row.estado_id),
   };
 }
 
-function zodDetail(err: ZodError) {
+function zodDetail(err: ZodError): string {
   return err.issues.map((issue) => `${issue.path.join(".") || "field"}: ${issue.message}`).join("; ");
 }
+
+/* =========================================================
+   DUPLICADOS
+========================================================= */
 
 async function existsByNombre(nombre: string, excludeId?: number): Promise<boolean> {
   const normalized = normalizeName(nombre);
@@ -114,12 +125,16 @@ async function existsByNombre(nombre: string, excludeId?: number): Promise<boole
   if (excludeId !== undefined) {
     const [rows]: any = await db.query(
       `
-        SELECT id
-        FROM tipo_pago
-        WHERE LOWER(TRIM(nombre)) = LOWER(?)
-          AND id <> ?
-        LIMIT 1
-      `,
+          SELECT id
+          FROM tipo_pago
+
+          WHERE LOWER(TRIM(nombre)) =
+                LOWER(?)
+
+            AND id <> ?
+
+          LIMIT 1
+        `,
       [normalized, excludeId]
     );
 
@@ -128,26 +143,42 @@ async function existsByNombre(nombre: string, excludeId?: number): Promise<boole
 
   const [rows]: any = await db.query(
     `
-      SELECT id
-      FROM tipo_pago
-      WHERE LOWER(TRIM(nombre)) = LOWER(?)
-      LIMIT 1
-    `,
+        SELECT id
+        FROM tipo_pago
+
+        WHERE LOWER(TRIM(nombre)) =
+              LOWER(?)
+
+        LIMIT 1
+      `,
     [normalized]
   );
 
   return Array.isArray(rows) && rows.length > 0;
 }
 
+/* =========================================================
+   ERRORES DE BASE DE DATOS
+========================================================= */
+
 function handleDatabaseError(reply: FastifyReply, err: any, operation: string) {
   reply.header("Cache-Control", "no-store");
+
+  /* -------------------------------------------------------
+     DUPLICADO
+  ------------------------------------------------------- */
 
   if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
     return reply.code(409).send({
       ok: false,
+
       message: "Ya existe un tipo de pago con ese nombre",
     });
   }
+
+  /* -------------------------------------------------------
+     REGISTRO REFERENCIADO
+  ------------------------------------------------------- */
 
   if (
     err?.errno === 1451 ||
@@ -156,12 +187,18 @@ function handleDatabaseError(reply: FastifyReply, err: any, operation: string) {
   ) {
     return reply.code(409).send({
       ok: false,
-      message: "No se puede eliminar el tipo de pago porque existen registros asociados",
+
+      message: "No se puede eliminar el tipo de pago porque posee información relacionada",
     });
   }
 
+  /* -------------------------------------------------------
+     ERROR GENERAL
+  ------------------------------------------------------- */
+
   return reply.code(500).send({
     ok: false,
+
     message: `Error al ${operation} tipo de pago`,
   });
 }
@@ -181,6 +218,7 @@ export default async function tipo_pago(app: FastifyInstance) {
    * Staff:
    * - sin acceso.
    */
+
   const canRead = [requireAuth, requireRoles([1, 3])];
 
   const onlySuper = [requireAuth, requireRoles([3])];
@@ -208,7 +246,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
   /* =======================================================
      GET /
-     Catálogo global
+     CATÁLOGO GLOBAL
   ======================================================= */
 
   app.get(
@@ -225,7 +263,9 @@ export default async function tipo_pago(app: FastifyInstance) {
                 nombre,
                 descripcion,
                 estado_id
+
               FROM tipo_pago
+
               ORDER BY
                 nombre ASC,
                 id ASC
@@ -236,7 +276,9 @@ export default async function tipo_pago(app: FastifyInstance) {
 
         return reply.send({
           ok: true,
+
           count: rows?.length ?? 0,
+
           items: (rows ?? []).map(normalize),
         });
       } catch (err: any) {
@@ -247,7 +289,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
   /* =======================================================
      GET /:id
-     Tipo global específico
+     TIPO GLOBAL ESPECÍFICO
   ======================================================= */
 
   app.get(
@@ -277,8 +319,11 @@ export default async function tipo_pago(app: FastifyInstance) {
                 nombre,
                 descripcion,
                 estado_id
+
               FROM tipo_pago
+
               WHERE id = ?
+
               LIMIT 1
             `,
           [id]
@@ -289,6 +334,7 @@ export default async function tipo_pago(app: FastifyInstance) {
         if (!rows?.length) {
           return reply.code(404).send({
             ok: false,
+
             message: "Tipo de pago no encontrado",
           });
         }
@@ -305,7 +351,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
   /* =======================================================
      POST /
-     Crear concepto global
+     CREAR CONCEPTO GLOBAL
   ======================================================= */
 
   app.post(
@@ -330,6 +376,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
           return reply.code(409).send({
             ok: false,
+
             message: "Ya existe un tipo de pago con ese nombre",
           });
         }
@@ -355,8 +402,11 @@ export default async function tipo_pago(app: FastifyInstance) {
                 nombre,
                 descripcion,
                 estado_id
+
               FROM tipo_pago
+
               WHERE id = ?
+
               LIMIT 1
             `,
           [insertId]
@@ -366,13 +416,18 @@ export default async function tipo_pago(app: FastifyInstance) {
 
         return reply.code(201).send({
           ok: true,
+
           id: insertId,
+
           item: rows?.length
             ? normalize(rows[0])
             : {
                 id: insertId,
+
                 nombre,
+
                 descripcion,
+
                 estado_id: estadoId,
               },
         });
@@ -382,7 +437,9 @@ export default async function tipo_pago(app: FastifyInstance) {
         if (err instanceof ZodError) {
           return reply.code(400).send({
             ok: false,
+
             message: "Datos inválidos",
+
             detail: zodDetail(err),
           });
         }
@@ -394,7 +451,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
   /* =======================================================
      PUT /:id
-     Reemplazo completo
+     REEMPLAZO COMPLETO
   ======================================================= */
 
   app.put(
@@ -432,6 +489,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
           return reply.code(409).send({
             ok: false,
+
             message: "Ya existe un tipo de pago con ese nombre",
           });
         }
@@ -439,10 +497,12 @@ export default async function tipo_pago(app: FastifyInstance) {
         const [result]: any = await db.query(
           `
               UPDATE tipo_pago
+
               SET
                 nombre = ?,
                 descripcion = ?,
                 estado_id = ?
+
               WHERE id = ?
             `,
           [nombre, descripcion, estadoId, id]
@@ -453,6 +513,7 @@ export default async function tipo_pago(app: FastifyInstance) {
         if (Number(result?.affectedRows ?? 0) === 0) {
           return reply.code(404).send({
             ok: false,
+
             message: "Tipo de pago no encontrado",
           });
         }
@@ -464,8 +525,11 @@ export default async function tipo_pago(app: FastifyInstance) {
                 nombre,
                 descripcion,
                 estado_id
+
               FROM tipo_pago
+
               WHERE id = ?
+
               LIMIT 1
             `,
           [id]
@@ -473,6 +537,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
         return reply.send({
           ok: true,
+
           updated: rows?.length
             ? normalize(rows[0])
             : {
@@ -488,7 +553,9 @@ export default async function tipo_pago(app: FastifyInstance) {
         if (err instanceof ZodError) {
           return reply.code(400).send({
             ok: false,
+
             message: "Datos inválidos",
+
             detail: zodDetail(err),
           });
         }
@@ -500,7 +567,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
   /* =======================================================
      PATCH /:id
-     Actualización parcial
+     ACTUALIZACIÓN PARCIAL
   ======================================================= */
 
   app.patch(
@@ -530,6 +597,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
           return reply.code(400).send({
             ok: false,
+
             message: "No hay campos para actualizar",
           });
         }
@@ -541,8 +609,11 @@ export default async function tipo_pago(app: FastifyInstance) {
                 nombre,
                 descripcion,
                 estado_id
+
               FROM tipo_pago
+
               WHERE id = ?
+
               LIMIT 1
             `,
           [id]
@@ -553,6 +624,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
           return reply.code(404).send({
             ok: false,
+
             message: "Tipo de pago no encontrado",
           });
         }
@@ -576,6 +648,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
             return reply.code(409).send({
               ok: false,
+
               message: "Ya existe un tipo de pago con ese nombre",
             });
           }
@@ -584,10 +657,12 @@ export default async function tipo_pago(app: FastifyInstance) {
         await db.query(
           `
             UPDATE tipo_pago
+
             SET
               nombre = ?,
               descripcion = ?,
               estado_id = ?
+
             WHERE id = ?
           `,
           [nombre, descripcion, estadoId, id]
@@ -600,8 +675,11 @@ export default async function tipo_pago(app: FastifyInstance) {
                 nombre,
                 descripcion,
                 estado_id
+
               FROM tipo_pago
+
               WHERE id = ?
+
               LIMIT 1
             `,
           [id]
@@ -611,6 +689,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
         return reply.send({
           ok: true,
+
           updated: rows?.length
             ? normalize(rows[0])
             : {
@@ -626,7 +705,9 @@ export default async function tipo_pago(app: FastifyInstance) {
         if (err instanceof ZodError) {
           return reply.code(400).send({
             ok: false,
+
             message: "Datos inválidos",
+
             detail: zodDetail(err),
           });
         }
@@ -638,7 +719,7 @@ export default async function tipo_pago(app: FastifyInstance) {
 
   /* =======================================================
      DELETE /:id
-     Eliminación del catálogo global
+     ELIMINACIÓN DEL CATÁLOGO GLOBAL
   ======================================================= */
 
   app.delete(
@@ -674,6 +755,7 @@ export default async function tipo_pago(app: FastifyInstance) {
         if (Number(result?.affectedRows ?? 0) === 0) {
           return reply.code(404).send({
             ok: false,
+
             message: "Tipo de pago no encontrado",
           });
         }
@@ -685,6 +767,17 @@ export default async function tipo_pago(app: FastifyInstance) {
       } catch (err: any) {
         reply.header("Cache-Control", "no-store");
 
+        /*
+         * El tipo de pago puede estar referenciado actualmente
+         * por:
+         *
+         * - academia_tipo_pago
+         * - tarifas_academia
+         * - plan_reglas
+         * - pago_detalle
+         *
+         * Las FK RESTRICT protegen la trazabilidad del sistema.
+         */
         if (
           err?.errno === 1451 ||
           err?.code === "ER_ROW_IS_REFERENCED_2" ||
@@ -692,8 +785,9 @@ export default async function tipo_pago(app: FastifyInstance) {
         ) {
           return reply.code(409).send({
             ok: false,
+
             message:
-              "No se puede eliminar el tipo de pago porque está asociado a academias, tarifas, promociones, cargos u otros registros",
+              "No se puede eliminar el tipo de pago porque está asociado a academias, tarifas, reglas de planes o pagos registrados",
           });
         }
 
