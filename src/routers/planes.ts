@@ -9,34 +9,57 @@ import { db } from "../db";
 import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
 /**
+ * =========================================================
+ * WELI - PLANES / BENEFICIOS
+ * =========================================================
+ *
  * Tablas:
  *
- * - planes_catalogo
- * - academia_plan
- * - plan_reglas
- *
- * Modelo:
- *
  * planes_catalogo
- *      Catálogo GLOBAL de planes/beneficios.
- *
- * academia_plan
- *      Determina qué planes están habilitados
- *      para una academia.
+ *   Catálogo GLOBAL de beneficios.
  *
  * plan_reglas
- *      Define las reglas globales de beneficio.
+ *   Define cómo se calcula el beneficio.
+ *
+ * academia_plan
+ *   Define qué beneficios están habilitados
+ *   para una academia.
+ *
+ * academia_plan_tipo_pago
+ *   Define sobre qué tipos de pago puede
+ *   aplicarse un beneficio cuando aplica_todos = 0.
+ *
+ * academia_tipo_pago
+ *   Determina qué tipos de pago están habilitados
+ *   realmente para una academia.
  *
  * Seguridad:
- * - READ: roles 1, 3
- * - WRITE: roles 1, 3
  *
- * academia_id:
- * - Admin: academia firmada en JWT.
- * - Superadmin: x-academia-id validado.
+ * READ:
+ * - Admin       rol 1
+ * - Superadmin  rol 3
  *
- * Nunca se recibe academia_id desde el body.
+ * WRITE:
+ * - Admin       rol 1
+ * - Superadmin  rol 3
+ *
+ * Scope:
+ *
+ * Admin:
+ * - academia_id proveniente del JWT firmado.
+ *
+ * Superadmin:
+ * - academia_id proveniente de x-academia-id.
+ *
+ * academia_id NUNCA se acepta desde el body.
+ * =========================================================
  */
+
+/* =========================================================
+   CONSTANTES
+========================================================= */
+
+const MAX_TIPOS_PAGO_BENEFICIO = 100;
 
 /* =========================================================
    SCHEMAS
@@ -46,17 +69,40 @@ const IdParam = z.object({
   id: z.coerce.number().int().positive(),
 });
 
-/*
- * id corresponde al ID de la relación academia_plan.
- *
- * plan_id corresponde al ID global de planes_catalogo.
- */
+const TipoPagoIdSchema = z.coerce.number().int().positive();
+
+const AplicaTodosSchema = z.coerce
+  .number()
+  .int()
+  .refine((value) => value === 0 || value === 1, {
+    message: "aplica_todos debe ser 0 o 1",
+  });
 
 const CreateSchema = z
   .object({
+    /*
+     * ID global perteneciente a planes_catalogo.
+     */
     plan_id: z.coerce.number().int().positive(),
 
+    /*
+     * 1 = beneficio aplicable a todos los tipos de pago
+     *     habilitados para la academia.
+     *
+     * 0 = beneficio aplicable solamente a los tipos
+     *     especificados en tipos_pago.
+     */
+    aplica_todos: AplicaTodosSchema.default(0),
+
     estado_id: z.coerce.number().int().positive().max(255).default(1),
+
+    /*
+     * IDs globales de tipo_pago.
+     *
+     * Deben estar habilitados previamente para la academia
+     * mediante academia_tipo_pago.
+     */
+    tipos_pago: z.array(TipoPagoIdSchema).max(MAX_TIPOS_PAGO_BENEFICIO).default([]),
   })
   .strict();
 
@@ -64,7 +110,11 @@ const PutSchema = z
   .object({
     plan_id: z.coerce.number().int().positive(),
 
+    aplica_todos: AplicaTodosSchema,
+
     estado_id: z.coerce.number().int().positive().max(255),
+
+    tipos_pago: z.array(TipoPagoIdSchema).max(MAX_TIPOS_PAGO_BENEFICIO),
   })
   .strict();
 
@@ -72,16 +122,28 @@ const PatchSchema = z
   .object({
     plan_id: z.coerce.number().int().positive().optional(),
 
+    aplica_todos: AplicaTodosSchema.optional(),
+
     estado_id: z.coerce.number().int().positive().max(255).optional(),
+
+    tipos_pago: z.array(TipoPagoIdSchema).max(MAX_TIPOS_PAGO_BENEFICIO).optional(),
   })
   .strict();
 
 /* =========================================================
-   HELPERS
+   HELPERS GENERALES
 ========================================================= */
 
 function zodDetail(err: ZodError): string {
   return err.issues.map((issue) => `${issue.path.join(".") || "field"}: ${issue.message}`).join("; ");
+}
+
+function businessError(message: string, statusCode = 400) {
+  const error: any = new Error(message);
+
+  error.statusCode = statusCode;
+
+  return error;
 }
 
 /* =========================================================
@@ -92,11 +154,7 @@ function resolveAcademiaId(req: FastifyRequest): number {
   const academiaId = Number(getEffectiveAcademiaId(req));
 
   if (!Number.isInteger(academiaId) || academiaId <= 0) {
-    const error: any = new Error("Academia efectiva inválida");
-
-    error.statusCode = 403;
-
-    throw error;
+    throw businessError("Academia efectiva inválida", 403);
   }
 
   return academiaId;
@@ -116,13 +174,19 @@ function normalize(row: any) {
     academia_id: Number(row.academia_id),
 
     /*
-     * ID del catálogo global.
+     * ID global de planes_catalogo.
      */
     plan_id: Number(row.plan_id),
 
     nombre: String(row.nombre ?? ""),
 
     descripcion: row.descripcion == null ? null : String(row.descripcion),
+
+    /*
+     * 1 = todos los conceptos habilitados
+     * 0 = solamente conceptos específicos
+     */
+    aplica_todos: Number(row.aplica_todos ?? 0),
 
     estado_id: Number(row.estado_id),
 
@@ -134,15 +198,21 @@ function normalize(row: any) {
   };
 }
 
+function normalizeTipoPagoIds(values: number[]): number[] {
+  return Array.from(new Set((values ?? []).map(Number).filter((id) => Number.isInteger(id) && id > 0)));
+}
+
 /* =========================================================
    PLAN GLOBAL
 ========================================================= */
 
-async function validatePlanGlobal(planId: number) {
-  const [rows]: any = await db.query(
+async function validatePlanGlobal(planId: number, executor: any = db) {
+  const [rows]: any = await executor.query(
     `
         SELECT
-          id
+          id,
+          nombre,
+          estado_id
 
         FROM planes_catalogo
 
@@ -154,21 +224,24 @@ async function validatePlanGlobal(planId: number) {
   );
 
   if (!rows?.length) {
-    throw new Error("El plan no existe en el catálogo global");
+    throw businessError("El plan no existe en el catálogo global");
   }
+
+  return rows[0];
 }
 
 /* =========================================================
    RELACIÓN ACADEMIA_PLAN
 ========================================================= */
 
-async function getRelacion(academiaId: number, id: number) {
-  const [rows]: any = await db.query(
+async function getRelacion(academiaId: number, id: number, executor: any = db) {
+  const [rows]: any = await executor.query(
     `
         SELECT
           ap.id,
           ap.academia_id,
           ap.plan_id,
+          ap.aplica_todos,
           ap.estado_id,
 
           ap.created_at,
@@ -183,8 +256,7 @@ async function getRelacion(academiaId: number, id: number) {
         FROM academia_plan ap
 
         INNER JOIN planes_catalogo pc
-          ON pc.id =
-             ap.plan_id
+          ON pc.id = ap.plan_id
 
         WHERE ap.id = ?
           AND ap.academia_id = ?
@@ -197,11 +269,17 @@ async function getRelacion(academiaId: number, id: number) {
   return rows?.length ? rows[0] : null;
 }
 
-async function existsRelation(academiaId: number, planId: number, excludeId?: number): Promise<boolean> {
+async function existsRelation(
+  academiaId: number,
+  planId: number,
+  excludeId?: number,
+  executor: any = db
+): Promise<boolean> {
   const values: any[] = [academiaId, planId];
 
   let sql = `
-    SELECT id
+    SELECT
+      id
 
     FROM academia_plan
 
@@ -221,26 +299,21 @@ async function existsRelation(academiaId: number, planId: number, excludeId?: nu
     LIMIT 1
   `;
 
-  const [rows]: any = await db.query(sql, values);
+  const [rows]: any = await executor.query(sql, values);
 
   return Array.isArray(rows) && rows.length > 0;
 }
 
 /* =========================================================
-   REGLAS DEL PLAN
+   REGLAS DEL BENEFICIO
 ========================================================= */
 
-async function getPlanReglas(planId: number) {
-  const [rows]: any = await db.query(
+async function getPlanReglas(planId: number, executor: any = db) {
+  const [rows]: any = await executor.query(
     `
         SELECT
           pr.id,
           pr.plan_id,
-          pr.tipo_pago_id,
-
-          tp.nombre
-            AS tipo_pago_nombre,
-
           pr.tipo_beneficio,
           pr.valor,
           pr.estado_id,
@@ -248,10 +321,6 @@ async function getPlanReglas(planId: number) {
           pr.updated_at
 
         FROM plan_reglas pr
-
-        LEFT JOIN tipo_pago tp
-          ON tp.id =
-             pr.tipo_pago_id
 
         WHERE pr.plan_id = ?
 
@@ -261,7 +330,247 @@ async function getPlanReglas(planId: number) {
     [planId]
   );
 
-  return rows ?? [];
+  return (rows ?? []).map((row: any) => ({
+    id: Number(row.id),
+
+    plan_id: Number(row.plan_id),
+
+    tipo_beneficio: String(row.tipo_beneficio ?? ""),
+
+    valor: Number(row.valor ?? 0),
+
+    estado_id: Number(row.estado_id),
+
+    created_at: row.created_at ?? null,
+
+    updated_at: row.updated_at ?? null,
+  }));
+}
+
+/* =========================================================
+   TIPOS DE PAGO ASOCIADOS AL BENEFICIO
+========================================================= */
+
+async function getPlanTiposPago(academiaId: number, academiaPlanId: number, executor: any = db) {
+  const [rows]: any = await executor.query(
+    `
+        SELECT
+          aptp.id,
+          aptp.academia_id,
+          aptp.academia_plan_id,
+          aptp.tipo_pago_id,
+          aptp.estado_id,
+          aptp.created_at,
+          aptp.updated_at,
+
+          tp.nombre
+            AS tipo_pago_nombre
+
+        FROM academia_plan_tipo_pago aptp
+
+        INNER JOIN tipo_pago tp
+          ON tp.id =
+             aptp.tipo_pago_id
+
+        WHERE aptp.academia_id = ?
+          AND aptp.academia_plan_id = ?
+          AND aptp.estado_id = 1
+
+        ORDER BY
+          tp.nombre ASC,
+          tp.id ASC
+      `,
+    [academiaId, academiaPlanId]
+  );
+
+  return (rows ?? []).map((row: any) => ({
+    id: Number(row.id),
+
+    academia_id: Number(row.academia_id),
+
+    academia_plan_id: Number(row.academia_plan_id),
+
+    tipo_pago_id: Number(row.tipo_pago_id),
+
+    nombre: String(row.tipo_pago_nombre ?? ""),
+
+    estado_id: Number(row.estado_id),
+
+    created_at: row.created_at ?? null,
+
+    updated_at: row.updated_at ?? null,
+  }));
+}
+
+async function getPlanTipoPagoIds(academiaId: number, academiaPlanId: number, executor: any = db): Promise<number[]> {
+  const [rows]: any = await executor.query(
+    `
+        SELECT
+          tipo_pago_id
+
+        FROM academia_plan_tipo_pago
+
+        WHERE academia_id = ?
+          AND academia_plan_id = ?
+          AND estado_id = 1
+
+        ORDER BY
+          tipo_pago_id ASC
+      `,
+    [academiaId, academiaPlanId]
+  );
+
+  return normalizeTipoPagoIds((rows ?? []).map((row: any) => Number(row.tipo_pago_id)));
+}
+
+/* =========================================================
+   VALIDACIÓN DEL ALCANCE DEL BENEFICIO
+========================================================= */
+
+function validateAplicacionBeneficio(aplicaTodos: number, tiposPago: number[]) {
+  const ids = normalizeTipoPagoIds(tiposPago);
+
+  if (aplicaTodos === 1) {
+    if (ids.length > 0) {
+      throw businessError("Si aplica_todos es 1, no debes enviar tipos de pago específicos");
+    }
+
+    return;
+  }
+
+  if (aplicaTodos === 0) {
+    if (!ids.length) {
+      throw businessError("Debes seleccionar al menos un tipo de pago cuando aplica_todos es 0");
+    }
+
+    return;
+  }
+
+  throw businessError("aplica_todos debe ser 0 o 1");
+}
+
+/* =========================================================
+   VALIDAR TIPOS DE PAGO DE LA ACADEMIA
+========================================================= */
+
+async function validateTiposPagoAcademia(academiaId: number, tiposPagoIds: number[], executor: any = db) {
+  const ids = normalizeTipoPagoIds(tiposPagoIds);
+
+  if (!ids.length) {
+    return;
+  }
+
+  const placeholders = ids.map(() => "?").join(", ");
+
+  const [rows]: any = await executor.query(
+    `
+        SELECT
+          atp.tipo_pago_id
+
+        FROM academia_tipo_pago atp
+
+        INNER JOIN tipo_pago tp
+          ON tp.id =
+             atp.tipo_pago_id
+
+        WHERE atp.academia_id = ?
+
+          AND atp.tipo_pago_id
+            IN (${placeholders})
+
+          AND atp.estado_id = 1
+
+          AND tp.estado_id = 1
+      `,
+    [academiaId, ...ids]
+  );
+
+  const validIds = new Set((rows ?? []).map((row: any) => Number(row.tipo_pago_id)));
+
+  const invalidIds = ids.filter((id) => !validIds.has(id));
+
+  if (invalidIds.length) {
+    throw businessError(`Uno o más tipos de pago no están habilitados para esta academia: ${invalidIds.join(", ")}`);
+  }
+}
+
+/* =========================================================
+   REEMPLAZAR TIPOS DE PAGO
+========================================================= */
+
+async function replacePlanTiposPago(
+  executor: any,
+  academiaId: number,
+  academiaPlanId: number,
+  aplicaTodos: number,
+  tiposPagoIds: number[]
+) {
+  /*
+   * Primero eliminamos el estado anterior.
+   *
+   * academia_plan_tipo_pago representa
+   * la configuración actual del beneficio.
+   */
+  await executor.query(
+    `
+      DELETE
+      FROM academia_plan_tipo_pago
+
+      WHERE academia_id = ?
+        AND academia_plan_id = ?
+    `,
+    [academiaId, academiaPlanId]
+  );
+
+  /*
+   * Si aplica a todos, no necesitamos
+   * registros específicos.
+   */
+  if (aplicaTodos === 1) {
+    return;
+  }
+
+  const ids = normalizeTipoPagoIds(tiposPagoIds);
+
+  for (const tipoPagoId of ids) {
+    await executor.query(
+      `
+        INSERT INTO academia_plan_tipo_pago (
+          academia_id,
+          academia_plan_id,
+          tipo_pago_id,
+          estado_id
+        )
+
+        VALUES (?, ?, ?, 1)
+      `,
+      [academiaId, academiaPlanId, tipoPagoId]
+    );
+  }
+}
+
+/* =========================================================
+   CONSTRUIR RESPUESTA DE BENEFICIO
+========================================================= */
+
+async function buildPlanItem(academiaId: number, row: any, executor: any = db) {
+  const item = normalize(row);
+
+  const reglas = await getPlanReglas(item.plan_id, executor);
+
+  /*
+   * Cuando aplica_todos = 1,
+   * el arreglo específico queda vacío.
+   */
+  const tipos_pago = item.aplica_todos === 1 ? [] : await getPlanTiposPago(academiaId, item.id, executor);
+
+  return {
+    ...item,
+
+    reglas,
+
+    tipos_pago,
+  };
 }
 
 /* =========================================================
@@ -269,32 +578,33 @@ async function getPlanReglas(planId: number) {
 ========================================================= */
 
 /**
- * Si una academia ya utilizó el plan para:
+ * Si una academia ya utilizó el beneficio para:
  *
  * - asignarlo a un jugador
  * - registrar un pago
  *
- * no permitimos transformar esa misma relación
- * academia_plan hacia otro plan global.
+ * no permitimos transformar esa relación
+ * hacia otro plan global ni eliminarla.
  *
- * Desactivar la relación sigue siendo posible
- * modificando estado_id.
+ * Desactivar sigue siendo permitido.
  */
 
 async function relationHasDependencies(
   academiaId: number,
-  planId: number
+  planId: number,
+  executor: any = db
 ): Promise<{
   used: boolean;
   source: string | null;
 }> {
   /* -------------------------------------------------------
-     PLAN ASIGNADO A JUGADOR
+     BENEFICIO ASIGNADO A JUGADOR
   ------------------------------------------------------- */
 
-  const [jugadores]: any = await db.query(
+  const [jugadores]: any = await executor.query(
     `
-        SELECT id
+        SELECT
+          id
 
         FROM jugador_plan_catalogo
 
@@ -314,12 +624,13 @@ async function relationHasDependencies(
   }
 
   /* -------------------------------------------------------
-     PLAN REGISTRADO EN PAGOS
+     BENEFICIO REGISTRADO EN PAGOS
   ------------------------------------------------------- */
 
-  const [pagos]: any = await db.query(
+  const [pagos]: any = await executor.query(
     `
-        SELECT id
+        SELECT
+          id
 
         FROM pagos_jugador
 
@@ -345,31 +656,23 @@ async function relationHasDependencies(
 }
 
 /* =========================================================
-   ERRORES DE SCOPE
+   MANEJO DE ERRORES
 ========================================================= */
 
 function scopeError(reply: FastifyReply, err: any) {
   const status = Number(err?.statusCode ?? 0);
 
-  if (status === 400 || status === 401 || status === 403) {
+  if (status === 400 || status === 401 || status === 403 || status === 404 || status === 409) {
     reply.header("Cache-Control", "no-store");
 
     return reply.code(status).send({
       ok: false,
 
-      message: err?.message || "No fue posible determinar la academia efectiva",
+      message: err?.message || "No fue posible procesar la solicitud",
     });
   }
 
   return null;
-}
-
-/* =========================================================
-   ERRORES DE NEGOCIO
-========================================================= */
-
-function isBusinessValidationError(err: any) {
-  return ["El plan no existe en el catálogo global"].includes(String(err?.message ?? ""));
 }
 
 /* =========================================================
@@ -378,10 +681,10 @@ function isBusinessValidationError(err: any) {
 
 export default async function planes(app: FastifyInstance) {
   /*
-   * Seguridad conservada exactamente
-   * según router original.
+   * Configuración económica:
+   *
+   * Staff NO administra beneficios.
    */
-
   const canRead = [requireAuth, requireRoles([1, 3])];
 
   const canWrite = [requireAuth, requireRoles([1, 3])];
@@ -423,6 +726,8 @@ export default async function planes(app: FastifyInstance) {
           ok: false,
 
           message: "Error en módulo de planes",
+
+          detail: err?.message,
         });
       }
     }
@@ -430,7 +735,7 @@ export default async function planes(app: FastifyInstance) {
 
   /* =======================================================
      GET /
-     PLANES HABILITADOS PARA LA ACADEMIA
+     BENEFICIOS HABILITADOS PARA LA ACADEMIA
   ======================================================= */
 
   app.get(
@@ -448,6 +753,7 @@ export default async function planes(app: FastifyInstance) {
                 ap.id,
                 ap.academia_id,
                 ap.plan_id,
+                ap.aplica_todos,
                 ap.estado_id,
 
                 ap.created_at,
@@ -478,14 +784,7 @@ export default async function planes(app: FastifyInstance) {
         const items: any[] = [];
 
         for (const row of rows ?? []) {
-          const item = normalize(row);
-
-          const reglas = await getPlanReglas(item.plan_id);
-
-          items.push({
-            ...item,
-            reglas,
-          });
+          items.push(await buildPlanItem(academiaId, row));
         }
 
         reply.header("Cache-Control", "no-store");
@@ -520,9 +819,9 @@ export default async function planes(app: FastifyInstance) {
   );
 
   /* =======================================================
-   GET /catalogo
-   CATÁLOGO GLOBAL DE PLANES
-======================================================= */
+     GET /catalogo
+     CATÁLOGO GLOBAL DE BENEFICIOS
+  ======================================================= */
 
   app.get(
     "/catalogo",
@@ -533,21 +832,21 @@ export default async function planes(app: FastifyInstance) {
       try {
         const [rows]: any = await db.query(
           `
-            SELECT
-              pc.id,
-              pc.nombre,
-              pc.descripcion,
-              pc.estado_id,
-              pc.created_at,
-              pc.updated_at
+              SELECT
+                pc.id,
+                pc.nombre,
+                pc.descripcion,
+                pc.estado_id,
+                pc.created_at,
+                pc.updated_at
 
-            FROM planes_catalogo pc
+              FROM planes_catalogo pc
 
-            ORDER BY
-              pc.estado_id ASC,
-              pc.nombre ASC,
-              pc.id ASC
-          `
+              ORDER BY
+                pc.estado_id ASC,
+                pc.nombre ASC,
+                pc.id ASC
+            `
         );
 
         const items: any[] = [];
@@ -597,7 +896,6 @@ export default async function planes(app: FastifyInstance) {
 
   /* =======================================================
      GET /:id
-     RELACIÓN ACADEMIA_PLAN
   ======================================================= */
 
   app.get(
@@ -635,17 +933,12 @@ export default async function planes(app: FastifyInstance) {
           });
         }
 
-        const item = normalize(row);
-
-        const reglas = await getPlanReglas(item.plan_id);
+        const item = await buildPlanItem(academiaId, row);
 
         return reply.send({
           ok: true,
 
-          item: {
-            ...item,
-            reglas,
-          },
+          item,
         });
       } catch (err: any) {
         const handled = scopeError(reply, err);
@@ -669,7 +962,7 @@ export default async function planes(app: FastifyInstance) {
 
   /* =======================================================
      POST /
-     HABILITAR PLAN GLOBAL EN ACADEMIA
+     HABILITAR BENEFICIO EN ACADEMIA
   ======================================================= */
 
   app.post(
@@ -678,87 +971,87 @@ export default async function planes(app: FastifyInstance) {
       preHandler: canWrite,
     },
     async (req: FastifyRequest, reply: FastifyReply) => {
+      let conn: any = null;
+
       try {
         const academiaId = resolveAcademiaId(req);
 
-        /*
-         * Schema strict().
-         *
-         * academia_id nunca se acepta
-         * desde el body.
-         */
         const body = CreateSchema.parse(req.body);
 
         const planId = Number(body.plan_id);
 
+        const aplicaTodos = Number(body.aplica_todos);
+
         const estadoId = Number(body.estado_id);
 
-        await validatePlanGlobal(planId);
+        const tiposPago = normalizeTipoPagoIds(body.tipos_pago);
 
-        const duplicate = await existsRelation(academiaId, planId);
+        validateAplicacionBeneficio(aplicaTodos, tiposPago);
+
+        conn = await db.getConnection();
+
+        await conn.beginTransaction();
+
+        await validatePlanGlobal(planId, conn);
+
+        const duplicate = await existsRelation(academiaId, planId, undefined, conn);
 
         if (duplicate) {
-          reply.header("Cache-Control", "no-store");
-
-          return reply.code(409).send({
-            ok: false,
-
-            message: "Este plan ya se encuentra asociado a la academia",
-          });
+          throw businessError("Este plan ya se encuentra asociado a la academia", 409);
         }
 
-        const [result]: any = await db.query(
+        if (aplicaTodos === 0) {
+          await validateTiposPagoAcademia(academiaId, tiposPago, conn);
+        }
+
+        const [result]: any = await conn.query(
           `
               INSERT INTO academia_plan (
                 academia_id,
                 plan_id,
+                aplica_todos,
                 estado_id
               )
 
-              VALUES (?, ?, ?)
+              VALUES (?, ?, ?, ?)
             `,
-          [academiaId, planId, estadoId]
+          [academiaId, planId, aplicaTodos, estadoId]
         );
 
         const insertId = Number(result?.insertId);
 
-        const row = await getRelacion(academiaId, insertId);
+        if (!Number.isInteger(insertId) || insertId <= 0) {
+          throw new Error("No fue posible obtener el ID de la asociación creada");
+        }
+
+        await replacePlanTiposPago(conn, academiaId, insertId, aplicaTodos, tiposPago);
+
+        const row = await getRelacion(academiaId, insertId, conn);
+
+        if (!row) {
+          throw new Error("No fue posible recuperar el beneficio creado");
+        }
+
+        const item = await buildPlanItem(academiaId, row, conn);
+
+        await conn.commit();
 
         reply.header("Cache-Control", "no-store");
-
-        if (row) {
-          const item = normalize(row);
-
-          const reglas = await getPlanReglas(item.plan_id);
-
-          return reply.code(201).send({
-            ok: true,
-
-            id: insertId,
-
-            item: {
-              ...item,
-              reglas,
-            },
-          });
-        }
 
         return reply.code(201).send({
           ok: true,
 
           id: insertId,
 
-          item: {
-            id: insertId,
-
-            academia_id: academiaId,
-
-            plan_id: planId,
-
-            estado_id: estadoId,
-          },
+          item,
         });
       } catch (err: any) {
+        if (conn) {
+          try {
+            await conn.rollback();
+          } catch {}
+        }
+
         reply.header("Cache-Control", "no-store");
 
         if (err instanceof ZodError) {
@@ -789,15 +1082,7 @@ export default async function planes(app: FastifyInstance) {
           return reply.code(409).send({
             ok: false,
 
-            message: "La academia o el plan indicado no existe",
-          });
-        }
-
-        if (isBusinessValidationError(err)) {
-          return reply.code(400).send({
-            ok: false,
-
-            message: err.message,
+            message: "Uno de los registros relacionados no existe",
           });
         }
 
@@ -808,13 +1093,17 @@ export default async function planes(app: FastifyInstance) {
 
           detail: err?.message,
         });
+      } finally {
+        if (conn) {
+          conn.release();
+        }
       }
     }
   );
 
   /* =======================================================
      PUT /:id
-     REEMPLAZO DE RELACIÓN
+     REEMPLAZO COMPLETO
   ======================================================= */
 
   app.put(
@@ -835,73 +1124,67 @@ export default async function planes(app: FastifyInstance) {
         });
       }
 
+      let conn: any = null;
+
       try {
         const academiaId = resolveAcademiaId(req);
 
         const id = parsedId.data.id;
 
-        const current = await getRelacion(academiaId, id);
-
-        if (!current) {
-          reply.header("Cache-Control", "no-store");
-
-          return reply.code(404).send({
-            ok: false,
-
-            message: "Plan no encontrado",
-          });
-        }
-
         const body = PutSchema.parse(req.body);
 
         const planId = Number(body.plan_id);
 
+        const aplicaTodos = Number(body.aplica_todos);
+
         const estadoId = Number(body.estado_id);
+
+        const tiposPago = normalizeTipoPagoIds(body.tipos_pago);
+
+        validateAplicacionBeneficio(aplicaTodos, tiposPago);
+
+        conn = await db.getConnection();
+
+        await conn.beginTransaction();
+
+        const current = await getRelacion(academiaId, id, conn);
+
+        if (!current) {
+          throw businessError("Plan no encontrado", 404);
+        }
 
         const changingPlan = planId !== Number(current.plan_id);
 
-        /*
-         * Si el plan ya fue utilizado,
-         * no permitimos transformar la relación
-         * hacia otro plan del catálogo.
-         *
-         * Cambiar únicamente estado_id sí es válido.
-         */
         if (changingPlan) {
-          const dependencies = await relationHasDependencies(academiaId, Number(current.plan_id));
+          const dependencies = await relationHasDependencies(academiaId, Number(current.plan_id), conn);
 
           if (dependencies.used) {
-            reply.header("Cache-Control", "no-store");
-
-            return reply.code(409).send({
-              ok: false,
-
-              message:
-                "La asociación actual está siendo utilizada y no puede cambiarse a otro plan. Puede desactivarse mediante estado_id",
-            });
+            throw businessError(
+              "La asociación actual está siendo utilizada y no puede cambiarse a otro plan. Puede desactivarse mediante estado_id",
+              409
+            );
           }
         }
 
-        await validatePlanGlobal(planId);
+        await validatePlanGlobal(planId, conn);
 
-        const duplicate = await existsRelation(academiaId, planId, id);
+        const duplicate = await existsRelation(academiaId, planId, id, conn);
 
         if (duplicate) {
-          reply.header("Cache-Control", "no-store");
-
-          return reply.code(409).send({
-            ok: false,
-
-            message: "Ya existe otra asociación de esta academia con ese plan",
-          });
+          throw businessError("Ya existe otra asociación de esta academia con ese plan", 409);
         }
 
-        const [result]: any = await db.query(
+        if (aplicaTodos === 0) {
+          await validateTiposPagoAcademia(academiaId, tiposPago, conn);
+        }
+
+        const [result]: any = await conn.query(
           `
               UPDATE academia_plan
 
               SET
                 plan_id = ?,
+                aplica_todos = ?,
                 estado_id = ?
 
               WHERE id = ?
@@ -909,50 +1192,39 @@ export default async function planes(app: FastifyInstance) {
 
               LIMIT 1
             `,
-          [planId, estadoId, id, academiaId]
+          [planId, aplicaTodos, estadoId, id, academiaId]
         );
 
-        reply.header("Cache-Control", "no-store");
-
         if (Number(result?.affectedRows ?? 0) === 0) {
-          return reply.code(404).send({
-            ok: false,
-
-            message: "Plan no encontrado",
-          });
+          throw businessError("Plan no encontrado", 404);
         }
 
-        const row = await getRelacion(academiaId, id);
+        await replacePlanTiposPago(conn, academiaId, id, aplicaTodos, tiposPago);
 
-        if (row) {
-          const item = normalize(row);
+        const row = await getRelacion(academiaId, id, conn);
 
-          const reglas = await getPlanReglas(item.plan_id);
-
-          return reply.send({
-            ok: true,
-
-            updated: {
-              ...item,
-              reglas,
-            },
-          });
+        if (!row) {
+          throw new Error("No fue posible recuperar el plan actualizado");
         }
+
+        const updated = await buildPlanItem(academiaId, row, conn);
+
+        await conn.commit();
+
+        reply.header("Cache-Control", "no-store");
 
         return reply.send({
           ok: true,
 
-          updated: {
-            id,
-
-            academia_id: academiaId,
-
-            plan_id: planId,
-
-            estado_id: estadoId,
-          },
+          updated,
         });
       } catch (err: any) {
+        if (conn) {
+          try {
+            await conn.rollback();
+          } catch {}
+        }
+
         reply.header("Cache-Control", "no-store");
 
         if (err instanceof ZodError) {
@@ -983,15 +1255,7 @@ export default async function planes(app: FastifyInstance) {
           return reply.code(409).send({
             ok: false,
 
-            message: "La academia o el plan indicado no existe",
-          });
-        }
-
-        if (isBusinessValidationError(err)) {
-          return reply.code(400).send({
-            ok: false,
-
-            message: err.message,
+            message: "Uno de los registros relacionados no existe",
           });
         }
 
@@ -1002,6 +1266,10 @@ export default async function planes(app: FastifyInstance) {
 
           detail: err?.message,
         });
+      } finally {
+        if (conn) {
+          conn.release();
+        }
       }
     }
   );
@@ -1028,149 +1296,132 @@ export default async function planes(app: FastifyInstance) {
         });
       }
 
+      let conn: any = null;
+
       try {
         const academiaId = resolveAcademiaId(req);
 
         const id = parsedId.data.id;
 
-        const current = await getRelacion(academiaId, id);
-
-        if (!current) {
-          reply.header("Cache-Control", "no-store");
-
-          return reply.code(404).send({
-            ok: false,
-
-            message: "Plan no encontrado",
-          });
-        }
-
         const body = PatchSchema.parse(req.body);
 
         if (Object.keys(body).length === 0) {
-          reply.header("Cache-Control", "no-store");
-
-          return reply.code(400).send({
-            ok: false,
-
-            message: "No hay campos para actualizar",
-          });
+          throw businessError("No hay campos para actualizar");
         }
+
+        conn = await db.getConnection();
+
+        await conn.beginTransaction();
+
+        const current = await getRelacion(academiaId, id, conn);
+
+        if (!current) {
+          throw businessError("Plan no encontrado", 404);
+        }
+
+        const currentTiposPago = await getPlanTipoPagoIds(academiaId, id, conn);
 
         const planId = body.plan_id !== undefined ? Number(body.plan_id) : Number(current.plan_id);
 
+        const aplicaTodos = body.aplica_todos !== undefined ? Number(body.aplica_todos) : Number(current.aplica_todos);
+
         const estadoId = body.estado_id !== undefined ? Number(body.estado_id) : Number(current.estado_id);
+
+        const tiposPago =
+          body.tipos_pago !== undefined
+            ? normalizeTipoPagoIds(body.tipos_pago)
+            : aplicaTodos === 1
+              ? []
+              : currentTiposPago;
+
+        validateAplicacionBeneficio(aplicaTodos, tiposPago);
 
         const changingPlan = planId !== Number(current.plan_id);
 
         if (changingPlan) {
-          const dependencies = await relationHasDependencies(academiaId, Number(current.plan_id));
+          const dependencies = await relationHasDependencies(academiaId, Number(current.plan_id), conn);
 
           if (dependencies.used) {
-            reply.header("Cache-Control", "no-store");
-
-            return reply.code(409).send({
-              ok: false,
-
-              message:
-                "La asociación actual está siendo utilizada y no puede cambiarse a otro plan. Puede desactivarse mediante estado_id",
-            });
+            throw businessError(
+              "La asociación actual está siendo utilizada y no puede cambiarse a otro plan. Puede desactivarse mediante estado_id",
+              409
+            );
           }
 
-          await validatePlanGlobal(planId);
+          await validatePlanGlobal(planId, conn);
 
-          const duplicate = await existsRelation(academiaId, planId, id);
+          const duplicate = await existsRelation(academiaId, planId, id, conn);
 
           if (duplicate) {
-            reply.header("Cache-Control", "no-store");
-
-            return reply.code(409).send({
-              ok: false,
-
-              message: "Ya existe otra asociación de esta academia con ese plan",
-            });
+            throw businessError("Ya existe otra asociación de esta academia con ese plan", 409);
           }
         }
 
-        const fields: string[] = [];
-
-        const values: any[] = [];
-
-        if (body.plan_id !== undefined) {
-          fields.push("plan_id = ?");
-
-          values.push(planId);
+        /*
+         * Aunque PATCH no cambie plan_id,
+         * si cambia el alcance debemos comprobar
+         * los tipos de pago resultantes.
+         */
+        if (aplicaTodos === 0) {
+          await validateTiposPagoAcademia(academiaId, tiposPago, conn);
         }
 
-        if (body.estado_id !== undefined) {
-          fields.push("estado_id = ?");
-
-          values.push(estadoId);
-        }
-
-        if (fields.length === 0) {
-          reply.header("Cache-Control", "no-store");
-
-          return reply.code(400).send({
-            ok: false,
-
-            message: "No hay campos válidos para actualizar",
-          });
-        }
-
-        values.push(id, academiaId);
-
-        const [result]: any = await db.query(
+        const [result]: any = await conn.query(
           `
               UPDATE academia_plan
 
               SET
-                ${fields.join(", ")}
+                plan_id = ?,
+                aplica_todos = ?,
+                estado_id = ?
 
               WHERE id = ?
                 AND academia_id = ?
 
               LIMIT 1
             `,
-          values
+          [planId, aplicaTodos, estadoId, id, academiaId]
         );
 
-        reply.header("Cache-Control", "no-store");
-
         if (Number(result?.affectedRows ?? 0) === 0) {
-          return reply.code(404).send({
-            ok: false,
-
-            message: "Plan no encontrado",
-          });
+          throw businessError("Plan no encontrado", 404);
         }
 
-        const row = await getRelacion(academiaId, id);
-
-        if (row) {
-          const item = normalize(row);
-
-          const reglas = await getPlanReglas(item.plan_id);
-
-          return reply.send({
-            ok: true,
-
-            updated: {
-              ...item,
-              reglas,
-            },
-          });
+        /*
+         * Solo reconstruimos el scope cuando
+         * PATCH modifica aplica_todos o tipos_pago.
+         *
+         * Si únicamente cambia nombre lógico
+         * del plan o estado, conservamos asociaciones.
+         */
+        if (body.aplica_todos !== undefined || body.tipos_pago !== undefined) {
+          await replacePlanTiposPago(conn, academiaId, id, aplicaTodos, tiposPago);
         }
+
+        const row = await getRelacion(academiaId, id, conn);
+
+        if (!row) {
+          throw new Error("No fue posible recuperar el plan actualizado");
+        }
+
+        const updated = await buildPlanItem(academiaId, row, conn);
+
+        await conn.commit();
+
+        reply.header("Cache-Control", "no-store");
 
         return reply.send({
           ok: true,
 
-          updated: {
-            id,
-            academia_id: academiaId,
-          },
+          updated,
         });
       } catch (err: any) {
+        if (conn) {
+          try {
+            await conn.rollback();
+          } catch {}
+        }
+
         reply.header("Cache-Control", "no-store");
 
         if (err instanceof ZodError) {
@@ -1201,15 +1452,7 @@ export default async function planes(app: FastifyInstance) {
           return reply.code(409).send({
             ok: false,
 
-            message: "La academia o el plan indicado no existe",
-          });
-        }
-
-        if (isBusinessValidationError(err)) {
-          return reply.code(400).send({
-            ok: false,
-
-            message: err.message,
+            message: "Uno de los registros relacionados no existe",
           });
         }
 
@@ -1220,6 +1463,10 @@ export default async function planes(app: FastifyInstance) {
 
           detail: err?.message,
         });
+      } finally {
+        if (conn) {
+          conn.release();
+        }
       }
     }
   );
@@ -1246,37 +1493,49 @@ export default async function planes(app: FastifyInstance) {
         });
       }
 
+      let conn: any = null;
+
       try {
         const academiaId = resolveAcademiaId(req);
 
         const id = parsed.data.id;
 
-        const current = await getRelacion(academiaId, id);
+        conn = await db.getConnection();
+
+        await conn.beginTransaction();
+
+        const current = await getRelacion(academiaId, id, conn);
 
         if (!current) {
-          reply.header("Cache-Control", "no-store");
-
-          return reply.code(404).send({
-            ok: false,
-
-            message: "Plan no encontrado",
-          });
+          throw businessError("Plan no encontrado", 404);
         }
 
-        const dependencies = await relationHasDependencies(academiaId, Number(current.plan_id));
+        const dependencies = await relationHasDependencies(academiaId, Number(current.plan_id), conn);
 
         if (dependencies.used) {
-          reply.header("Cache-Control", "no-store");
-
-          return reply.code(409).send({
-            ok: false,
-
-            message:
-              "El plan está siendo utilizado por jugadores o pagos y no puede eliminarse de la academia. Debe desactivarse mediante estado_id",
-          });
+          throw businessError(
+            "El plan está siendo utilizado por jugadores o pagos y no puede eliminarse de la academia. Debe desactivarse mediante estado_id",
+            409
+          );
         }
 
-        const [result]: any = await db.query(
+        /*
+         * academia_plan_tipo_pago tiene FK RESTRICT,
+         * por lo que eliminamos explícitamente
+         * las asociaciones antes del padre.
+         */
+        await conn.query(
+          `
+            DELETE
+            FROM academia_plan_tipo_pago
+
+            WHERE academia_id = ?
+              AND academia_plan_id = ?
+          `,
+          [academiaId, id]
+        );
+
+        const [result]: any = await conn.query(
           `
               DELETE
               FROM academia_plan
@@ -1289,15 +1548,13 @@ export default async function planes(app: FastifyInstance) {
           [id, academiaId]
         );
 
-        reply.header("Cache-Control", "no-store");
-
         if (Number(result?.affectedRows ?? 0) === 0) {
-          return reply.code(404).send({
-            ok: false,
-
-            message: "Plan no encontrado",
-          });
+          throw businessError("Plan no encontrado", 404);
         }
+
+        await conn.commit();
+
+        reply.header("Cache-Control", "no-store");
 
         return reply.send({
           ok: true,
@@ -1305,6 +1562,12 @@ export default async function planes(app: FastifyInstance) {
           deleted: id,
         });
       } catch (err: any) {
+        if (conn) {
+          try {
+            await conn.rollback();
+          } catch {}
+        }
+
         reply.header("Cache-Control", "no-store");
 
         const handled = scopeError(reply, err);
@@ -1330,6 +1593,10 @@ export default async function planes(app: FastifyInstance) {
 
           detail: err?.message,
         });
+      } finally {
+        if (conn) {
+          conn.release();
+        }
       }
     }
   );
