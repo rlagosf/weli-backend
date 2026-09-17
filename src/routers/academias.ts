@@ -73,7 +73,7 @@ const MAX_NOMBRE_CATEGORIA = 50;
 
 const ESTADO_ACTIVO = 1;
 
-const ESTADO_INACTIVO = 2;
+const ESTADO_INACTIVO_CONFIG = 0;
 
 /* =========================================================
    SCHEMAS BASE
@@ -85,13 +85,15 @@ const IdParam = z.object({
 
 const EstadoSchema = z.coerce.number().int().positive().max(255);
 
+const EstadoConfigSchema = z.coerce.number().int().min(0).max(1);
+
 const TipoPagoConfigSchema = z
   .object({
     tipo_pago_id: z.coerce.number().int().positive(),
 
     monto: z.coerce.number().finite().nonnegative().max(999999999.99),
 
-    estado_id: EstadoSchema.optional().default(ESTADO_ACTIVO),
+    estado_id: EstadoConfigSchema.optional().default(ESTADO_ACTIVO),
   })
   .strict();
 
@@ -106,6 +108,12 @@ const CreateSchema = z
     rut_academia: z.coerce.number().int().positive().max(99_999_999),
 
     deporte_id: z.coerce.number().int().positive(),
+
+    direccion: z.string().trim().min(3).max(180),
+
+    ciudad_comuna_id: z.coerce.number().int().positive(),
+
+    email: z.string().trim().email("Correo inválido").max(160),
 
     estado_id: EstadoSchema.optional().default(ESTADO_ACTIVO),
 
@@ -166,6 +174,12 @@ const UpdateSchema = z
     rut_academia: z.coerce.number().int().positive().max(99_999_999).optional(),
 
     deporte_id: z.coerce.number().int().positive().optional(),
+
+    direccion: z.string().trim().min(3).max(180).optional(),
+
+    ciudad_comuna_id: z.coerce.number().int().positive().optional(),
+
+    email: z.string().trim().email("Correo inválido").max(160).optional(),
 
     estado_id: EstadoSchema.optional(),
 
@@ -243,6 +257,58 @@ function resolveAcademiaId(req: FastifyRequest): number {
   }
 
   return academiaId;
+}
+
+function normalizeEmail(value: string): string {
+  return String(value ?? "")
+    .trim()
+    .toLocaleLowerCase("es");
+}
+
+async function validateCiudadComuna(conn: any, ciudadComunaId: number): Promise<void> {
+  const [rows]: any = await conn.query(
+    `
+      SELECT
+        cc.id,
+        cc.estado_id,
+        c.id AS ciudad_id,
+        c.region_id AS ciudad_region_id,
+        c.estado_id AS ciudad_estado_id,
+        co.id AS comuna_id,
+        co.region_id AS comuna_region_id
+
+      FROM ciudad_comuna cc
+
+      INNER JOIN ciudades c
+        ON c.id = cc.ciudad_id
+
+      INNER JOIN comunas co
+        ON co.id = cc.comuna_id
+
+      WHERE cc.id = ?
+
+      LIMIT 1
+    `,
+    [ciudadComunaId]
+  );
+
+  if (!rows?.length) {
+    badRequest("La relación ciudad/comuna seleccionada no existe");
+  }
+
+  const row = rows[0];
+
+  if (Number(row.estado_id) !== ESTADO_ACTIVO) {
+    badRequest("La relación ciudad/comuna seleccionada está inactiva");
+  }
+
+  if (Number(row.ciudad_estado_id) !== ESTADO_ACTIVO) {
+    badRequest("La ciudad seleccionada está inactiva");
+  }
+
+  if (Number(row.ciudad_region_id) !== Number(row.comuna_region_id)) {
+    badRequest("La ciudad y la comuna seleccionadas no pertenecen a la misma región");
+  }
 }
 
 /* =========================================================
@@ -431,39 +497,173 @@ async function upsertTipoPagoAcademia(
 }
 
 /* =========================================================
-   UPSERT TARIFA
+   TARIFA VERSIONADA
 ========================================================= */
 
-async function upsertTarifaAcademia(
+async function syncTarifaAcademiaVersionada(
   conn: any,
   academiaId: number,
   tipoPagoId: number,
   monto: number,
   estadoId: number
 ): Promise<void> {
+  const [rows]: any = await conn.query(
+    `
+      SELECT
+        id,
+        monto,
+        estado_id,
+        es_vigente
+
+      FROM tarifas_academia
+
+      WHERE academia_id = ?
+        AND tipo_pago_id = ?
+        AND es_vigente = 1
+
+      LIMIT 1
+
+      FOR UPDATE
+    `,
+    [academiaId, tipoPagoId]
+  );
+
+  const current = rows?.[0] ?? null;
+
+  if (Number(estadoId) !== ESTADO_ACTIVO) {
+    if (current) {
+      await conn.query(
+        `
+          UPDATE tarifas_academia
+
+          SET
+            estado_id = ?,
+            es_vigente = NULL,
+            vigencia_hasta = COALESCE(vigencia_hasta, NOW())
+
+          WHERE id = ?
+            AND academia_id = ?
+            AND es_vigente = 1
+        `,
+        [ESTADO_INACTIVO_CONFIG, current.id, academiaId]
+      );
+    }
+
+    return;
+  }
+
+  if (!current) {
+    await conn.query(
+      `
+        INSERT INTO tarifas_academia (
+          academia_id,
+          tipo_pago_id,
+          monto,
+          vigencia_desde,
+          vigencia_hasta,
+          es_vigente,
+          estado_id
+        )
+
+        VALUES (?, ?, ?, NOW(), NULL, 1, ?)
+      `,
+      [academiaId, tipoPagoId, monto, ESTADO_ACTIVO]
+    );
+
+    return;
+  }
+
+  if (Number(current.monto) === Number(monto)) {
+    if (Number(current.estado_id) !== ESTADO_ACTIVO) {
+      await conn.query(
+        `
+          UPDATE tarifas_academia
+
+          SET
+            estado_id = ?
+
+          WHERE id = ?
+            AND academia_id = ?
+        `,
+        [ESTADO_ACTIVO, current.id, academiaId]
+      );
+    }
+
+    return;
+  }
+
+  await conn.query(
+    `
+      UPDATE tarifas_academia
+
+      SET
+        estado_id = ?,
+        es_vigente = NULL,
+        vigencia_hasta = NOW()
+
+      WHERE id = ?
+        AND academia_id = ?
+        AND es_vigente = 1
+    `,
+    [ESTADO_INACTIVO_CONFIG, current.id, academiaId]
+  );
+
   await conn.query(
     `
       INSERT INTO tarifas_academia (
         academia_id,
         tipo_pago_id,
         monto,
+        vigencia_desde,
+        vigencia_hasta,
+        es_vigente,
         estado_id
       )
 
-      VALUES (?, ?, ?, ?)
-
-      ON DUPLICATE KEY UPDATE
-        monto =
-          VALUES(monto),
-
-        estado_id =
-          VALUES(estado_id),
-
-        updated_at =
-          CURRENT_TIMESTAMP
+      VALUES (?, ?, ?, NOW(), NULL, 1, ?)
     `,
-    [academiaId, tipoPagoId, monto, estadoId]
+    [academiaId, tipoPagoId, monto, ESTADO_ACTIVO]
   );
+}
+
+async function deactivateOmittedTiposPago(conn: any, academiaId: number, desiredTipoPagoIds: number[]): Promise<void> {
+  const [rows]: any = await conn.query(
+    `
+      SELECT
+        tipo_pago_id
+
+      FROM academia_tipo_pago
+
+      WHERE academia_id = ?
+        AND estado_id = ?
+    `,
+    [academiaId, ESTADO_ACTIVO]
+  );
+
+  const desired = new Set(desiredTipoPagoIds.map(Number));
+
+  for (const row of rows ?? []) {
+    const tipoPagoId = Number(row.tipo_pago_id);
+
+    if (desired.has(tipoPagoId)) {
+      continue;
+    }
+
+    await conn.query(
+      `
+        UPDATE academia_tipo_pago
+
+        SET
+          estado_id = ?
+
+        WHERE academia_id = ?
+          AND tipo_pago_id = ?
+      `,
+      [ESTADO_INACTIVO_CONFIG, academiaId, tipoPagoId]
+    );
+
+    await syncTarifaAcademiaVersionada(conn, academiaId, tipoPagoId, 0, ESTADO_INACTIVO_CONFIG);
+  }
 }
 
 /* =========================================================
@@ -555,7 +755,7 @@ async function deactivateInvalidBenefitScopes(conn: any, academiaId: number): Pr
       WHERE aptp.academia_id = ?
         AND atp.estado_id <> ?
     `,
-    [ESTADO_INACTIVO, academiaId, ESTADO_ACTIVO]
+    [ESTADO_INACTIVO_CONFIG, academiaId, ESTADO_ACTIVO]
   );
 }
 
@@ -643,6 +843,25 @@ export default async function academias(app: FastifyInstance) {
                 d.nombre
                   AS deporte_nombre,
 
+                a.direccion,
+                a.ciudad_comuna_id,
+                a.email,
+
+                cc.ciudad_id,
+
+                ci.nombre
+                  AS ciudad_nombre,
+
+                cc.comuna_id,
+
+                co.nombre
+                  AS comuna_nombre,
+
+                co.region_id,
+
+                r.nombre
+                  AS region_nombre,
+
                 a.estado_id,
 
                 ea.nombre
@@ -656,6 +875,22 @@ export default async function academias(app: FastifyInstance) {
               LEFT JOIN deportes d
                 ON d.id =
                    a.deporte_id
+
+              LEFT JOIN ciudad_comuna cc
+                ON cc.id =
+                   a.ciudad_comuna_id
+
+              LEFT JOIN ciudades ci
+                ON ci.id =
+                   cc.ciudad_id
+
+              LEFT JOIN comunas co
+                ON co.id =
+                   cc.comuna_id
+
+              LEFT JOIN regiones r
+                ON r.id =
+                   co.region_id
 
               LEFT JOIN estado_academia ea
                 ON ea.id =
@@ -768,6 +1003,25 @@ export default async function academias(app: FastifyInstance) {
                 d.nombre
                   AS deporte_nombre,
 
+                a.direccion,
+                a.ciudad_comuna_id,
+                a.email,
+
+                cc.ciudad_id,
+
+                ci.nombre
+                  AS ciudad_nombre,
+
+                cc.comuna_id,
+
+                co.nombre
+                  AS comuna_nombre,
+
+                co.region_id,
+
+                r.nombre
+                  AS region_nombre,
+
                 a.estado_id,
 
                 ea.nombre
@@ -781,6 +1035,22 @@ export default async function academias(app: FastifyInstance) {
               LEFT JOIN deportes d
                 ON d.id =
                    a.deporte_id
+
+              LEFT JOIN ciudad_comuna cc
+                ON cc.id =
+                   a.ciudad_comuna_id
+
+              LEFT JOIN ciudades ci
+                ON ci.id =
+                   cc.ciudad_id
+
+              LEFT JOIN comunas co
+                ON co.id =
+                   cc.comuna_id
+
+              LEFT JOIN regiones r
+                ON r.id =
+                   co.region_id
 
               LEFT JOIN estado_academia ea
                 ON ea.id =
@@ -876,6 +1146,15 @@ export default async function academias(app: FastifyInstance) {
                 ta.estado_id
                   AS tarifa_estado_id,
 
+                ta.vigencia_desde
+                  AS tarifa_vigencia_desde,
+
+                ta.vigencia_hasta
+                  AS tarifa_vigencia_hasta,
+
+                ta.es_vigente
+                  AS tarifa_es_vigente,
+
                 ta.created_at
                   AS tarifa_created_at,
 
@@ -894,6 +1173,8 @@ export default async function academias(app: FastifyInstance) {
 
                AND ta.tipo_pago_id =
                    atp.tipo_pago_id
+
+               AND ta.es_vigente = 1
 
               WHERE atp.academia_id = ?
 
@@ -1090,6 +1371,12 @@ export default async function academias(app: FastifyInstance) {
 
         const nombre = normalizeName(body.nombre);
 
+        const direccion = normalizeName(body.direccion);
+
+        const email = normalizeEmail(body.email);
+
+        await validateCiudadComuna(conn, body.ciudad_comuna_id);
+
         const sucursales = body.sucursales.map(normalizeName);
 
         const categorias = body.categorias.map(normalizeName);
@@ -1158,12 +1445,15 @@ export default async function academias(app: FastifyInstance) {
                 nombre,
                 rut_academia,
                 deporte_id,
+                direccion,
+                ciudad_comuna_id,
+                email,
                 estado_id
               )
 
-              VALUES (?, ?, ?, ?)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
             `,
-          [nombre, body.rut_academia, body.deporte_id, body.estado_id]
+          [nombre, body.rut_academia, body.deporte_id, direccion, body.ciudad_comuna_id, email, body.estado_id]
         );
 
         const academiaId = Number(resultAcademia.insertId);
@@ -1215,7 +1505,7 @@ export default async function academias(app: FastifyInstance) {
         for (const config of tiposPago) {
           await upsertTipoPagoAcademia(conn, academiaId, config.tipo_pago_id, config.estado_id);
 
-          await upsertTarifaAcademia(conn, academiaId, config.tipo_pago_id, config.monto, config.estado_id);
+          await syncTarifaAcademiaVersionada(conn, academiaId, config.tipo_pago_id, config.monto, config.estado_id);
         }
 
         /* -----------------------------
@@ -1290,7 +1580,16 @@ export default async function academias(app: FastifyInstance) {
                 ta.monto,
 
                 ta.estado_id
-                  AS tarifa_estado_id
+                  AS tarifa_estado_id,
+
+                ta.vigencia_desde
+                  AS tarifa_vigencia_desde,
+
+                ta.vigencia_hasta
+                  AS tarifa_vigencia_hasta,
+
+                ta.es_vigente
+                  AS tarifa_es_vigente
 
               FROM academia_tipo_pago atp
 
@@ -1304,6 +1603,8 @@ export default async function academias(app: FastifyInstance) {
 
                AND ta.tipo_pago_id =
                    atp.tipo_pago_id
+
+               AND ta.es_vigente = 1
 
               WHERE atp.academia_id = ?
 
@@ -1359,6 +1660,12 @@ export default async function academias(app: FastifyInstance) {
             rut_academia: body.rut_academia,
 
             deporte_id: body.deporte_id,
+
+            direccion,
+
+            ciudad_comuna_id: body.ciudad_comuna_id,
+
+            email,
 
             estado_id: body.estado_id,
 
@@ -1429,6 +1736,9 @@ export default async function academias(app: FastifyInstance) {
           body.nombre === undefined &&
           body.rut_academia === undefined &&
           body.deporte_id === undefined &&
+          body.direccion === undefined &&
+          body.ciudad_comuna_id === undefined &&
+          body.email === undefined &&
           body.estado_id === undefined &&
           body.sucursales === undefined &&
           body.categorias === undefined &&
@@ -1482,6 +1792,10 @@ export default async function academias(app: FastifyInstance) {
           if (rutRows?.length) {
             conflict("Ya existe otra academia registrada con ese RUT");
           }
+        }
+
+        if (body.ciudad_comuna_id !== undefined) {
+          await validateCiudadComuna(conn, body.ciudad_comuna_id);
         }
 
         /* -----------------------------
@@ -1571,6 +1885,24 @@ export default async function academias(app: FastifyInstance) {
           sets.push("deporte_id = ?");
 
           updateParams.push(body.deporte_id);
+        }
+
+        if (body.direccion !== undefined) {
+          sets.push("direccion = ?");
+
+          updateParams.push(normalizeName(body.direccion));
+        }
+
+        if (body.ciudad_comuna_id !== undefined) {
+          sets.push("ciudad_comuna_id = ?");
+
+          updateParams.push(body.ciudad_comuna_id);
+        }
+
+        if (body.email !== undefined) {
+          sets.push("email = ?");
+
+          updateParams.push(normalizeEmail(body.email));
         }
 
         if (body.estado_id !== undefined) {
@@ -1787,36 +2119,19 @@ export default async function academias(app: FastifyInstance) {
 
         if (tiposPago) {
           /*
-           * No eliminamos configuración histórica.
+           * La lista enviada es autoritativa para disponibilidad,
+           * pero nunca eliminamos historia financiera.
            */
-          await conn.query(
-            `
-              UPDATE academia_tipo_pago
-
-              SET
-                estado_id = ?
-
-              WHERE academia_id = ?
-            `,
-            [ESTADO_INACTIVO, academiaId]
-          );
-
-          await conn.query(
-            `
-              UPDATE tarifas_academia
-
-              SET
-                estado_id = ?
-
-              WHERE academia_id = ?
-            `,
-            [ESTADO_INACTIVO, academiaId]
+          await deactivateOmittedTiposPago(
+            conn,
+            academiaId,
+            tiposPago.map((item) => item.tipo_pago_id)
           );
 
           for (const config of tiposPago) {
             await upsertTipoPagoAcademia(conn, academiaId, config.tipo_pago_id, config.estado_id);
 
-            await upsertTarifaAcademia(conn, academiaId, config.tipo_pago_id, config.monto, config.estado_id);
+            await syncTarifaAcademiaVersionada(conn, academiaId, config.tipo_pago_id, config.monto, config.estado_id);
           }
 
           /*

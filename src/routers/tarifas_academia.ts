@@ -9,70 +9,157 @@ import { db } from "../db";
 import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
 /**
- * Tabla: tarifas_academia
+ * ============================================================
+ * WELI - TARIFAS POR ACADEMIA
+ * ============================================================
  *
- * Campos:
- * - id
- * - academia_id
- * - tipo_pago_id
- * - monto
- * - estado_id
- * - created_at
- * - updated_at
+ * Tabla:
  *
- * Seguridad:
- * - READ: roles 1, 3
- * - WRITE: roles 1, 3
+ * tarifas_academia
+ *
+ * Responsabilidad:
+ *
+ * Cada academia define cuánto cobra por cada tipo de pago
+ * previamente habilitado mediante academia_tipo_pago.
+ *
+ *
+ * MODELO HISTÓRICO
+ * ------------------------------------------------------------
+ *
+ * Una modificación de precio NO sobrescribe la tarifa anterior.
+ *
+ * Ejemplo:
+ *
+ *  Mantención:
+ *
+ *  $20.000
+ *  2026-01-01 -> 2026-09-16
+ *  es_vigente = NULL
+ *
+ *  $25.000
+ *  2026-09-16 -> NULL
+ *  es_vigente = 1
+ *
+ *
+ * Regla:
+ *
+ * - es_vigente = 1
+ *      tarifa actual.
+ *
+ * - es_vigente = NULL
+ *      tarifa histórica.
+ *
+ * Solo puede existir UNA tarifa vigente por:
+ *
+ *   academia_id + tipo_pago_id
+ *
+ * mediante:
+ *
+ * uq_tarifa_vigente_academia_tipo
+ *
+ *
+ * TRAZABILIDAD
+ * ------------------------------------------------------------
+ *
+ * pago_detalle.tarifa_id apunta a la versión exacta
+ * de tarifa utilizada al momento del cobro.
+ *
+ * Por tanto:
+ *
+ * - nunca modificamos el monto de una tarifa histórica;
+ * - cambiar precio crea una nueva versión;
+ * - el historial permanece disponible.
+ *
+ *
+ * SEGURIDAD
+ * ------------------------------------------------------------
+ *
+ * Roles:
+ *
+ * Admin      = 1
+ * Superadmin = 3
  *
  * academia_id:
- * - Admin: academia firmada en JWT.
- * - Superadmin: x-academia-id validado.
- * - Nunca se recibe academia_id desde el body.
  *
- * Reglas:
- * - tipo_pago_id referencia tipo_pago global.
- * - el tipo de pago debe estar habilitado para la academia
- *   mediante academia_tipo_pago.
- * - solo puede existir una tarifa por academia + tipo_pago_id.
- * - la tarifa histórica no debe eliminarse si ya fue utilizada
- *   por pago_detalle.
+ * Admin:
+ * - proviene del JWT.
+ *
+ * Superadmin:
+ * - proviene de x-academia-id.
+ *
+ * academia_id NUNCA se recibe desde el body.
+ * ============================================================
  */
 
-/* =========================================================
+/* ============================================================
    SCHEMAS
-========================================================= */
+============================================================ */
 
 const IdParam = z.object({
   id: z.coerce.number().int().positive(),
 });
 
+const EstadoSchema = z.coerce.number().int().min(0).max(1);
+
+const MontoSchema = z.coerce.number().finite().nonnegative().max(99999999.99);
+
+/*
+ * Crear una tarifa significa crear
+ * la tarifa VIGENTE.
+ */
 const CreateSchema = z
   .object({
     tipo_pago_id: z.coerce.number().int().positive(),
 
-    monto: z.coerce.number().finite().nonnegative().max(999999999.99),
+    monto: MontoSchema,
 
-    estado_id: z.coerce.number().int().positive().max(255).default(1),
+    /*
+     * Se mantiene por compatibilidad.
+     *
+     * Una tarifa nueva debe quedar activa.
+     */
+    estado_id: EstadoSchema.default(1),
   })
   .strict();
 
+/*
+ * PUT:
+ *
+ * Permitimos recibir tipo_pago_id por compatibilidad
+ * con clientes existentes, pero NO permitiremos cambiarlo.
+ *
+ * La identidad histórica de la tarifa debe mantenerse.
+ */
 const PutSchema = z
   .object({
     tipo_pago_id: z.coerce.number().int().positive(),
 
-    monto: z.coerce.number().finite().nonnegative().max(999999999.99),
+    monto: MontoSchema,
 
-    estado_id: z.coerce.number().int().positive().max(255),
+    estado_id: EstadoSchema.default(1),
   })
   .strict();
 
+/*
+ * PATCH:
+ *
+ * - monto:
+ *     genera nueva versión si cambia.
+ *
+ * - estado_id = 0:
+ *     cierra la tarifa vigente.
+ *
+ * - tipo_pago_id:
+ *     se acepta por compatibilidad,
+ *     pero no puede cambiar respecto de la tarifa.
+ */
 const PatchSchema = z
   .object({
     tipo_pago_id: z.coerce.number().int().positive().optional(),
 
-    monto: z.coerce.number().finite().nonnegative().max(999999999.99).optional(),
+    monto: MontoSchema.optional(),
 
-    estado_id: z.coerce.number().int().positive().max(255).optional(),
+    estado_id: EstadoSchema.optional(),
   })
   .strict();
 
@@ -80,33 +167,57 @@ const QuerySchema = z
   .object({
     tipo_pago_id: z.coerce.number().int().positive().optional(),
 
-    estado_id: z.coerce.number().int().positive().max(255).optional(),
+    estado_id: EstadoSchema.optional(),
+
+    /*
+     * 0:
+     *   solo tarifas vigentes.
+     *
+     * 1:
+     *   incluye historial.
+     */
+    incluir_historial: z
+      .enum(["0", "1"])
+      .default("0")
+      .transform((value) => value === "1"),
 
     limit: z.coerce.number().int().min(1).max(500).default(200),
   })
   .strict();
 
-/* =========================================================
-   HELPERS
-========================================================= */
+/* ============================================================
+   HELPERS GENERALES
+============================================================ */
 
 function zodDetail(err: ZodError): string {
   return err.issues.map((issue) => `${issue.path.join(".") || "field"}: ${issue.message}`).join("; ");
 }
 
+function makeHttpError(statusCode: number, message: string) {
+  const err: any = new Error(message);
+
+  err.statusCode = statusCode;
+
+  return err;
+}
+
+/* ============================================================
+   ACADEMIA EFECTIVA
+============================================================ */
+
 function resolveAcademiaId(req: FastifyRequest): number {
   const academiaId = Number(getEffectiveAcademiaId(req));
 
   if (!Number.isInteger(academiaId) || academiaId <= 0) {
-    const err: any = new Error("Academia efectiva inválida");
-
-    err.statusCode = 403;
-
-    throw err;
+    throw makeHttpError(403, "Academia efectiva inválida");
   }
 
   return academiaId;
 }
+
+/* ============================================================
+   NORMALIZACIÓN
+============================================================ */
 
 function normalize(row: any) {
   return {
@@ -124,39 +235,56 @@ function normalize(row: any) {
 
     estado_id: Number(row.estado_id),
 
+    vigencia_desde: row.vigencia_desde ?? null,
+
+    vigencia_hasta: row.vigencia_hasta ?? null,
+
+    es_vigente: row.es_vigente == null ? null : Number(row.es_vigente),
+
     created_at: row.created_at ?? null,
 
     updated_at: row.updated_at ?? null,
   };
 }
 
-/* =========================================================
-   OBTENER TARIFA
-========================================================= */
+/* ============================================================
+   SELECT BASE
+============================================================ */
 
-async function getTarifa(academiaId: number, id: number) {
-  const [rows]: any = await db.query(
+const SELECT_TARIFA = `
+  SELECT
+    ta.id,
+    ta.academia_id,
+    ta.tipo_pago_id,
+    ta.monto,
+    ta.estado_id,
+    ta.vigencia_desde,
+    ta.vigencia_hasta,
+    ta.es_vigente,
+    ta.created_at,
+    ta.updated_at,
+
+    tp.nombre
+      AS tipo_pago_nombre,
+
+    tp.descripcion
+      AS tipo_pago_descripcion
+
+  FROM tarifas_academia ta
+
+  INNER JOIN tipo_pago tp
+    ON tp.id =
+       ta.tipo_pago_id
+`;
+
+/* ============================================================
+   OBTENER TARIFA POR ID
+============================================================ */
+
+async function getTarifa(academiaId: number, id: number, executor: any = db) {
+  const [rows]: any = await executor.query(
     `
-        SELECT
-          ta.id,
-          ta.academia_id,
-          ta.tipo_pago_id,
-          ta.monto,
-          ta.estado_id,
-          ta.created_at,
-          ta.updated_at,
-
-          tp.nombre
-            AS tipo_pago_nombre,
-
-          tp.descripcion
-            AS tipo_pago_descripcion
-
-        FROM tarifas_academia ta
-
-        INNER JOIN tipo_pago tp
-          ON tp.id =
-             ta.tipo_pago_id
+        ${SELECT_TARIFA}
 
         WHERE ta.id = ?
           AND ta.academia_id = ?
@@ -169,16 +297,111 @@ async function getTarifa(academiaId: number, id: number) {
   return rows?.length ? rows[0] : null;
 }
 
-/* =========================================================
-   VALIDAR TIPO HABILITADO
-========================================================= */
+/* ============================================================
+   OBTENER TARIFA PARA UPDATE / LOCK
+============================================================ */
 
-async function validateTipoPagoEnabled(academiaId: number, tipoPagoId: number) {
-  const [rows]: any = await db.query(
+async function getTarifaForUpdate(academiaId: number, id: number, connection: any) {
+  const [rows]: any = await connection.query(
+    `
+        SELECT
+          id,
+          academia_id,
+          tipo_pago_id,
+          monto,
+          estado_id,
+          vigencia_desde,
+          vigencia_hasta,
+          es_vigente,
+          created_at,
+          updated_at
+
+        FROM tarifas_academia
+
+        WHERE id = ?
+          AND academia_id = ?
+
+        LIMIT 1
+
+        FOR UPDATE
+      `,
+    [id, academiaId]
+  );
+
+  return rows?.length ? rows[0] : null;
+}
+
+/* ============================================================
+   OBTENER TARIFA VIGENTE POR TIPO
+============================================================ */
+
+async function getTarifaVigente(academiaId: number, tipoPagoId: number, executor: any = db) {
+  const [rows]: any = await executor.query(
+    `
+        ${SELECT_TARIFA}
+
+        WHERE ta.academia_id = ?
+          AND ta.tipo_pago_id = ?
+          AND ta.es_vigente = 1
+
+        LIMIT 1
+      `,
+    [academiaId, tipoPagoId]
+  );
+
+  return rows?.length ? rows[0] : null;
+}
+
+/* ============================================================
+   TARIFA VIGENTE PARA UPDATE / LOCK
+============================================================ */
+
+async function getTarifaVigenteForUpdate(academiaId: number, tipoPagoId: number, connection: any) {
+  const [rows]: any = await connection.query(
+    `
+        SELECT
+          id,
+          academia_id,
+          tipo_pago_id,
+          monto,
+          estado_id,
+          vigencia_desde,
+          vigencia_hasta,
+          es_vigente,
+          created_at,
+          updated_at
+
+        FROM tarifas_academia
+
+        WHERE academia_id = ?
+          AND tipo_pago_id = ?
+          AND es_vigente = 1
+
+        LIMIT 1
+
+        FOR UPDATE
+      `,
+    [academiaId, tipoPagoId]
+  );
+
+  return rows?.length ? rows[0] : null;
+}
+
+/* ============================================================
+   VALIDAR TIPO DE PAGO HABILITADO
+============================================================ */
+
+async function validateTipoPagoEnabled(academiaId: number, tipoPagoId: number, executor: any = db) {
+  const [rows]: any = await executor.query(
     `
         SELECT
           atp.id,
+
           atp.estado_id
+            AS academia_estado_id,
+
+          tp.estado_id
+            AS global_estado_id
 
         FROM academia_tipo_pago atp
 
@@ -194,56 +417,28 @@ async function validateTipoPagoEnabled(academiaId: number, tipoPagoId: number) {
     [academiaId, tipoPagoId]
   );
 
-  if (!rows?.length) {
-    throw new Error("El tipo de pago no está asociado a la academia");
+  if (!Array.isArray(rows) || !rows.length) {
+    throw makeHttpError(400, "El tipo de pago no está asociado a la academia");
   }
 
-  if (Number(rows[0].estado_id) !== 1) {
-    throw new Error("El tipo de pago no se encuentra habilitado para la academia");
+  if (Number(rows[0].global_estado_id) !== 1) {
+    throw makeHttpError(409, "El tipo de pago se encuentra deshabilitado globalmente");
+  }
+
+  if (Number(rows[0].academia_estado_id) !== 1) {
+    throw makeHttpError(400, "El tipo de pago no se encuentra habilitado para la academia");
   }
 }
 
-/* =========================================================
-   DUPLICIDAD
-========================================================= */
-
-async function existsTarifa(academiaId: number, tipoPagoId: number, excludeId?: number) {
-  const values: any[] = [academiaId, tipoPagoId];
-
-  let sql = `
-    SELECT id
-
-    FROM tarifas_academia
-
-    WHERE academia_id = ?
-      AND tipo_pago_id = ?
-  `;
-
-  if (excludeId !== undefined) {
-    sql += `
-      AND id <> ?
-    `;
-
-    values.push(excludeId);
-  }
-
-  sql += `
-    LIMIT 1
-  `;
-
-  const [rows]: any = await db.query(sql, values);
-
-  return Array.isArray(rows) && rows.length > 0;
-}
-
-/* =========================================================
+/* ============================================================
    DEPENDENCIAS HISTÓRICAS
-========================================================= */
+============================================================ */
 
 async function hasPaymentDependencies(tarifaId: number) {
   const [rows]: any = await db.query(
     `
-        SELECT id
+        SELECT
+          id
 
         FROM pago_detalle
 
@@ -257,63 +452,144 @@ async function hasPaymentDependencies(tarifaId: number) {
   return Array.isArray(rows) && rows.length > 0;
 }
 
-/* =========================================================
-   ERRORES SCOPE
-========================================================= */
+/* ============================================================
+   CERRAR TARIFA VIGENTE
+============================================================ */
 
-function handleScopeError(reply: FastifyReply, err: any) {
+async function cerrarTarifa(connection: any, academiaId: number, tarifaId: number) {
+  const [result]: any = await connection.query(
+    `
+        UPDATE tarifas_academia
+
+        SET
+          estado_id = 0,
+          es_vigente = NULL,
+          vigencia_hasta = NOW()
+
+        WHERE id = ?
+          AND academia_id = ?
+          AND es_vigente = 1
+
+        LIMIT 1
+      `,
+    [tarifaId, academiaId]
+  );
+
+  if (Number(result?.affectedRows ?? 0) === 0) {
+    throw makeHttpError(409, "La tarifa ya no se encuentra vigente");
+  }
+}
+
+/* ============================================================
+   CREAR NUEVA VERSIÓN
+============================================================ */
+
+async function crearTarifaVigente(
+  connection: any,
+  academiaId: number,
+  tipoPagoId: number,
+  monto: number
+): Promise<number> {
+  const [result]: any = await connection.query(
+    `
+        INSERT INTO tarifas_academia (
+          academia_id,
+          tipo_pago_id,
+          monto,
+          vigencia_desde,
+          vigencia_hasta,
+          es_vigente,
+          estado_id
+        )
+
+        VALUES (
+          ?,
+          ?,
+          ?,
+          NOW(),
+          NULL,
+          1,
+          1
+        )
+      `,
+    [academiaId, tipoPagoId, monto]
+  );
+
+  return Number(result?.insertId);
+}
+
+/* ============================================================
+   ERRORES
+============================================================ */
+
+function handleDatabaseError(reply: FastifyReply, err: any, operation: string) {
+  reply.header("Cache-Control", "no-store");
+
   const status = Number(err?.statusCode ?? 0);
 
-  if ([400, 401, 403].includes(status)) {
-    reply.header("Cache-Control", "no-store");
-
+  if ([400, 401, 403, 404, 409].includes(status)) {
     return reply.code(status).send({
       ok: false,
 
-      message: err?.message ?? "No fue posible determinar la academia efectiva",
+      message: err?.message ?? "No fue posible procesar la solicitud",
     });
   }
 
-  return null;
+  if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
+    return reply.code(409).send({
+      ok: false,
+
+      message: "Ya existe una tarifa vigente para este tipo de pago en la academia",
+    });
+  }
+
+  if (
+    err?.errno === 1451 ||
+    err?.code === "ER_ROW_IS_REFERENCED_2" ||
+    String(err?.code ?? "").includes("ER_ROW_IS_REFERENCED")
+  ) {
+    return reply.code(409).send({
+      ok: false,
+
+      message: "La tarifa posee información financiera relacionada y no puede eliminarse",
+    });
+  }
+
+  if (err?.errno === 1452 || err?.code === "ER_NO_REFERENCED_ROW_2") {
+    return reply.code(409).send({
+      ok: false,
+
+      message: "La academia o el tipo de pago indicado no existe",
+    });
+  }
+
+  console.error(`[tarifas_academia] ${operation}`, err);
+
+  return reply.code(500).send({
+    ok: false,
+
+    message: `Error al ${operation}`,
+
+    detail: err?.message,
+  });
 }
 
-/* =========================================================
-   VALIDACIONES DE NEGOCIO
-========================================================= */
-
-function isBusinessValidationError(err: any) {
-  const message = String(err?.message ?? "");
-
-  return [
-    "El tipo de pago no está asociado a la academia",
-    "El tipo de pago no se encuentra habilitado para la academia",
-  ].includes(message);
-}
-
-/* =========================================================
+/* ============================================================
    ROUTER
-========================================================= */
+============================================================ */
 
 export default async function tarifas_academia(app: FastifyInstance) {
   /*
-   * Seguridad:
-   *
-   * READ:
-   * - Admin
-   * - Superadmin
-   *
-   * WRITE:
-   * - Admin
-   * - Superadmin
+   * Admin y Superadmin pueden administrar
+   * tarifas de la academia efectiva.
    */
-
   const canRead = [requireAuth, requireRoles([1, 3])];
 
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  /* =======================================================
+  /* ==========================================================
      HEALTH
-  ======================================================= */
+  ========================================================== */
 
   app.get(
     "/health",
@@ -333,29 +609,25 @@ export default async function tarifas_academia(app: FastifyInstance) {
 
           academia_id: academiaId,
 
+          versionado: true,
+
           timestamp: new Date().toISOString(),
         });
       } catch (err: any) {
-        const handled = handleScopeError(reply, err);
-
-        if (handled) {
-          return handled;
-        }
-
-        reply.header("Cache-Control", "no-store");
-
-        return reply.code(500).send({
-          ok: false,
-
-          message: "Error en módulo tarifas_academia",
-        });
+        return handleDatabaseError(reply, err, "consultar módulo de tarifas");
       }
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
      GET /
-  ======================================================= */
+
+     Por defecto:
+     - solo tarifas vigentes.
+
+     ?incluir_historial=1
+     - incluye todas las versiones.
+  ========================================================== */
 
   app.get(
     "/",
@@ -371,6 +643,10 @@ export default async function tarifas_academia(app: FastifyInstance) {
         const where: string[] = ["ta.academia_id = ?"];
 
         const values: any[] = [academiaId];
+
+        if (!query.incluir_historial) {
+          where.push("ta.es_vigente = 1");
+        }
 
         if (query.tipo_pago_id !== undefined) {
           where.push("ta.tipo_pago_id = ?");
@@ -388,33 +664,22 @@ export default async function tarifas_academia(app: FastifyInstance) {
 
         const [rows]: any = await db.query(
           `
-              SELECT
-                ta.id,
-                ta.academia_id,
-                ta.tipo_pago_id,
-                ta.monto,
-                ta.estado_id,
-                ta.created_at,
-                ta.updated_at,
-
-                tp.nombre
-                  AS tipo_pago_nombre,
-
-                tp.descripcion
-                  AS tipo_pago_descripcion
-
-              FROM tarifas_academia ta
-
-              INNER JOIN tipo_pago tp
-                ON tp.id =
-                   ta.tipo_pago_id
+              ${SELECT_TARIFA}
 
               WHERE
                 ${where.join(" AND ")}
 
               ORDER BY
                 tp.nombre ASC,
-                ta.id ASC
+
+                CASE
+                  WHEN ta.es_vigente = 1
+                  THEN 0
+                  ELSE 1
+                END ASC,
+
+                ta.vigencia_desde DESC,
+                ta.id DESC
 
               LIMIT ?
             `,
@@ -428,14 +693,16 @@ export default async function tarifas_academia(app: FastifyInstance) {
 
           academia_id: academiaId,
 
+          incluye_historial: query.incluir_historial,
+
           count: rows?.length ?? 0,
 
           items: (rows ?? []).map(normalize),
         });
       } catch (err: any) {
-        reply.header("Cache-Control", "no-store");
-
         if (err instanceof ZodError) {
+          reply.header("Cache-Control", "no-store");
+
           return reply.code(400).send({
             ok: false,
 
@@ -445,24 +712,67 @@ export default async function tarifas_academia(app: FastifyInstance) {
           });
         }
 
-        const handled = handleScopeError(reply, err);
-
-        if (handled) {
-          return handled;
-        }
-
-        return reply.code(500).send({
-          ok: false,
-
-          message: "Error al listar tarifas de academia",
-        });
+        return handleDatabaseError(reply, err, "listar tarifas de academia");
       }
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
+     GET /tipo/:tipoPagoId
+
+     Obtiene tarifa vigente de un tipo de pago.
+  ========================================================== */
+
+  app.get(
+    "/tipo/:id",
+    {
+      preHandler: canRead,
+    },
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const parsed = IdParam.safeParse(req.params);
+
+      if (!parsed.success) {
+        reply.header("Cache-Control", "no-store");
+
+        return reply.code(400).send({
+          ok: false,
+          message: "ID inválido",
+        });
+      }
+
+      try {
+        const academiaId = resolveAcademiaId(req);
+
+        const row = await getTarifaVigente(academiaId, parsed.data.id);
+
+        reply.header("Cache-Control", "no-store");
+
+        if (!row) {
+          return reply.code(404).send({
+            ok: false,
+
+            message: "No existe una tarifa vigente para este tipo de pago",
+          });
+        }
+
+        return reply.send({
+          ok: true,
+
+          item: normalize(row),
+        });
+      } catch (err: any) {
+        return handleDatabaseError(reply, err, "obtener tarifa vigente");
+      }
+    }
+  );
+
+  /* ==========================================================
      GET /:id
-  ======================================================= */
+
+     Puede obtener:
+     - tarifa vigente;
+     - tarifa histórica.
+  ========================================================== */
 
   app.get(
     "/:id",
@@ -502,26 +812,23 @@ export default async function tarifas_academia(app: FastifyInstance) {
           item: normalize(row),
         });
       } catch (err: any) {
-        const handled = handleScopeError(reply, err);
-
-        if (handled) {
-          return handled;
-        }
-
-        reply.header("Cache-Control", "no-store");
-
-        return reply.code(500).send({
-          ok: false,
-
-          message: "Error al obtener tarifa",
-        });
+        return handleDatabaseError(reply, err, "obtener tarifa");
       }
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
      POST /
-  ======================================================= */
+
+     CREA UNA NUEVA TARIFA VIGENTE.
+
+     Si ya existe una tarifa vigente para:
+     academia + tipo_pago
+     devuelve 409.
+
+     Si solo existen tarifas históricas:
+     permite crear nueva vigencia.
+  ========================================================== */
 
   app.post(
     "/",
@@ -529,40 +836,48 @@ export default async function tarifas_academia(app: FastifyInstance) {
       preHandler: canWrite,
     },
     async (req: FastifyRequest, reply: FastifyReply) => {
+      let connection: any = null;
+
       try {
         const academiaId = resolveAcademiaId(req);
 
         const body = CreateSchema.parse(req.body);
 
-        await validateTipoPagoEnabled(academiaId, body.tipo_pago_id);
-
-        const duplicate = await existsTarifa(academiaId, body.tipo_pago_id);
-
-        if (duplicate) {
-          reply.header("Cache-Control", "no-store");
-
-          return reply.code(409).send({
+        /*
+         * Una tarifa nueva siempre
+         * debe comenzar vigente.
+         */
+        if (Number(body.estado_id) !== 1) {
+          return reply.code(400).send({
             ok: false,
 
-            message: "Ya existe una tarifa para este tipo de pago en la academia",
+            message: "Una tarifa nueva debe crearse activa",
           });
         }
 
-        const [result]: any = await db.query(
-          `
-              INSERT INTO tarifas_academia (
-                academia_id,
-                tipo_pago_id,
-                monto,
-                estado_id
-              )
+        connection = await db.getConnection();
 
-              VALUES (?, ?, ?, ?)
-            `,
-          [academiaId, body.tipo_pago_id, body.monto, body.estado_id]
-        );
+        await connection.beginTransaction();
 
-        const insertId = Number(result?.insertId);
+        /*
+         * La validación se ejecuta dentro
+         * de la misma transacción.
+         */
+        await validateTipoPagoEnabled(academiaId, body.tipo_pago_id, connection);
+
+        /*
+         * Bloqueamos una eventual tarifa
+         * vigente concurrente.
+         */
+        const current = await getTarifaVigenteForUpdate(academiaId, body.tipo_pago_id, connection);
+
+        if (current) {
+          throw makeHttpError(409, "Ya existe una tarifa vigente para este tipo de pago en la academia");
+        }
+
+        const insertId = await crearTarifaVigente(connection, academiaId, body.tipo_pago_id, Number(body.monto));
+
+        await connection.commit();
 
         const row = await getTarifa(academiaId, insertId);
 
@@ -584,13 +899,23 @@ export default async function tarifas_academia(app: FastifyInstance) {
 
                 monto: Number(body.monto),
 
-                estado_id: body.estado_id,
+                estado_id: 1,
+
+                es_vigente: 1,
               },
         });
       } catch (err: any) {
-        reply.header("Cache-Control", "no-store");
+        if (connection) {
+          try {
+            await connection.rollback();
+          } catch {
+            // No-op
+          }
+        }
 
         if (err instanceof ZodError) {
+          reply.header("Cache-Control", "no-store");
+
           return reply.code(400).send({
             ok: false,
 
@@ -600,47 +925,30 @@ export default async function tarifas_academia(app: FastifyInstance) {
           });
         }
 
-        const handled = handleScopeError(reply, err);
-
-        if (handled) {
-          return handled;
+        return handleDatabaseError(reply, err, "crear tarifa");
+      } finally {
+        if (connection) {
+          connection.release();
         }
-
-        if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
-          return reply.code(409).send({
-            ok: false,
-
-            message: "Ya existe una tarifa para este tipo de pago en la academia",
-          });
-        }
-
-        if (isBusinessValidationError(err)) {
-          return reply.code(400).send({
-            ok: false,
-            message: err.message,
-          });
-        }
-
-        if (err?.errno === 1452 || err?.code === "ER_NO_REFERENCED_ROW_2") {
-          return reply.code(409).send({
-            ok: false,
-
-            message: "La academia o el tipo de pago indicado no existe",
-          });
-        }
-
-        return reply.code(500).send({
-          ok: false,
-
-          message: "Error al crear tarifa",
-        });
       }
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
      PUT /:id
-  ======================================================= */
+
+     REEMPLAZO FUNCIONAL DE TARIFA VIGENTE.
+
+     IMPORTANTE:
+     NO actualiza monto histórico.
+
+     Si cambia el monto:
+     1. cierra tarifa actual;
+     2. inserta nueva versión.
+
+     estado_id = 0:
+     cierra tarifa sin crear reemplazo.
+  ========================================================== */
 
   app.put(
     "/:id",
@@ -659,109 +967,126 @@ export default async function tarifas_academia(app: FastifyInstance) {
         });
       }
 
+      let connection: any = null;
+
       try {
         const academiaId = resolveAcademiaId(req);
 
         const id = parsed.data.id;
 
-        const current = await getTarifa(academiaId, id);
-
-        if (!current) {
-          reply.header("Cache-Control", "no-store");
-
-          return reply.code(404).send({
-            ok: false,
-
-            message: "Tarifa no encontrada",
-          });
-        }
-
         const body = PutSchema.parse(req.body);
 
-        const changingTipoPago = Number(body.tipo_pago_id) !== Number(current.tipo_pago_id);
+        connection = await db.getConnection();
+
+        await connection.beginTransaction();
+
+        const current = await getTarifaForUpdate(academiaId, id, connection);
+
+        if (!current) {
+          throw makeHttpError(404, "Tarifa no encontrada");
+        }
 
         /*
-         * Si la tarifa ya fue utilizada,
-         * no se permite cambiar su identidad
-         * hacia otro tipo_pago.
-         *
-         * El monto sí puede cambiar porque
-         * pago_detalle conserva el snapshot histórico.
+         * Una tarifa histórica
+         * jamás se modifica.
          */
-        if (changingTipoPago && (await hasPaymentDependencies(id))) {
-          reply.header("Cache-Control", "no-store");
+        if (Number(current.es_vigente) !== 1) {
+          throw makeHttpError(409, "La tarifa es histórica y no puede modificarse");
+        }
 
-          return reply.code(409).send({
-            ok: false,
+        /*
+         * La identidad del concepto
+         * NO puede cambiar.
+         */
+        if (Number(body.tipo_pago_id) !== Number(current.tipo_pago_id)) {
+          throw makeHttpError(409, "No se puede cambiar el tipo de pago de una tarifa existente");
+        }
 
-            message: "La tarifa posee historial financiero y no puede cambiar de tipo de pago",
+        await validateTipoPagoEnabled(academiaId, current.tipo_pago_id, connection);
+
+        /*
+         * estado_id = 0:
+         * cerrar tarifa sin reemplazo.
+         */
+        if (Number(body.estado_id) === 0) {
+          await cerrarTarifa(connection, academiaId, id);
+
+          await connection.commit();
+
+          const closed = await getTarifa(academiaId, id);
+
+          return reply.send({
+            ok: true,
+
+            action: "closed",
+
+            item: closed ? normalize(closed) : null,
           });
         }
 
-        await validateTipoPagoEnabled(academiaId, body.tipo_pago_id);
+        const nuevoMonto = Number(body.monto);
 
-        const duplicate = await existsTarifa(academiaId, body.tipo_pago_id, id);
+        const montoActual = Number(current.monto);
 
-        if (duplicate) {
-          reply.header("Cache-Control", "no-store");
+        /*
+         * Si no cambió nada,
+         * no creamos una versión inútil.
+         */
+        if (nuevoMonto === montoActual) {
+          await connection.commit();
 
-          return reply.code(409).send({
-            ok: false,
+          const same = await getTarifa(academiaId, id);
 
-            message: "Ya existe otra tarifa para este tipo de pago en la academia",
+          return reply.send({
+            ok: true,
+
+            action: "unchanged",
+
+            item: same ? normalize(same) : null,
           });
         }
 
-        const [result]: any = await db.query(
-          `
-              UPDATE tarifas_academia
+        /*
+         * VERSIONADO:
+         *
+         * cerrar anterior.
+         */
+        await cerrarTarifa(connection, academiaId, id);
 
-              SET
-                tipo_pago_id = ?,
-                monto = ?,
-                estado_id = ?
+        /*
+         * crear nueva.
+         */
+        const newId = await crearTarifaVigente(connection, academiaId, current.tipo_pago_id, nuevoMonto);
 
-              WHERE id = ?
-                AND academia_id = ?
+        await connection.commit();
 
-              LIMIT 1
-            `,
-          [body.tipo_pago_id, body.monto, body.estado_id, id, academiaId]
-        );
+        const updated = await getTarifa(academiaId, newId);
 
         reply.header("Cache-Control", "no-store");
-
-        if (Number(result?.affectedRows ?? 0) === 0) {
-          return reply.code(404).send({
-            ok: false,
-
-            message: "Tarifa no encontrada",
-          });
-        }
-
-        const updated = await getTarifa(academiaId, id);
 
         return reply.send({
           ok: true,
 
-          updated: updated
-            ? normalize(updated)
-            : {
-                id,
+          action: "versioned",
 
-                academia_id: academiaId,
+          previous_tarifa_id: id,
 
-                tipo_pago_id: body.tipo_pago_id,
+          tarifa_id: newId,
 
-                monto: Number(body.monto),
-
-                estado_id: body.estado_id,
-              },
+          item: updated ? normalize(updated) : null,
         });
       } catch (err: any) {
-        reply.header("Cache-Control", "no-store");
+        if (connection) {
+          try {
+            await connection.rollback();
+          } catch {
+            // No-op
+          }
+        }
 
         if (err instanceof ZodError) {
+          reply.header("Cache-Control", "no-store");
+
           return reply.code(400).send({
             ok: false,
 
@@ -771,39 +1096,26 @@ export default async function tarifas_academia(app: FastifyInstance) {
           });
         }
 
-        const handled = handleScopeError(reply, err);
-
-        if (handled) {
-          return handled;
+        return handleDatabaseError(reply, err, "actualizar tarifa");
+      } finally {
+        if (connection) {
+          connection.release();
         }
-
-        if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
-          return reply.code(409).send({
-            ok: false,
-
-            message: "Ya existe otra tarifa para este tipo de pago en la academia",
-          });
-        }
-
-        if (isBusinessValidationError(err)) {
-          return reply.code(400).send({
-            ok: false,
-            message: err.message,
-          });
-        }
-
-        return reply.code(500).send({
-          ok: false,
-
-          message: "Error al actualizar tarifa",
-        });
       }
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
      PATCH /:id
-  ======================================================= */
+
+     ACTUALIZACIÓN PARCIAL.
+
+     Misma regla:
+     - tarifa histórica = inmutable;
+     - monto distinto = nueva versión;
+     - estado_id 0 = cierre;
+     - tipo_pago_id NO puede cambiar.
+  ========================================================== */
 
   app.patch(
     "/:id",
@@ -822,28 +1134,16 @@ export default async function tarifas_academia(app: FastifyInstance) {
         });
       }
 
+      let connection: any = null;
+
       try {
         const academiaId = resolveAcademiaId(req);
 
         const id = parsed.data.id;
 
-        const current = await getTarifa(academiaId, id);
-
-        if (!current) {
-          reply.header("Cache-Control", "no-store");
-
-          return reply.code(404).send({
-            ok: false,
-
-            message: "Tarifa no encontrada",
-          });
-        }
-
         const body = PatchSchema.parse(req.body);
 
         if (Object.keys(body).length === 0) {
-          reply.header("Cache-Control", "no-store");
-
           return reply.code(400).send({
             ok: false,
 
@@ -851,90 +1151,110 @@ export default async function tarifas_academia(app: FastifyInstance) {
           });
         }
 
-        const tipoPagoId = body.tipo_pago_id ?? Number(current.tipo_pago_id);
+        connection = await db.getConnection();
 
-        const monto = body.monto ?? Number(current.monto);
+        await connection.beginTransaction();
 
-        const estadoId = body.estado_id ?? Number(current.estado_id);
+        const current = await getTarifaForUpdate(academiaId, id, connection);
 
-        const changingTipoPago = Number(tipoPagoId) !== Number(current.tipo_pago_id);
+        if (!current) {
+          throw makeHttpError(404, "Tarifa no encontrada");
+        }
 
-        if (changingTipoPago && (await hasPaymentDependencies(id))) {
-          reply.header("Cache-Control", "no-store");
+        if (Number(current.es_vigente) !== 1) {
+          throw makeHttpError(409, "La tarifa es histórica y no puede modificarse");
+        }
 
-          return reply.code(409).send({
-            ok: false,
+        /*
+         * Aunque venga tipo_pago_id,
+         * debe corresponder al mismo concepto.
+         */
+        if (body.tipo_pago_id !== undefined && Number(body.tipo_pago_id) !== Number(current.tipo_pago_id)) {
+          throw makeHttpError(409, "No se puede cambiar el tipo de pago de una tarifa existente");
+        }
 
-            message: "La tarifa posee historial financiero y no puede cambiar de tipo de pago",
+        await validateTipoPagoEnabled(academiaId, current.tipo_pago_id, connection);
+
+        /*
+         * Cierre explícito.
+         */
+        if (body.estado_id === 0) {
+          await cerrarTarifa(connection, academiaId, id);
+
+          await connection.commit();
+
+          const closed = await getTarifa(academiaId, id);
+
+          return reply.send({
+            ok: true,
+
+            action: "closed",
+
+            item: closed ? normalize(closed) : null,
           });
         }
 
-        if (body.tipo_pago_id !== undefined) {
-          await validateTipoPagoEnabled(academiaId, tipoPagoId);
+        const montoActual = Number(current.monto);
 
-          const duplicate = await existsTarifa(academiaId, tipoPagoId, id);
+        const nuevoMonto = body.monto !== undefined ? Number(body.monto) : montoActual;
 
-          if (duplicate) {
-            reply.header("Cache-Control", "no-store");
+        /*
+         * Si no cambió monto:
+         * no generamos versión.
+         */
+        if (nuevoMonto === montoActual) {
+          await connection.commit();
 
-            return reply.code(409).send({
-              ok: false,
+          const same = await getTarifa(academiaId, id);
 
-              message: "Ya existe otra tarifa para este tipo de pago en la academia",
-            });
-          }
+          return reply.send({
+            ok: true,
+
+            action: "unchanged",
+
+            item: same ? normalize(same) : null,
+          });
         }
 
-        const [result]: any = await db.query(
-          `
-              UPDATE tarifas_academia
+        /*
+         * Cerrar versión anterior.
+         */
+        await cerrarTarifa(connection, academiaId, id);
 
-              SET
-                tipo_pago_id = ?,
-                monto = ?,
-                estado_id = ?
+        /*
+         * Crear nueva versión.
+         */
+        const newId = await crearTarifaVigente(connection, academiaId, current.tipo_pago_id, nuevoMonto);
 
-              WHERE id = ?
-                AND academia_id = ?
+        await connection.commit();
 
-              LIMIT 1
-            `,
-          [tipoPagoId, monto, estadoId, id, academiaId]
-        );
+        const updated = await getTarifa(academiaId, newId);
 
         reply.header("Cache-Control", "no-store");
-
-        if (Number(result?.affectedRows ?? 0) === 0) {
-          return reply.code(404).send({
-            ok: false,
-
-            message: "Tarifa no encontrada",
-          });
-        }
-
-        const updated = await getTarifa(academiaId, id);
 
         return reply.send({
           ok: true,
 
-          updated: updated
-            ? normalize(updated)
-            : {
-                id,
+          action: "versioned",
 
-                academia_id: academiaId,
+          previous_tarifa_id: id,
 
-                tipo_pago_id: tipoPagoId,
+          tarifa_id: newId,
 
-                monto,
-
-                estado_id: estadoId,
-              },
+          item: updated ? normalize(updated) : null,
         });
       } catch (err: any) {
-        reply.header("Cache-Control", "no-store");
+        if (connection) {
+          try {
+            await connection.rollback();
+          } catch {
+            // No-op
+          }
+        }
 
         if (err instanceof ZodError) {
+          reply.header("Cache-Control", "no-store");
+
           return reply.code(400).send({
             ok: false,
 
@@ -944,39 +1264,28 @@ export default async function tarifas_academia(app: FastifyInstance) {
           });
         }
 
-        const handled = handleScopeError(reply, err);
-
-        if (handled) {
-          return handled;
+        return handleDatabaseError(reply, err, "actualizar tarifa");
+      } finally {
+        if (connection) {
+          connection.release();
         }
-
-        if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
-          return reply.code(409).send({
-            ok: false,
-
-            message: "Ya existe otra tarifa para este tipo de pago en la academia",
-          });
-        }
-
-        if (isBusinessValidationError(err)) {
-          return reply.code(400).send({
-            ok: false,
-            message: err.message,
-          });
-        }
-
-        return reply.code(500).send({
-          ok: false,
-
-          message: "Error al actualizar tarifa",
-        });
       }
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
      DELETE /:id
-  ======================================================= */
+
+     Borrado físico permitido SOLO si:
+     - pertenece a la academia;
+     - no posee pago_detalle asociado.
+
+     Para una tarifa utilizada:
+     nunca se elimina.
+
+     Para conservar historial normalmente se recomienda
+     cerrar la tarifa mediante PATCH estado_id = 0.
+  ========================================================== */
 
   app.delete(
     "/:id",
@@ -1003,8 +1312,6 @@ export default async function tarifas_academia(app: FastifyInstance) {
         const current = await getTarifa(academiaId, id);
 
         if (!current) {
-          reply.header("Cache-Control", "no-store");
-
           return reply.code(404).send({
             ok: false,
 
@@ -1013,12 +1320,10 @@ export default async function tarifas_academia(app: FastifyInstance) {
         }
 
         if (await hasPaymentDependencies(id)) {
-          reply.header("Cache-Control", "no-store");
-
           return reply.code(409).send({
             ok: false,
 
-            message: "La tarifa posee historial financiero y no puede eliminarse. Debe desactivarse mediante estado_id",
+            message: "La tarifa posee historial financiero y no puede eliminarse",
           });
         }
 
@@ -1051,29 +1356,7 @@ export default async function tarifas_academia(app: FastifyInstance) {
           deleted: id,
         });
       } catch (err: any) {
-        reply.header("Cache-Control", "no-store");
-
-        const handled = handleScopeError(reply, err);
-
-        if (handled) {
-          return handled;
-        }
-
-        if (err?.errno === 1451 || String(err?.code ?? "").includes("ER_ROW_IS_REFERENCED")) {
-          return reply.code(409).send({
-            ok: false,
-
-            message: "No se puede eliminar la tarifa porque está siendo utilizada",
-
-            detail: err?.sqlMessage ?? err?.message,
-          });
-        }
-
-        return reply.code(500).send({
-          ok: false,
-
-          message: "Error al eliminar tarifa",
-        });
+        return handleDatabaseError(reply, err, "eliminar tarifa");
       }
     }
   );

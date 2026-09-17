@@ -30,7 +30,9 @@ import prevision_medica from "./routers/prevision_medica";
 import establec_educ from "./routers/establec_educ";
 import sucursales_real from "./routers/sucursales_real";
 import deportes from "./routers/deportes";
-
+import ciudades from "./routers/ciudades";
+import ciudad_comuna from "./routers/ciudad_comuna";  
+import regiones from "./routers/regiones";
 
 import estadisticas from "./routers/estadisticas";
 import convocatorias from "./routers/convocatorias";
@@ -82,6 +84,9 @@ export async function registerRoutes(app: FastifyInstance) {
   app.register(establec_educ, { prefix: `${API_BASE}/establecimientos-educ` });
   app.register(sucursales_real, { prefix: `${API_BASE}/sucursales-real` });
   app.register(deportes, { prefix: `${API_BASE}/deportes` });
+  app.register(ciudades, { prefix: `${API_BASE}/ciudades` });
+  app.register(ciudad_comuna, { prefix: `${API_BASE}/ciudad-comuna` });
+  app.register(regiones, { prefix: `${API_BASE}/regiones` });
 
   // ───────────────────────── Reportes ─────────────────────────
   app.register(estadisticas, { prefix: `${API_BASE}/estadisticas` });

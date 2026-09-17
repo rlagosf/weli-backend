@@ -1,5 +1,3 @@
-// src/routers/tipo_pago.ts
-
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { z, ZodError } from "zod";
@@ -9,85 +7,72 @@ import { db } from "../db";
 import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
 /**
- * =========================================================
+ * ============================================================
  * WELI - TIPOS DE PAGO
- * =========================================================
+ * ============================================================
  *
  * tipo_pago
- * ---------------------------------------------------------
- * Catálogo GLOBAL del sistema.
+ * ------------------------------------------------------------
+ * Catálogo GLOBAL.
  *
- * Campos reales:
+ * Ejemplos:
+ * - Matrícula
+ * - Mantención
+ * - Material deportivo
+ * - Torneo
+ * - Seguro
  *
- * - id
- * - nombre
- * - descripcion
- * - estado_id
+ * Solo Superadmin administra estructuralmente este catálogo.
+ *
  *
  * academia_tipo_pago
- * ---------------------------------------------------------
- * Determina qué conceptos están habilitados
- * para una academia.
+ * ------------------------------------------------------------
+ * Define qué tipos de pago utiliza cada academia.
+ *
+ * La ausencia de relación significa:
+ * - NO habilitado para esa academia.
+ *
  *
  * tarifas_academia
- * ---------------------------------------------------------
- * Determina el valor base configurado
- * por academia para cada tipo de pago.
+ * ------------------------------------------------------------
+ * Define el monto configurado por una academia para un
+ * tipo de pago habilitado.
  *
- * Rutas:
+ * Puede contener múltiples versiones históricas.
  *
- * GET /
- *   Catálogo EFECTIVO de la academia.
+ * La tarifa actualmente vigente se identifica mediante:
  *
- * GET /catalogo
- *   Catálogo GLOBAL.
- *   Solo Superadmin.
+ *   es_vigente = 1
  *
- * GET /:id
- *   Tipo de pago habilitado para
- *   la academia efectiva.
  *
- * POST /
- * PUT /:id
- * PATCH /:id
- * DELETE /:id
- *   Administración del catálogo global.
- *   Solo Superadmin.
- *
- * Seguridad:
+ * SEGURIDAD
+ * ------------------------------------------------------------
  *
  * Admin:
- * - puede leer configuración efectiva
- *   de su academia.
+ * - academia desde JWT firmado.
+ * - puede consultar catálogo efectivo.
+ * - puede consultar configuración.
+ * - puede habilitar/deshabilitar tipos para su academia.
+ * - NO modifica tipo_pago global.
  *
  * Superadmin:
- * - puede leer configuración efectiva
- *   de la academia seleccionada.
- * - puede consultar y administrar
- *   catálogo global.
+ * - academia desde x-academia-id para operaciones scoped.
+ * - administra catálogo global.
  *
  * academia_id:
- *
- * Admin:
- * - proviene del JWT firmado.
- *
- * Superadmin:
- * - proviene de x-academia-id.
- *
- * academia_id NUNCA se recibe
- * desde el body.
- * =========================================================
+ * - NUNCA se recibe desde el body.
+ * ============================================================
  */
 
-/* =========================================================
+/* ============================================================
    SCHEMAS
-========================================================= */
+============================================================ */
 
 const IdParam = z.object({
   id: z.coerce.number().int().positive(),
 });
 
-const EstadoSchema = z.coerce.number().int().positive().max(255);
+const EstadoSchema = z.coerce.number().int().min(0).max(1);
 
 const CreateSchema = z
   .object({
@@ -124,9 +109,23 @@ const PatchSchema = z
   })
   .strict();
 
-/* =========================================================
+const DisponibilidadSchema = z
+  .object({
+    estado_id: EstadoSchema,
+  })
+  .strict();
+
+const ConfiguracionQuerySchema = z
+  .object({
+    search: z.string().trim().max(120).optional().default(""),
+
+    estado_academia_id: EstadoSchema.optional(),
+  })
+  .strict();
+
+/* ============================================================
    HELPERS GENERALES
-========================================================= */
+============================================================ */
 
 function normalizeName(value: string): string {
   return String(value ?? "")
@@ -148,9 +147,9 @@ function zodDetail(err: ZodError): string {
   return err.issues.map((issue) => `${issue.path.join(".") || "field"}: ${issue.message}`).join("; ");
 }
 
-/* =========================================================
+/* ============================================================
    ACADEMIA EFECTIVA
-========================================================= */
+============================================================ */
 
 function resolveAcademiaId(req: FastifyRequest): number {
   const academiaId = Number(getEffectiveAcademiaId(req));
@@ -166,9 +165,9 @@ function resolveAcademiaId(req: FastifyRequest): number {
   return academiaId;
 }
 
-/* =========================================================
+/* ============================================================
    NORMALIZACIÓN GLOBAL
-========================================================= */
+============================================================ */
 
 function normalizeGlobal(row: any) {
   return {
@@ -182,15 +181,18 @@ function normalizeGlobal(row: any) {
   };
 }
 
-/* =========================================================
-   NORMALIZACIÓN ACADEMIA
-========================================================= */
+/* ============================================================
+   NORMALIZACIÓN CONFIGURACIÓN ACADEMIA
+============================================================ */
 
-function normalizeScoped(row: any) {
+function normalizeConfiguration(row: any) {
+  const estadoGlobal = Number(row.estado_global_id ?? row.estado_id ?? 0);
+
+  const estadoAcademia = Number(row.estado_academia_id ?? 0);
+
+  const disponible = estadoGlobal === 1 && estadoAcademia === 1;
+
   return {
-    /*
-     * ID global de tipo_pago.
-     */
     id: Number(row.id),
 
     tipo_pago_id: Number(row.id),
@@ -200,36 +202,83 @@ function normalizeScoped(row: any) {
     descripcion: row.descripcion == null ? null : String(row.descripcion),
 
     /*
-     * Estado del catálogo global.
+     * Estado global.
      */
-    estado_id: Number(row.estado_id),
+    estado_id: estadoGlobal,
+
+    estado_global_id: estadoGlobal,
 
     /*
      * Relación con academia.
      */
-    academia_tipo_pago_id: Number(row.academia_tipo_pago_id),
+    academia_tipo_pago_id: row.academia_tipo_pago_id == null ? null : Number(row.academia_tipo_pago_id),
 
-    academia_id: Number(row.academia_id),
+    academia_id: row.academia_id == null ? null : Number(row.academia_id),
 
-    academia_estado_id: Number(row.academia_estado_id),
+    estado_academia_id: estadoAcademia,
+
+    disponible,
 
     /*
-     * Tarifa base.
-     *
-     * Puede ser NULL si todavía
-     * no existe una tarifa configurada.
+     * Tarifa actualmente vigente.
      */
     tarifa_id: row.tarifa_id == null ? null : Number(row.tarifa_id),
 
     monto: row.monto == null ? null : Number(row.monto),
 
     tarifa_estado_id: row.tarifa_estado_id == null ? null : Number(row.tarifa_estado_id),
+
+    tarifa_vigencia_desde: row.tarifa_vigencia_desde ?? null,
+
+    tarifa_vigencia_hasta: row.tarifa_vigencia_hasta ?? null,
+
+    tarifa_es_vigente: row.tarifa_es_vigente == null ? null : Number(row.tarifa_es_vigente),
   };
 }
 
-/* =========================================================
+/* ============================================================
+   NORMALIZACIÓN CATÁLOGO EFECTIVO
+============================================================ */
+
+function normalizeScoped(row: any) {
+  return {
+    id: Number(row.id),
+
+    tipo_pago_id: Number(row.id),
+
+    nombre: String(row.nombre ?? ""),
+
+    descripcion: row.descripcion == null ? null : String(row.descripcion),
+
+    estado_id: Number(row.estado_id),
+
+    estado_global_id: Number(row.estado_id),
+
+    academia_tipo_pago_id: Number(row.academia_tipo_pago_id),
+
+    academia_id: Number(row.academia_id),
+
+    estado_academia_id: Number(row.academia_estado_id),
+
+    disponible: Number(row.estado_id) === 1 && Number(row.academia_estado_id) === 1,
+
+    tarifa_id: row.tarifa_id == null ? null : Number(row.tarifa_id),
+
+    monto: row.monto == null ? null : Number(row.monto),
+
+    tarifa_estado_id: row.tarifa_estado_id == null ? null : Number(row.tarifa_estado_id),
+
+    tarifa_vigencia_desde: row.tarifa_vigencia_desde ?? null,
+
+    tarifa_vigencia_hasta: row.tarifa_vigencia_hasta ?? null,
+
+    tarifa_es_vigente: row.tarifa_es_vigente == null ? null : Number(row.tarifa_es_vigente),
+  };
+}
+
+/* ============================================================
    DUPLICADOS GLOBALES
-========================================================= */
+============================================================ */
 
 async function existsByNombre(nombre: string, excludeId?: number): Promise<boolean> {
   const normalized = normalizeName(nombre);
@@ -248,8 +297,7 @@ async function existsByNombre(nombre: string, excludeId?: number): Promise<boole
 
           WHERE LOWER(
                   TRIM(nombre)
-                ) =
-                LOWER(?)
+                ) = LOWER(?)
 
             AND id <> ?
 
@@ -270,8 +318,7 @@ async function existsByNombre(nombre: string, excludeId?: number): Promise<boole
 
         WHERE LOWER(
                 TRIM(nombre)
-              ) =
-              LOWER(?)
+              ) = LOWER(?)
 
         LIMIT 1
       `,
@@ -281,9 +328,9 @@ async function existsByNombre(nombre: string, excludeId?: number): Promise<boole
   return Array.isArray(rows) && rows.length > 0;
 }
 
-/* =========================================================
+/* ============================================================
    OBTENER GLOBAL
-========================================================= */
+============================================================ */
 
 async function getGlobalById(id: number) {
   const [rows]: any = await db.query(
@@ -306,9 +353,77 @@ async function getGlobalById(id: number) {
   return rows?.length ? rows[0] : null;
 }
 
-/* =========================================================
-   OBTENER TIPO DE PAGO DE ACADEMIA
-========================================================= */
+/* ============================================================
+   OBTENER CONFIGURACIÓN DE ACADEMIA
+============================================================ */
+
+async function getConfigurationById(academiaId: number, tipoPagoId: number) {
+  const [rows]: any = await db.query(
+    `
+        SELECT
+          tp.id,
+          tp.nombre,
+          tp.descripcion,
+
+          tp.estado_id
+            AS estado_global_id,
+
+          atp.id
+            AS academia_tipo_pago_id,
+
+          atp.academia_id,
+
+          COALESCE(
+            atp.estado_id,
+            0
+          ) AS estado_academia_id,
+
+          ta.id
+            AS tarifa_id,
+
+          ta.monto,
+
+          ta.estado_id
+            AS tarifa_estado_id,
+
+          ta.vigencia_desde
+            AS tarifa_vigencia_desde,
+
+          ta.vigencia_hasta
+            AS tarifa_vigencia_hasta,
+
+          ta.es_vigente
+            AS tarifa_es_vigente
+
+        FROM tipo_pago tp
+
+        LEFT JOIN academia_tipo_pago atp
+          ON atp.tipo_pago_id =
+             tp.id
+
+         AND atp.academia_id = ?
+
+        LEFT JOIN tarifas_academia ta
+          ON ta.academia_id = ?
+
+         AND ta.tipo_pago_id =
+             tp.id
+
+         AND ta.es_vigente = 1
+
+        WHERE tp.id = ?
+
+        LIMIT 1
+      `,
+    [academiaId, academiaId, tipoPagoId]
+  );
+
+  return rows?.length ? rows[0] : null;
+}
+
+/* ============================================================
+   OBTENER TIPO EFECTIVO DE ACADEMIA
+============================================================ */
 
 async function getScopedById(academiaId: number, tipoPagoId: number) {
   const [rows]: any = await db.query(
@@ -333,7 +448,16 @@ async function getScopedById(academiaId: number, tipoPagoId: number) {
           ta.monto,
 
           ta.estado_id
-            AS tarifa_estado_id
+            AS tarifa_estado_id,
+
+          ta.vigencia_desde
+            AS tarifa_vigencia_desde,
+
+          ta.vigencia_hasta
+            AS tarifa_vigencia_hasta,
+
+          ta.es_vigente
+            AS tarifa_es_vigente
 
         FROM tipo_pago tp
 
@@ -350,6 +474,8 @@ async function getScopedById(academiaId: number, tipoPagoId: number) {
          AND ta.tipo_pago_id =
              atp.tipo_pago_id
 
+         AND ta.es_vigente = 1
+
         WHERE tp.id = ?
 
         LIMIT 1
@@ -360,16 +486,16 @@ async function getScopedById(academiaId: number, tipoPagoId: number) {
   return rows?.length ? rows[0] : null;
 }
 
-/* =========================================================
+/* ============================================================
    ERRORES
-========================================================= */
+============================================================ */
 
 function handleDatabaseError(reply: FastifyReply, err: any, operation: string) {
   reply.header("Cache-Control", "no-store");
 
   const status = Number(err?.statusCode ?? 0);
 
-  if (status === 400 || status === 401 || status === 403 || status === 404 || status === 409) {
+  if ([400, 401, 403, 404, 409].includes(status)) {
     return reply.code(status).send({
       ok: false,
 
@@ -377,21 +503,13 @@ function handleDatabaseError(reply: FastifyReply, err: any, operation: string) {
     });
   }
 
-  /* -------------------------------------------------------
-     DUPLICADO
-  ------------------------------------------------------- */
-
   if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
     return reply.code(409).send({
       ok: false,
 
-      message: "Ya existe un tipo de pago con ese nombre",
+      message: "Ya existe un registro equivalente",
     });
   }
-
-  /* -------------------------------------------------------
-     REGISTRO REFERENCIADO
-  ------------------------------------------------------- */
 
   if (
     err?.errno === 1451 ||
@@ -405,10 +523,6 @@ function handleDatabaseError(reply: FastifyReply, err: any, operation: string) {
     });
   }
 
-  /* -------------------------------------------------------
-     ERROR GENERAL
-  ------------------------------------------------------- */
-
   console.error(`[tipo_pago] ${operation}`, err);
 
   return reply.code(500).send({
@@ -420,36 +534,29 @@ function handleDatabaseError(reply: FastifyReply, err: any, operation: string) {
   });
 }
 
-/* =========================================================
+/* ============================================================
    ROUTER
-========================================================= */
+============================================================ */
 
 export default async function tipo_pago(app: FastifyInstance) {
   /*
-   * Catálogo efectivo:
-   *
-   * Admin y Superadmin.
-   *
-   * Staff no administra
-   * configuración financiera.
+   * Operación dentro de una academia.
    */
-  const canReadScoped = [requireAuth, requireRoles([1, 3])];
+  const canManageScoped = [requireAuth, requireRoles([1, 3])];
 
   /*
-   * Catálogo GLOBAL:
-   *
-   * solamente Superadmin.
+   * Administración catálogo global.
    */
   const onlySuper = [requireAuth, requireRoles([3])];
 
-  /* =======================================================
+  /* ==========================================================
      HEALTH
-  ======================================================= */
+  ========================================================== */
 
   app.get(
     "/health",
     {
-      preHandler: canReadScoped,
+      preHandler: canManageScoped,
     },
     async (req: FastifyRequest, reply: FastifyReply) => {
       try {
@@ -474,11 +581,12 @@ export default async function tipo_pago(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
      GET /catalogo
-     CATÁLOGO GLOBAL COMPLETO
+
+     CATÁLOGO GLOBAL
      SOLO SUPERADMIN
-  ======================================================= */
+  ========================================================== */
 
   app.get(
     "/catalogo",
@@ -498,7 +606,6 @@ export default async function tipo_pago(app: FastifyInstance) {
               FROM tipo_pago
 
               ORDER BY
-                estado_id ASC,
                 nombre ASC,
                 id ASC
             `
@@ -521,29 +628,311 @@ export default async function tipo_pago(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
+     GET /configuracion
+
+     CATÁLOGO COMPLETO + CONFIGURACIÓN DE LA ACADEMIA
+
+     Admin / Superadmin
+
+     Esta es la ruta destinada al frontend de configuración.
+  ========================================================== */
+
+  app.get(
+    "/configuracion",
+    {
+      preHandler: canManageScoped,
+    },
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const parsed = ConfiguracionQuerySchema.safeParse(req.query);
+
+      if (!parsed.success) {
+        reply.header("Cache-Control", "no-store");
+
+        return reply.code(400).send({
+          ok: false,
+
+          message: "Parámetros inválidos",
+
+          detail: zodDetail(parsed.error),
+        });
+      }
+
+      try {
+        const academiaId = resolveAcademiaId(req);
+
+        const { search, estado_academia_id } = parsed.data;
+
+        const where: string[] = [];
+
+        const values: any[] = [academiaId, academiaId];
+
+        if (search) {
+          where.push(
+            `
+              (
+                LOWER(tp.nombre)
+                  LIKE LOWER(?)
+
+                OR LOWER(
+                     COALESCE(
+                       tp.descripcion,
+                       ''
+                     )
+                   )
+                  LIKE LOWER(?)
+
+                OR CAST(
+                     tp.id AS CHAR
+                   )
+                  LIKE ?
+              )
+            `
+          );
+
+          const term = `%${search}%`;
+
+          values.push(term, term, term);
+        }
+
+        if (estado_academia_id !== undefined) {
+          where.push(
+            `
+              COALESCE(
+                atp.estado_id,
+                0
+              ) = ?
+            `
+          );
+
+          values.push(estado_academia_id);
+        }
+
+        const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+        const [rows]: any = await db.query(
+          `
+              SELECT
+                tp.id,
+                tp.nombre,
+                tp.descripcion,
+
+                tp.estado_id
+                  AS estado_global_id,
+
+                atp.id
+                  AS academia_tipo_pago_id,
+
+                atp.academia_id,
+
+                COALESCE(
+                  atp.estado_id,
+                  0
+                ) AS estado_academia_id,
+
+                ta.id
+                  AS tarifa_id,
+
+                ta.monto,
+
+                ta.estado_id
+                  AS tarifa_estado_id,
+
+                ta.vigencia_desde
+                  AS tarifa_vigencia_desde,
+
+                ta.vigencia_hasta
+                  AS tarifa_vigencia_hasta,
+
+                ta.es_vigente
+                  AS tarifa_es_vigente
+
+              FROM tipo_pago tp
+
+              LEFT JOIN academia_tipo_pago atp
+                ON atp.tipo_pago_id =
+                   tp.id
+
+               AND atp.academia_id = ?
+
+              LEFT JOIN tarifas_academia ta
+                ON ta.academia_id = ?
+
+               AND ta.tipo_pago_id =
+                   tp.id
+
+               AND ta.es_vigente = 1
+
+              ${whereSql}
+
+              ORDER BY
+                tp.nombre ASC,
+                tp.id ASC
+            `,
+          values
+        );
+
+        reply.header("Cache-Control", "no-store");
+
+        return reply.send({
+          ok: true,
+
+          scope: "configuracion",
+
+          academia_id: academiaId,
+
+          count: rows?.length ?? 0,
+
+          items: (rows ?? []).map(normalizeConfiguration),
+        });
+      } catch (err: any) {
+        return handleDatabaseError(reply, err, "listar configuración de");
+      }
+    }
+  );
+
+  /* ==========================================================
+     PATCH /:id/disponibilidad
+
+     HABILITAR / DESHABILITAR TIPO DE PAGO
+     PARA UNA ACADEMIA
+
+     NO modifica tipo_pago global.
+  ========================================================== */
+
+  app.patch(
+    "/:id/disponibilidad",
+    {
+      preHandler: canManageScoped,
+    },
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const parsedId = IdParam.safeParse(req.params);
+
+      if (!parsedId.success) {
+        reply.header("Cache-Control", "no-store");
+
+        return reply.code(400).send({
+          ok: false,
+          message: "ID inválido",
+        });
+      }
+
+      try {
+        const academiaId = resolveAcademiaId(req);
+
+        const tipoPagoId = parsedId.data.id;
+
+        const body = DisponibilidadSchema.parse(req.body);
+
+        const global = await getGlobalById(tipoPagoId);
+
+        if (!global) {
+          reply.header("Cache-Control", "no-store");
+
+          return reply.code(404).send({
+            ok: false,
+
+            message: "Tipo de pago no encontrado",
+          });
+        }
+
+        /*
+         * No se puede activar dentro de una academia
+         * un concepto globalmente deshabilitado.
+         */
+        if (body.estado_id === 1 && Number(global.estado_id) !== 1) {
+          reply.header("Cache-Control", "no-store");
+
+          return reply.code(409).send({
+            ok: false,
+
+            message: "El tipo de pago se encuentra deshabilitado globalmente",
+          });
+        }
+
+        /*
+         * UPSERT.
+         *
+         * academia_tipo_pago posee:
+         *
+         * UNIQUE (
+         *   academia_id,
+         *   tipo_pago_id
+         * )
+         */
+        await db.query(
+          `
+            INSERT INTO academia_tipo_pago (
+              academia_id,
+              tipo_pago_id,
+              estado_id
+            )
+
+            VALUES (?, ?, ?)
+
+            ON DUPLICATE KEY UPDATE
+              estado_id =
+                VALUES(
+                  estado_id
+                )
+          `,
+          [academiaId, tipoPagoId, body.estado_id]
+        );
+
+        const row = await getConfigurationById(academiaId, tipoPagoId);
+
+        reply.header("Cache-Control", "no-store");
+
+        return reply.send({
+          ok: true,
+
+          academia_id: academiaId,
+
+          tipo_pago_id: tipoPagoId,
+
+          estado_academia_id: body.estado_id,
+
+          item: row ? normalizeConfiguration(row) : null,
+        });
+      } catch (err: any) {
+        reply.header("Cache-Control", "no-store");
+
+        if (err instanceof ZodError) {
+          return reply.code(400).send({
+            ok: false,
+
+            message: "Payload inválido",
+
+            detail: zodDetail(err),
+          });
+        }
+
+        return handleDatabaseError(reply, err, "actualizar disponibilidad de");
+      }
+    }
+  );
+
+  /* ==========================================================
      GET /
-     TIPOS DE PAGO HABILITADOS PARA LA ACADEMIA
-  ======================================================= */
+
+     CATÁLOGO EFECTIVO DE LA ACADEMIA
+
+     Devuelve SOLAMENTE:
+     - tipo global activo
+     - relación academia activa
+
+     Es la ruta adecuada para formularios operativos.
+  ========================================================== */
 
   app.get(
     "/",
     {
-      preHandler: canReadScoped,
+      preHandler: canManageScoped,
     },
     async (req: FastifyRequest, reply: FastifyReply) => {
       try {
         const academiaId = resolveAcademiaId(req);
 
-        /*
-         * NO consultamos tipo_pago directamente.
-         *
-         * La tabla conductora es academia_tipo_pago.
-         *
-         * Si existen 20 tipos globales
-         * pero la academia habilitó 3,
-         * esta ruta devuelve SOLO 3.
-         */
         const [rows]: any = await db.query(
           `
               SELECT
@@ -566,7 +955,16 @@ export default async function tipo_pago(app: FastifyInstance) {
                 ta.monto,
 
                 ta.estado_id
-                  AS tarifa_estado_id
+                  AS tarifa_estado_id,
+
+                ta.vigencia_desde
+                  AS tarifa_vigencia_desde,
+
+                ta.vigencia_hasta
+                  AS tarifa_vigencia_hasta,
+
+                ta.es_vigente
+                  AS tarifa_es_vigente
 
               FROM academia_tipo_pago atp
 
@@ -580,6 +978,8 @@ export default async function tipo_pago(app: FastifyInstance) {
 
                AND ta.tipo_pago_id =
                    atp.tipo_pago_id
+
+               AND ta.es_vigente = 1
 
               WHERE atp.academia_id = ?
 
@@ -613,15 +1013,17 @@ export default async function tipo_pago(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
      GET /:id
-     TIPO DE PAGO DE LA ACADEMIA
-  ======================================================= */
+
+     TIPO DE PAGO EFECTIVAMENTE HABILITADO
+     EN LA ACADEMIA
+  ========================================================== */
 
   app.get(
     "/:id",
     {
-      preHandler: canReadScoped,
+      preHandler: canManageScoped,
     },
     async (req: FastifyRequest, reply: FastifyReply) => {
       const parsed = IdParam.safeParse(req.params);
@@ -631,7 +1033,6 @@ export default async function tipo_pago(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
-
           message: "ID inválido",
         });
       }
@@ -651,12 +1052,6 @@ export default async function tipo_pago(app: FastifyInstance) {
           });
         }
 
-        /*
-         * GET / representa configuración
-         * efectiva, por lo tanto tanto
-         * catálogo como relación deben
-         * estar activos.
-         */
         if (Number(row.academia_estado_id) !== 1 || Number(row.estado_id) !== 1) {
           return reply.code(404).send({
             ok: false,
@@ -678,11 +1073,12 @@ export default async function tipo_pago(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
      POST /
-     CREAR TIPO GLOBAL
+
+     CREAR TIPO DE PAGO GLOBAL
      SOLO SUPERADMIN
-  ======================================================= */
+  ========================================================== */
 
   app.post(
     "/",
@@ -765,11 +1161,12 @@ export default async function tipo_pago(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
      PUT /:id
+
      REEMPLAZO GLOBAL
      SOLO SUPERADMIN
-  ======================================================= */
+  ========================================================== */
 
   app.put(
     "/:id",
@@ -784,7 +1181,6 @@ export default async function tipo_pago(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
-
           message: "ID inválido",
         });
       }
@@ -793,12 +1189,6 @@ export default async function tipo_pago(app: FastifyInstance) {
         const id = parsed.data.id;
 
         const body = PutSchema.parse(req.body);
-
-        const nombre = normalizeName(body.nombre);
-
-        const descripcion = normalizeDescription(body.descripcion);
-
-        const estadoId = Number(body.estado_id);
 
         const current = await getGlobalById(id);
 
@@ -811,6 +1201,12 @@ export default async function tipo_pago(app: FastifyInstance) {
             message: "Tipo de pago no encontrado",
           });
         }
+
+        const nombre = normalizeName(body.nombre);
+
+        const descripcion = normalizeDescription(body.descripcion);
+
+        const estadoId = Number(body.estado_id);
 
         const duplicate = await existsByNombre(nombre, id);
 
@@ -851,11 +1247,8 @@ export default async function tipo_pago(app: FastifyInstance) {
             ? normalizeGlobal(updated)
             : {
                 id,
-
                 nombre,
-
                 descripcion,
-
                 estado_id: estadoId,
               },
         });
@@ -877,11 +1270,12 @@ export default async function tipo_pago(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
      PATCH /:id
+
      ACTUALIZACIÓN GLOBAL PARCIAL
      SOLO SUPERADMIN
-  ======================================================= */
+  ========================================================== */
 
   app.patch(
     "/:id",
@@ -896,7 +1290,6 @@ export default async function tipo_pago(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
-
           message: "ID inválido",
         });
       }
@@ -978,11 +1371,8 @@ export default async function tipo_pago(app: FastifyInstance) {
             ? normalizeGlobal(updated)
             : {
                 id,
-
                 nombre,
-
                 descripcion,
-
                 estado_id: estadoId,
               },
         });
@@ -1004,11 +1394,12 @@ export default async function tipo_pago(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
+  /* ==========================================================
      DELETE /:id
+
      ELIMINACIÓN GLOBAL
      SOLO SUPERADMIN
-  ======================================================= */
+  ========================================================== */
 
   app.delete(
     "/:id",
@@ -1023,7 +1414,6 @@ export default async function tipo_pago(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
-
           message: "ID inválido",
         });
       }
@@ -1073,17 +1463,6 @@ export default async function tipo_pago(app: FastifyInstance) {
       } catch (err: any) {
         reply.header("Cache-Control", "no-store");
 
-        /*
-         * Referencias actuales posibles:
-         *
-         * - academia_tipo_pago
-         * - tarifas_academia
-         * - academia_plan_tipo_pago
-         * - pago_detalle
-         *
-         * plan_reglas YA NO depende
-         * de tipo_pago.
-         */
         if (
           err?.errno === 1451 ||
           err?.code === "ER_ROW_IS_REFERENCED_2" ||
@@ -1093,7 +1472,7 @@ export default async function tipo_pago(app: FastifyInstance) {
             ok: false,
 
             message:
-              "No se puede eliminar el tipo de pago porque está asociado a academias, tarifas, beneficios o pagos registrados",
+              "No se puede eliminar el tipo de pago porque está asociado a academias, tarifas, planes o pagos registrados. Puede deshabilitarlo globalmente en su lugar.",
           });
         }
 
