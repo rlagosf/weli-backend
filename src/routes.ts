@@ -40,6 +40,7 @@ import convocatorias_historico from "./routers/convocatorias_historico";
 
 import admin_noticias from "./routers/admin_noticias";
 import estado_noticias from "./routers/estado_noticias";
+import academia_tema from "./routers/academia_tema";
 
 import planes from "./routers/planes";
 import jugador_planes from "./routers/jugador_planes";
@@ -91,14 +92,13 @@ export async function registerRoutes(app: FastifyInstance) {
   // ───────────────────────── Reportes ─────────────────────────
   app.register(estadisticas, { prefix: `${API_BASE}/estadisticas` });
   app.register(convocatorias, { prefix: `${API_BASE}/convocatorias` });
-  app.register(convocatorias_historico, {
-    prefix: `${API_BASE}/convocatorias-historico`,
-  });
+  app.register(convocatorias_historico, {prefix: `${API_BASE}/convocatorias-historico` });
 
   // ───────────────────────── Noticias ─────────────────────────
   app.register(noticiasPublicRoutes, { prefix: `${API_BASE}/noticias` });
   app.register(admin_noticias, { prefix: `${API_BASE}/admin-noticias` });
   app.register(estado_noticias, { prefix: `${API_BASE}/estado-noticias` });
+  app.register(academia_tema, { prefix: `${API_BASE}/academia-tema` });
 
   // ───────────────────────── IA ─────────────────────────
   app.register(gabriela, { prefix: `${API_BASE}/gabriela` });

@@ -68,6 +68,7 @@ const SPORT_TABLE: Record<number, string> = {
   4: "stats_padel",
   5: "stats_tenis_mesa",
   6: "stats_basquet",
+  7: "stats_american_football",
 };
 
 // Campos base comunes (stats_base)
@@ -216,6 +217,7 @@ const floatKeys = new Set([
   "pir",
   "per",
   "lactato",
+  "tercer_down_efectividad_pct",
 ]);
 
 function coerceNumbers(obj: Record<string, any>) {
@@ -595,7 +597,7 @@ export default async function estadisticas(app: FastifyInstance) {
         limit,
         offset,
         joined_sport: Boolean(deporte_id && SPORT_TABLE[deporte_id]),
-        note: deporte_id ? undefined : "Para incluir métricas del deporte, envía deporte_id (1..6).",
+        note: deporte_id ? undefined : "Para incluir métricas del deporte, envía deporte_id (1..7).",
       });
     } catch (err: any) {
       return reply.code(500).send({ ok: false, message: "Error al listar", error: sqlErr(err) });

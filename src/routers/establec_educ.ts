@@ -1,10 +1,8 @@
 // src/routers/establec_educ.ts
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-
 import { z, ZodError } from "zod";
 import { db } from "../db";
-
 import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
 /**
@@ -53,8 +51,19 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
  *   - Admin
  *   - Superadmin
  *
- * El academia_id nunca se recibe desde el body.
+ * El academia_id nunca se recibe desde body ni query.
  * Siempre se determina mediante getEffectiveAcademiaId(req).
+ *
+ * Se mantienen dos modalidades de lectura:
+ *
+ * GET /
+ *   Listado administrativo paginado.
+ *
+ * GET /catalogo
+ *   Catálogo operacional sin paginación para formularios.
+ *   Devuelve únicamente establecimientos activos y habilitados
+ *   para la academia efectiva, incluyendo comuna y región.
+ *
  * ============================================================
  */
 
@@ -69,17 +78,11 @@ const IdParam = z.object({
 const ListQuerySchema = z
   .object({
     page: z.coerce.number().int().min(1).default(1),
-
     limit: z.coerce.number().int().min(1).max(100).default(15),
-
     search: z.string().trim().max(120).optional().default(""),
-
     region_id: z.coerce.number().int().positive().optional(),
-
     comuna_id: z.coerce.number().int().positive().optional(),
-
     estado_id: z.coerce.number().int().min(0).max(1).optional(),
-
     disponibilidad: z.coerce.number().int().min(0).max(1).optional(),
   })
   .strict();
@@ -87,9 +90,7 @@ const ListQuerySchema = z
 const CreateSchema = z
   .object({
     nombre: z.string().trim().min(3, "Debe tener al menos 3 caracteres").max(120),
-
     comuna_id: z.coerce.number().int().positive(),
-
     estado_id: z.coerce.number().int().min(0).max(1).default(1),
   })
   .strict();
@@ -97,9 +98,7 @@ const CreateSchema = z
 const PutSchema = z
   .object({
     nombre: z.string().trim().min(3, "Debe tener al menos 3 caracteres").max(120),
-
     comuna_id: z.coerce.number().int().positive(),
-
     estado_id: z.coerce.number().int().min(0).max(1),
   })
   .strict();
@@ -107,9 +106,7 @@ const PutSchema = z
 const PatchSchema = z
   .object({
     nombre: z.string().trim().min(3, "Debe tener al menos 3 caracteres").max(120).optional(),
-
     comuna_id: z.coerce.number().int().positive().optional(),
-
     estado_id: z.coerce.number().int().min(0).max(1).optional(),
   })
   .strict();
@@ -129,47 +126,46 @@ function zodDetail(err: ZodError) {
 }
 
 function normalize(row: any) {
-  const estadoGlobal = Number(row.estado_id ?? 0);
+  const estadoGlobal = Number(row?.estado_id ?? 0);
 
-  const estadoAcademia = Number(row.estado_academia_id ?? 0);
+  /*
+   * Regla de negocio:
+   *
+   * Si la academia nunca ha configurado este establecimiento,
+   * se considera DISPONIBLE por defecto.
+   *
+   * Sólo un estado_academia_id = 0 explícito lo deshabilita
+   * para esa academia.
+   */
+  const estadoAcademia =
+    row?.estado_academia_id === null || row?.estado_academia_id === undefined ? 1 : Number(row.estado_academia_id);
 
   const disponible = estadoGlobal === 1 && estadoAcademia === 1;
 
   return {
-    id: Number(row.id),
+    id: Number(row?.id),
 
-    nombre: String(row.nombre ?? ""),
+    nombre: String(row?.nombre ?? ""),
 
-    comuna_id: row.comuna_id !== null && row.comuna_id !== undefined ? Number(row.comuna_id) : null,
+    comuna_id: row?.comuna_id !== null && row?.comuna_id !== undefined ? Number(row.comuna_id) : null,
 
-    comuna_nombre: row.comuna_nombre !== undefined ? String(row.comuna_nombre ?? "") : "",
+    comuna_nombre: row?.comuna_nombre !== undefined ? String(row.comuna_nombre ?? "") : "",
 
-    region_id: row.region_id !== null && row.region_id !== undefined ? Number(row.region_id) : null,
+    region_id: row?.region_id !== null && row?.region_id !== undefined ? Number(row.region_id) : null,
 
-    region_nombre: row.region_nombre !== undefined ? String(row.region_nombre ?? "") : "",
+    region_nombre: row?.region_nombre !== undefined ? String(row.region_nombre ?? "") : "",
 
-    /*
-     * Estado maestro/global.
-     */
     estado_id: estadoGlobal,
+
     estado_global_id: estadoGlobal,
 
-    /*
-     * Preferencia propia de la academia.
-     */
     estado_academia_id: estadoAcademia,
 
-    /*
-     * Disponibilidad efectiva:
-     *
-     * global activo
-     * AND
-     * academia activa
-     */
     disponible,
 
-    created_at: row.created_at ?? null,
-    updated_at: row.updated_at ?? null,
+    created_at: row?.created_at ?? null,
+
+    updated_at: row?.updated_at ?? null,
   };
 }
 
@@ -275,7 +271,7 @@ async function getEstablecimientoById(id: number, academiaId: number) {
 
         COALESCE(
           aee.estado_id,
-          0
+          1
         ) AS estado_academia_id
 
       FROM establec_educ ee
@@ -341,7 +337,18 @@ export default async function establec_educ(app: FastifyInstance) {
 
   /* ==========================================================
      GET /
-     Listado paginado
+
+     Listado administrativo paginado.
+
+     Permite:
+     - búsqueda textual;
+     - filtro por región;
+     - filtro por comuna;
+     - filtro por estado global;
+     - filtro por disponibilidad efectiva.
+
+     Conserva paginación porque esta ruta también puede ser
+     utilizada desde pantallas administrativas.
   ========================================================== */
 
   app.get(
@@ -380,14 +387,12 @@ export default async function establec_educ(app: FastifyInstance) {
         const { page, limit, search, region_id, comuna_id, estado_id, disponibilidad } = parsed.data;
 
         const offset = (page - 1) * limit;
-
         const normalizedSearch = search.trim();
 
         /*
          * WHERE dinámico.
          */
         const conditions: string[] = [];
-
         const whereParams: any[] = [];
 
         if (normalizedSearch) {
@@ -413,25 +418,21 @@ export default async function establec_educ(app: FastifyInstance) {
 
         if (region_id !== undefined) {
           conditions.push("r.id = ?");
-
           whereParams.push(region_id);
         }
 
         if (comuna_id !== undefined) {
           conditions.push("c.id = ?");
-
           whereParams.push(comuna_id);
         }
 
         if (estado_id !== undefined) {
           conditions.push("ee.estado_id = ?");
-
           whereParams.push(estado_id);
         }
 
         /*
-         * disponibilidad representa disponibilidad
-         * EFECTIVA.
+         * disponibilidad representa disponibilidad EFECTIVA.
          *
          * 1:
          *   estado global = 1
@@ -447,7 +448,7 @@ export default async function establec_educ(app: FastifyInstance) {
                 WHEN ee.estado_id = 1
                  AND COALESCE(
                        aee.estado_id,
-                       0
+                       1
                      ) = 1
                 THEN 1
                 ELSE 0
@@ -462,29 +463,29 @@ export default async function establec_educ(app: FastifyInstance) {
 
         /*
          * El primer parámetro siempre corresponde
-         * al academia_id usado por el LEFT JOIN.
+         * al academia_id utilizado por el LEFT JOIN.
          */
         const baseParams = [academiaId, ...whereParams];
 
         const [countRows]: any = await db.query(
           `
-              SELECT
-                COUNT(*) AS total
+            SELECT
+              COUNT(*) AS total
 
-              FROM establec_educ ee
+            FROM establec_educ ee
 
-              INNER JOIN comunas c
-                ON c.id = ee.comuna_id
+            INNER JOIN comunas c
+              ON c.id = ee.comuna_id
 
-              INNER JOIN regiones r
-                ON r.id = c.region_id
+            INNER JOIN regiones r
+              ON r.id = c.region_id
 
-              LEFT JOIN academia_establec_educ aee
-                ON aee.establecimiento_id = ee.id
-               AND aee.academia_id = ?
+            LEFT JOIN academia_establec_educ aee
+              ON aee.establecimiento_id = ee.id
+             AND aee.academia_id = ?
 
-              ${whereSql}
-            `,
+            ${whereSql}
+          `,
           baseParams
         );
 
@@ -494,51 +495,47 @@ export default async function establec_educ(app: FastifyInstance) {
 
         const [rows]: any = await db.query(
           `
-              SELECT
-                ee.id,
-                ee.nombre,
-                ee.comuna_id,
-                ee.estado_id,
-                ee.created_at,
-                ee.updated_at,
+            SELECT
+              ee.id,
+              ee.nombre,
+              ee.comuna_id,
+              ee.estado_id,
+              ee.created_at,
+              ee.updated_at,
 
-                c.nombre
-                  AS comuna_nombre,
+              c.nombre AS comuna_nombre,
 
-                r.id
-                  AS region_id,
+              r.id AS region_id,
+              r.nombre AS region_nombre,
 
-                r.nombre
-                  AS region_nombre,
+              COALESCE(
+                aee.estado_id,
+                1
+              ) AS estado_academia_id
 
-                COALESCE(
-                  aee.estado_id,
-                  0
-                ) AS estado_academia_id
+            FROM establec_educ ee
 
-              FROM establec_educ ee
+            INNER JOIN comunas c
+              ON c.id = ee.comuna_id
 
-              INNER JOIN comunas c
-                ON c.id = ee.comuna_id
+            INNER JOIN regiones r
+              ON r.id = c.region_id
 
-              INNER JOIN regiones r
-                ON r.id = c.region_id
+            LEFT JOIN academia_establec_educ aee
+              ON aee.establecimiento_id = ee.id
+             AND aee.academia_id = ?
 
-              LEFT JOIN academia_establec_educ aee
-                ON aee.establecimiento_id = ee.id
-               AND aee.academia_id = ?
+            ${whereSql}
 
-              ${whereSql}
+            ORDER BY
+              r.nombre ASC,
+              c.nombre ASC,
+              ee.nombre ASC,
+              ee.id ASC
 
-              ORDER BY
-                r.nombre ASC,
-                c.nombre ASC,
-                ee.nombre ASC,
-                ee.id ASC
-
-              LIMIT ?
-              OFFSET ?
-            `,
+            LIMIT ?
+            OFFSET ?
+          `,
           [...baseParams, limit, offset]
         );
 
@@ -588,7 +585,199 @@ export default async function establec_educ(app: FastifyInstance) {
   );
 
   /* ==========================================================
+     GET /catalogo
+
+     Catálogo operacional para formularios.
+
+     Esta ruta existe específicamente para formularios que
+     necesitan conocer TODOS los establecimientos disponibles,
+     sin depender de la paginación administrativa de GET /.
+
+     Devuelve únicamente establecimientos que:
+
+     - están activos globalmente;
+     - están habilitados para la academia efectiva;
+     - tienen una comuna válida;
+     - tienen una región válida.
+
+     La respuesta incorpora:
+
+     - establecimiento;
+     - comuna;
+     - región;
+     - disponibilidad efectiva.
+
+     Esto permite construir dinámicamente en el frontend:
+
+       Región
+          ↓
+       Comuna
+          ↓
+       Establecimiento
+
+     Sólo aparecerán regiones y comunas que posean al menos
+     un establecimiento disponible para la academia.
+
+     Admin / Staff:
+       academia obtenida desde JWT.
+
+     Superadmin:
+       academia obtenida desde x-academia-id.
+
+     El academia_id nunca se recibe desde query ni body.
+
+     IMPORTANTE:
+     esta ruta debe declararse antes de GET /:id para que
+     "catalogo" no sea interpretado como un parámetro id.
+  ========================================================== */
+
+  app.get(
+    "/catalogo",
+    {
+      preHandler: canRead,
+    },
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      try {
+        /*
+         * Admin / Staff:
+         *   academia desde JWT.
+         *
+         * Superadmin:
+         *   academia desde x-academia-id.
+         *
+         * La academia NO determina región/comuna.
+         * Sólo permite aplicar exclusiones particulares.
+         */
+        const academiaId = Number(getEffectiveAcademiaId(req));
+
+        if (!Number.isInteger(academiaId) || academiaId <= 0) {
+          return reply.code(403).send({
+            ok: false,
+            message: "No se pudo determinar la academia",
+          });
+        }
+
+        const [rows]: any = await db.query(
+          `
+            SELECT
+              ee.id,
+              ee.nombre,
+              ee.comuna_id,
+              ee.estado_id,
+              ee.created_at,
+              ee.updated_at,
+
+              c.nombre AS comuna_nombre,
+
+              r.id AS region_id,
+              r.nombre AS region_nombre,
+
+              COALESCE(
+                aee.estado_id,
+                1
+              ) AS estado_academia_id
+
+            FROM establec_educ ee
+
+            INNER JOIN comunas c
+              ON c.id = ee.comuna_id
+
+            INNER JOIN regiones r
+              ON r.id = c.region_id
+
+            /*
+             * LEFT JOIN:
+             *
+             * La ausencia de una relación NO significa
+             * que el establecimiento esté deshabilitado.
+             *
+             * Sólo buscamos una configuración particular
+             * para la academia actual.
+             */
+            LEFT JOIN academia_establec_educ aee
+              ON aee.establecimiento_id = ee.id
+             AND aee.academia_id = ?
+
+            WHERE
+              /*
+               * El establecimiento debe estar activo
+               * globalmente.
+               */
+              ee.estado_id = 1
+
+              /*
+               * La región también debe encontrarse activa.
+               */
+              AND r.estado_id = 1
+
+              /*
+               * Regla fundamental:
+               *
+               * sin configuración -> 1
+               * explícitamente 1  -> 1
+               * explícitamente 0  -> NO aparece
+               */
+              AND COALESCE(
+                    aee.estado_id,
+                    1
+                  ) = 1
+
+            ORDER BY
+              r.nombre ASC,
+              c.nombre ASC,
+              ee.nombre ASC,
+              ee.id ASC
+          `,
+          [academiaId]
+        );
+
+        const items = (Array.isArray(rows) ? rows : []).map(normalize);
+
+        reply.header("Cache-Control", "no-store");
+
+        return reply.send({
+          ok: true,
+
+          items,
+
+          summary: {
+            total: items.length,
+          },
+        });
+      } catch (err: any) {
+        req.log.error(
+          {
+            err,
+          },
+          "establec_educ: error obteniendo catálogo operacional"
+        );
+
+        return reply.code(err?.statusCode === 403 ? 403 : 500).send({
+          ok: false,
+
+          message:
+            err?.statusCode === 403
+              ? err?.message || "Academia no válida"
+              : "Error al obtener catálogo de establecimientos",
+
+          ...(err?.statusCode !== 403
+            ? {
+                detail: err?.message,
+              }
+            : {}),
+        });
+      }
+    }
+  );
+
+  /* ==========================================================
      GET /:id
+
+     Obtiene un establecimiento individual enriquecido con:
+     - comuna;
+     - región;
+     - estado global;
+     - disponibilidad para la academia efectiva.
   ========================================================== */
 
   app.get(
@@ -659,8 +848,20 @@ export default async function establec_educ(app: FastifyInstance) {
 
   /* ==========================================================
      POST /
-     Crear establecimiento global
-     SOLO SUPERADMIN
+
+     Crear establecimiento global.
+
+     SOLO SUPERADMIN.
+
+     La ubicación territorial se define mediante comuna_id.
+
+     La región se obtiene indirectamente desde:
+
+       establec_educ.comuna_id
+                ↓
+             comunas
+                ↓
+             regiones
   ========================================================== */
 
   app.post(
@@ -673,9 +874,7 @@ export default async function establec_educ(app: FastifyInstance) {
         const parsed = CreateSchema.parse(req.body);
 
         const nombre = parsed.nombre.trim();
-
         const comunaId = parsed.comuna_id;
-
         const estadoId = parsed.estado_id;
 
         /*
@@ -691,7 +890,7 @@ export default async function establec_educ(app: FastifyInstance) {
         }
 
         /*
-         * La unicidad ahora es:
+         * La unicidad es:
          *
          * comuna_id + nombre
          */
@@ -766,8 +965,10 @@ export default async function establec_educ(app: FastifyInstance) {
 
   /* ==========================================================
      PUT /:id
-     Sustitución completa estructural
-     SOLO SUPERADMIN
+
+     Sustitución completa estructural.
+
+     SOLO SUPERADMIN.
   ========================================================== */
 
   app.put(
@@ -800,9 +1001,7 @@ export default async function establec_educ(app: FastifyInstance) {
         }
 
         const nombre = body.nombre.trim();
-
         const comunaId = body.comuna_id;
-
         const estadoId = body.estado_id;
 
         const validComuna = await comunaExists(comunaId);
@@ -884,8 +1083,10 @@ export default async function establec_educ(app: FastifyInstance) {
 
   /* ==========================================================
      PATCH /:id
-     Edición parcial estructural
-     SOLO SUPERADMIN
+
+     Edición parcial estructural.
+
+     SOLO SUPERADMIN.
   ========================================================== */
 
   app.patch(
@@ -1032,8 +1233,8 @@ export default async function establec_educ(app: FastifyInstance) {
   /* ==========================================================
      PATCH /:id/disponibilidad
 
-     Habilitar / deshabilitar un establecimiento
-     exclusivamente para la academia efectiva.
+     Habilita o deshabilita un establecimiento exclusivamente
+     para la academia efectiva.
 
      Admin / Superadmin.
 
@@ -1042,6 +1243,8 @@ export default async function establec_educ(app: FastifyInstance) {
 
      Modifica:
        academia_establec_educ.estado_id
+
+     La academia nunca se recibe desde el body.
   ========================================================== */
 
   app.patch(
@@ -1185,7 +1388,15 @@ export default async function establec_educ(app: FastifyInstance) {
 
   /* ==========================================================
      DELETE /:id
-     SOLO SUPERADMIN
+
+     Eliminación estructural.
+
+     SOLO SUPERADMIN.
+
+     Si existen relaciones asociadas, MySQL impedirá
+     la eliminación mediante la correspondiente FK.
+     En ese escenario se recomienda deshabilitar el registro
+     globalmente en lugar de eliminarlo físicamente.
   ========================================================== */
 
   app.delete(
