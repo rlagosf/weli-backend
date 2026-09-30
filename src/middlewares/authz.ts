@@ -1,14 +1,19 @@
 // src/middlewares/authz.ts
 
 import type { FastifyReply, FastifyRequest } from "fastify";
+
 import jwt from "jsonwebtoken";
+
 import { CONFIG } from "../config";
+
 import { db } from "../db";
 
 type AnyObj = Record<string, any>;
 
 const PANEL_ROLES = new Set([1, 2, 3]);
+
 const PANEL_TYPES = new Set(["admin", "user", "staff", "superadmin"]);
+
 const JWT_ALGORITHM = "HS256" as const;
 
 const JWT_ISSUER = String((CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER ?? "app").trim();
@@ -16,6 +21,7 @@ const JWT_ISSUER = String((CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER 
 const JWT_AUDIENCE = String((CONFIG as any)?.JWT_AUDIENCE ?? process.env.JWT_AUDIENCE ?? "web").trim();
 
 const ACADEMIA_ESTADO_ACTIVA = 1;
+
 const ACADEMIA_ESTADO_DESACTIVADA = 2;
 
 /* =========================================================
@@ -25,14 +31,20 @@ const ACADEMIA_ESTADO_DESACTIVADA = 2;
 export type AuthContext =
   | {
       type: "user";
+
       user_id: number;
+
       rol_id: number;
+
       academia_id: number | null;
     }
   | {
       type: "apoderado";
+
       rut: string;
+
       apoderado_id?: number;
+
       academia_id?: number;
     };
 
@@ -105,8 +117,11 @@ async function getAcademiaEstado(academiaId: number): Promise<number | null> {
   const [rows]: any = await db.query(
     `
         SELECT estado_id
+
         FROM academias
+
         WHERE id = ?
+
         LIMIT 1
       `,
     [academiaId]
@@ -142,7 +157,9 @@ async function assertAcademiaActiva(academiaId: number): Promise<void> {
   if (estadoId !== ACADEMIA_ESTADO_ACTIVA) {
     throw Object.assign(new Error("ACADEMIA_DISABLED"), {
       statusCode: 403,
+
       authzCode: "ACADEMIA_DISABLED",
+
       academiaEstadoId: estadoId,
     });
   }
@@ -154,11 +171,16 @@ async function assertAcademiaActiva(academiaId: number): Promise<void> {
 
 function sendAcademiaAccessError(
   req: FastifyRequest,
+
   reply: FastifyReply,
+
   error: any,
+
   context?: {
     user_id?: number;
+
     rol_id?: number;
+
     academia_id?: number;
   }
 ) {
@@ -171,11 +193,13 @@ function sendAcademiaAccessError(
 
         estado_id: error?.academiaEstadoId,
       },
+
       "[authz] acceso bloqueado por academia desactivada"
     );
 
     return reply.code(403).send({
       ok: false,
+
       message: "ACADEMIA_DISABLED",
 
       academia_estado_id: Number(error?.academiaEstadoId ?? ACADEMIA_ESTADO_DESACTIVADA),
@@ -183,10 +207,15 @@ function sendAcademiaAccessError(
   }
 
   if (code === "ACADEMIA_NOT_FOUND") {
-    req.log.warn(context ?? {}, "[authz] academia asociada no existe");
+    req.log.warn(
+      context ?? {},
+
+      "[authz] academia asociada no existe"
+    );
 
     return reply.code(403).send({
       ok: false,
+
       message: "ACADEMIA_NOT_FOUND",
     });
   }
@@ -198,6 +227,7 @@ function sendAcademiaAccessError(
    * que el JWT sea inválido.
    *
    * Ejemplos:
+   *
    * - MySQL caído;
    * - timeout;
    * - pool agotado;
@@ -209,14 +239,18 @@ function sendAcademiaAccessError(
   req.log.error(
     {
       ...context,
+
       message: error?.message,
+
       code: error?.code,
     },
+
     "[authz] error verificando estado de academia"
   );
 
   return reply.code(503).send({
     ok: false,
+
     message: "AUTH_SERVICE_UNAVAILABLE",
   });
 }
@@ -245,7 +279,16 @@ function readLegacyAuthFromReq(req: FastifyRequest): AuthContext | undefined {
   if (type === "apoderado") {
     const rut = String(user?.rut ?? "").trim();
 
-    if (!/^\d{8}$/.test(rut)) {
+    /*
+     * Regla WELI:
+     *
+     * cuerpo numérico,
+     * sin puntos,
+     * sin guion,
+     * sin DV,
+     * 7 u 8 dígitos.
+     */
+    if (!/^\d{7,8}$/.test(rut)) {
       return undefined;
     }
 
@@ -289,8 +332,11 @@ function readLegacyAuthFromReq(req: FastifyRequest): AuthContext | undefined {
   if (rol_id === 3) {
     return {
       type: "user",
+
       user_id,
+
       rol_id,
+
       academia_id: null,
     };
   }
@@ -303,8 +349,11 @@ function readLegacyAuthFromReq(req: FastifyRequest): AuthContext | undefined {
 
   return {
     type: "user",
+
     user_id,
+
     rol_id,
+
     academia_id,
   };
 }
@@ -361,6 +410,15 @@ function ensureAuthContext(req: FastifyRequest): AuthContext | undefined {
  *
  * Una academia desactivada invalida operativamente las sesiones
  * de Admin y Staff aunque el JWT todavía no haya expirado.
+ *
+ * La nueva política de cifrado de datos no requiere descifrado
+ * dentro de este middleware:
+ *
+ * - los usuarios de panel se identifican mediante claims firmados;
+ * - el estado de academia es un dato operacional;
+ * - el RUT del apoderado forma parte temporalmente del contrato JWT
+ *   existente y se utiliza posteriormente para calcular blind indexes
+ *   en los routers autorizados.
  */
 export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
   const authorization = String(req.headers.authorization ?? "").trim();
@@ -370,6 +428,7 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
   if (!match) {
     return reply.code(401).send({
       ok: false,
+
       message: "UNAUTHORIZED",
     });
   }
@@ -393,11 +452,13 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
       {
         message: error?.message,
       },
+
       "[authz] invalid JWT configuration"
     );
 
     return reply.code(500).send({
       ok: false,
+
       message: "AUTH_CONFIGURATION_ERROR",
     });
   }
@@ -427,11 +488,13 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
       {
         message: error?.message,
       },
+
       "[authz] invalid authentication token"
     );
 
     return reply.code(401).send({
       ok: false,
+
       message: "INVALID_TOKEN",
     });
   }
@@ -444,16 +507,25 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
 
   /* =======================================================
      APODERADO
-     Se conserva la lógica existente.
-     Su revisión integral queda fuera de esta etapa.
   ======================================================= */
 
   if (type === "apoderado") {
     const rut = String(user?.rut ?? "").trim();
 
-    if (!/^\d{8}$/.test(rut)) {
+    /*
+     * Regla WELI:
+     *
+     * RUT interno:
+     * - cuerpo numérico;
+     * - sin puntos;
+     * - sin guion;
+     * - sin DV;
+     * - 7 u 8 dígitos.
+     */
+    if (!/^\d{7,8}$/.test(rut)) {
       return reply.code(401).send({
         ok: false,
+
         message: "INVALID_TOKEN",
       });
     }
@@ -468,8 +540,9 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
      *
      * Si no lo incorpora, NO se inventa una academia.
      *
-     * La revisión integral del modelo Apoderado se realizará
-     * posteriormente y de forma separada.
+     * El portal multiacademia puede operar sin academia_id en
+     * el JWT porque la autorización real del jugador se verifica
+     * posteriormente mediante el blind index del apoderado.
      */
     const academia_id = extractAcademiaId(user);
 
@@ -501,10 +574,15 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
         : {}),
     };
 
+    /*
+     * req.auth es la fuente canónica.
+     */
     (req as any).auth = authContext;
 
     /*
-     * Compatibilidad temporal.
+     * Compatibilidad temporal con código anterior.
+     *
+     * Se conserva el payload ya verificado.
      */
     (req as any).user = user;
 
@@ -518,6 +596,7 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
   if (!PANEL_TYPES.has(type)) {
     return reply.code(401).send({
       ok: false,
+
       message: "INVALID_TOKEN",
     });
   }
@@ -529,6 +608,7 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
   if (!rol_id || !user_id) {
     return reply.code(401).send({
       ok: false,
+
       message: "INVALID_TOKEN",
     });
   }
@@ -575,6 +655,7 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
        */
       return reply.code(401).send({
         ok: false,
+
         message: "INVALID_TOKEN",
       });
     }
@@ -595,7 +676,9 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
     } catch (error: any) {
       return sendAcademiaAccessError(req, reply, error, {
         user_id,
+
         rol_id,
+
         academia_id: academiaToken,
       });
     }
@@ -605,7 +688,9 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
     type: "user",
 
     user_id,
+
     rol_id,
+
     academia_id,
   };
 
@@ -637,6 +722,7 @@ export async function requireApoderado(req: FastifyRequest, reply: FastifyReply)
   if (!auth || auth.type !== "apoderado") {
     return reply.code(403).send({
       ok: false,
+
       message: "FORBIDDEN",
     });
   }
@@ -655,6 +741,7 @@ export function requireRoles(allowed: number[]) {
     if (!auth || auth.type !== "user") {
       return reply.code(403).send({
         ok: false,
+
         message: "FORBIDDEN",
       });
     }
@@ -668,11 +755,13 @@ export function requireRoles(allowed: number[]) {
 
           allowed: [...allowedRoles],
         },
+
         "[authz] forbidden by role"
       );
 
       return reply.code(403).send({
         ok: false,
+
         message: "FORBIDDEN",
       });
     }

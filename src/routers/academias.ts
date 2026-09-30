@@ -6,6 +6,16 @@ import { z } from "zod";
 
 import { db } from "../db";
 
+import {
+  blindIndex,
+  decryptNullable,
+  decryptRut,
+  encryptNullable,
+  encryptRut,
+  rutBlindIndex,
+  validateCryptoConfiguration,
+} from "../services/crypto";
+
 import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
 /**
@@ -212,7 +222,7 @@ const CreateSchema = z
   .object({
     nombre: z.string().trim().min(2).max(120),
 
-    rut_academia: z.coerce.number().int().positive().max(99_999_999),
+    rut_academia: z.coerce.number().int().min(1_000_000).max(99_999_999),
 
     deporte_id: z.coerce.number().int().positive(),
 
@@ -312,7 +322,7 @@ const UpdateSchema = z
   .object({
     nombre: z.string().trim().min(2).max(120).optional(),
 
-    rut_academia: z.coerce.number().int().positive().max(99_999_999).optional(),
+    rut_academia: z.coerce.number().int().min(1_000_000).max(99_999_999).optional(),
 
     deporte_id: z.coerce.number().int().positive().optional(),
 
@@ -415,6 +425,54 @@ function normalizeEmail(value: string): string {
     .trim()
 
     .toLocaleLowerCase("es");
+}
+
+/**
+ * Representación canónica utilizada exclusivamente para nombre_idx.
+ * Debe coincidir con la utilizada durante la migración inicial.
+ */
+function normalizeAcademiaNameForIndex(value: string): string {
+  return normalizeName(value).toLowerCase();
+}
+
+/**
+ * Convierte una fila de academias a su contrato público.
+ *
+ * Durante la fase transitoria:
+ * - prioriza las columnas cifradas;
+ * - mantiene fallback legacy por compatibilidad;
+ * - nunca expone ciphertext ni blind indexes.
+ */
+function normalizeAcademiaOut(row: any) {
+  if (!row) return null;
+
+  const out: Record<string, any> = { ...row };
+
+  if (row.nombre_enc) {
+    out.nombre = decryptNullable(row.nombre_enc) ?? row.nombre ?? null;
+  }
+
+  if (row.rut_academia_enc) {
+    const rut = decryptRut(row.rut_academia_enc);
+    out.rut_academia = rut ? Number(rut) : (row.rut_academia ?? null);
+  }
+
+  if (row.direccion_enc) {
+    out.direccion = decryptNullable(row.direccion_enc) ?? row.direccion ?? null;
+  }
+
+  if (row.email_enc) {
+    out.email = decryptNullable(row.email_enc) ?? row.email ?? null;
+  }
+
+  delete out.nombre_enc;
+  delete out.nombre_idx;
+  delete out.rut_academia_enc;
+  delete out.rut_academia_idx;
+  delete out.direccion_enc;
+  delete out.email_enc;
+
+  return out;
 }
 
 async function validateCiudadComuna(conn: any, ciudadComunaId: number): Promise<void> {
@@ -1072,6 +1130,8 @@ async function deactivateInvalidBenefitScopes(conn: any, academiaId: number): Pr
 ========================================================= */
 
 export default async function academias(app: FastifyInstance) {
+  validateCryptoConfiguration();
+
   const onlySuper = [requireAuth, requireRoles([3])];
 
   const canManageLogo = [requireAuth, requireRoles([1, 3])];
@@ -1165,8 +1225,12 @@ export default async function academias(app: FastifyInstance) {
                 a.id,
 
                 a.nombre,
+                a.nombre_enc,
+                a.nombre_idx,
 
                 a.rut_academia,
+                a.rut_academia_enc,
+                a.rut_academia_idx,
 
                 a.deporte_id,
 
@@ -1175,10 +1239,12 @@ export default async function academias(app: FastifyInstance) {
                   AS deporte_nombre,
 
                 a.direccion,
+                a.direccion_enc,
 
                 a.ciudad_comuna_id,
 
                 a.email,
+                a.email_enc,
                 a.logo_mime,
                 a.logo_updated_at,
                 CASE WHEN a.logo_base64 IS NULL THEN 0 ELSE 1 END AS tiene_logo,
@@ -1289,7 +1355,7 @@ export default async function academias(app: FastifyInstance) {
 
           offset,
 
-          data: rows,
+          data: Array.isArray(rows) ? rows.map(normalizeAcademiaOut) : [],
         });
       } catch (error: any) {
         const parsed = mysqlError(error);
@@ -1372,8 +1438,12 @@ export default async function academias(app: FastifyInstance) {
                 a.id,
 
                 a.nombre,
+                a.nombre_enc,
+                a.nombre_idx,
 
                 a.rut_academia,
+                a.rut_academia_enc,
+                a.rut_academia_idx,
 
                 a.deporte_id,
 
@@ -1382,10 +1452,12 @@ export default async function academias(app: FastifyInstance) {
                   AS deporte_nombre,
 
                 a.direccion,
+                a.direccion_enc,
 
                 a.ciudad_comuna_id,
 
                 a.email,
+                a.email_enc,
                 a.logo_base64,
                 a.logo_mime,
                 a.logo_updated_at,
@@ -1820,7 +1892,7 @@ export default async function academias(app: FastifyInstance) {
           ok: true,
 
           item: {
-            ...academiaRows[0],
+            ...normalizeAcademiaOut(academiaRows[0]),
 
             sucursales: sucursales ?? [],
 
@@ -1924,13 +1996,13 @@ export default async function academias(app: FastifyInstance) {
 
               FROM academias
 
-              WHERE rut_academia = ?
+              WHERE rut_academia_idx = ?
 
               LIMIT 1
 
             `,
 
-          [body.rut_academia]
+          [rutBlindIndex(body.rut_academia)]
         );
 
         if (rutRows?.length) {
@@ -1959,32 +2031,52 @@ export default async function academias(app: FastifyInstance) {
               INSERT INTO academias (
 
                 nombre,
+                nombre_enc,
+                nombre_idx,
 
                 rut_academia,
+                rut_academia_enc,
+                rut_academia_idx,
 
                 deporte_id,
 
                 direccion,
+                direccion_enc,
 
                 ciudad_comuna_id,
+
                 email,
+                email_enc,
+
                 logo_base64,
                 logo_mime,
                 logo_updated_at,
                 estado_id
               )
 
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, IF(? IS NULL, NULL, NOW()), ?)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, IF(? IS NULL, NULL, NOW()), ?)
 
             `,
 
           [
             nombre,
+            encryptNullable(nombre),
+            blindIndex(normalizeAcademiaNameForIndex(nombre)),
+
             body.rut_academia,
+            encryptRut(body.rut_academia),
+            rutBlindIndex(body.rut_academia),
+
             body.deporte_id,
+
             direccion,
+            encryptNullable(direccion),
+
             body.ciudad_comuna_id,
+
             email,
+            encryptNullable(email),
+
             logoBase64,
             logoMime,
             logoBase64,
@@ -2522,7 +2614,7 @@ export default async function academias(app: FastifyInstance) {
 
                 FROM academias
 
-                WHERE rut_academia = ?
+                WHERE rut_academia_idx = ?
 
                   AND id <> ?
 
@@ -2530,7 +2622,7 @@ export default async function academias(app: FastifyInstance) {
 
               `,
 
-            [body.rut_academia, academiaId]
+            [rutBlindIndex(body.rut_academia), academiaId]
           );
 
           if (rutRows?.length) {
@@ -2627,15 +2719,21 @@ export default async function academias(app: FastifyInstance) {
         const updateParams: any[] = [];
 
         if (body.nombre !== undefined) {
-          sets.push("nombre = ?");
+          const nombre = normalizeName(body.nombre);
 
-          updateParams.push(normalizeName(body.nombre));
+          sets.push("nombre = ?");
+          sets.push("nombre_enc = ?");
+          sets.push("nombre_idx = ?");
+
+          updateParams.push(nombre, encryptNullable(nombre), blindIndex(normalizeAcademiaNameForIndex(nombre)));
         }
 
         if (body.rut_academia !== undefined) {
           sets.push("rut_academia = ?");
+          sets.push("rut_academia_enc = ?");
+          sets.push("rut_academia_idx = ?");
 
-          updateParams.push(body.rut_academia);
+          updateParams.push(body.rut_academia, encryptRut(body.rut_academia), rutBlindIndex(body.rut_academia));
         }
 
         if (body.deporte_id !== undefined) {
@@ -2645,9 +2743,12 @@ export default async function academias(app: FastifyInstance) {
         }
 
         if (body.direccion !== undefined) {
-          sets.push("direccion = ?");
+          const direccion = normalizeName(body.direccion);
 
-          updateParams.push(normalizeName(body.direccion));
+          sets.push("direccion = ?");
+          sets.push("direccion_enc = ?");
+
+          updateParams.push(direccion, encryptNullable(direccion));
         }
 
         if (body.ciudad_comuna_id !== undefined) {
@@ -2657,8 +2758,12 @@ export default async function academias(app: FastifyInstance) {
         }
 
         if (body.email !== undefined) {
+          const email = normalizeEmail(body.email);
+
           sets.push("email = ?");
-          updateParams.push(normalizeEmail(body.email));
+          sets.push("email_enc = ?");
+
+          updateParams.push(email, encryptNullable(email));
         }
 
         if (body.logo_base64 !== undefined && body.logo_mime !== undefined) {

@@ -39,9 +39,7 @@ const AggregateQuery = z.object({
 
   deporte_id: z.coerce.number().int().positive(), // requerido
 
-  partido_id: z
-    .union([z.coerce.number().int().positive(), z.literal("null"), z.null()])
-    .optional(),
+  partido_id: z.union([z.coerce.number().int().positive(), z.literal("null"), z.null()]).optional(),
 });
 
 const CreateSchema = z
@@ -72,13 +70,7 @@ const SPORT_TABLE: Record<number, string> = {
 };
 
 // Campos base comunes (stats_base)
-const baseKeys = new Set([
-  "minutos_jugados",
-  "partidos_jugados",
-  "lesiones",
-  "dias_baja",
-  "sanciones_federativas",
-]);
+const baseKeys = new Set(["minutos_jugados", "partidos_jugados", "lesiones", "dias_baja", "sanciones_federativas"]);
 
 /**
  * ✅ Whitelist por deporte (detalle)
@@ -199,6 +191,34 @@ const allowedSportKeys: Record<number, Set<string>> = {
     "pir",
     "per",
   ]),
+  7: new Set([
+    "pases_completos",
+    "pases_intentados",
+    "pases_yardas",
+    "pases_touchdowns",
+    "pases_intercepciones",
+
+    "acarreos_intentos",
+    "acarreos_yardas",
+    "acarreos_touchdowns",
+
+    "recepciones_total",
+    "recepciones_yardas",
+    "recepciones_touchdowns",
+
+    "tackles_totales",
+    "sacks",
+    "intercepciones_defensivas",
+    "fumbles_recuperados",
+
+    "yardas_totales",
+    "perdidas_balon",
+    "tiempo_posesion_segundos",
+
+    "tercer_down_intentos",
+    "tercer_down_conversiones",
+    "tercer_down_efectividad_pct",
+  ]),
 };
 
 const floatKeys = new Set([
@@ -265,11 +285,7 @@ function normalizePartidoId(v: any): number | null | undefined {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
-function assertQueryAcademiaMatchesEffectiveOr403(
-  academia_id: number | undefined,
-  effective: number,
-  reply: any
-) {
+function assertQueryAcademiaMatchesEffectiveOr403(academia_id: number | undefined, effective: number, reply: any) {
   if (academia_id !== undefined && Number(academia_id) !== Number(effective)) {
     reply.code(403).send({ ok: false, message: "ACADEMIA_SCOPE_MISMATCH" });
     return false;
@@ -337,10 +353,10 @@ async function ensureSportRow(deporte_id: number, stats_id: number) {
 }
 
 async function getJoinedStatsByStatsIdScoped(stats_id: number, academia_id: number) {
-  const [baseRows]: any = await db.query(
-    "SELECT * FROM stats_base WHERE id = ? AND academia_id = ? LIMIT 1",
-    [stats_id, academia_id]
-  );
+  const [baseRows]: any = await db.query("SELECT * FROM stats_base WHERE id = ? AND academia_id = ? LIMIT 1", [
+    stats_id,
+    academia_id,
+  ]);
   const base = baseRows?.[0];
   if (!base) return null;
 
@@ -666,7 +682,13 @@ export default async function estadisticas(app: FastifyInstance) {
         [...params, limit, offset]
       );
 
-      return reply.send({ ok: true, items: rows, limit, offset, joined_sport: Boolean(deporte_id && SPORT_TABLE[deporte_id]) });
+      return reply.send({
+        ok: true,
+        items: rows,
+        limit,
+        offset,
+        joined_sport: Boolean(deporte_id && SPORT_TABLE[deporte_id]),
+      });
     } catch (err: any) {
       return reply.code(500).send({ ok: false, message: "Error al listar (joined)", error: sqlErr(err) });
     }
@@ -786,7 +808,8 @@ export default async function estadisticas(app: FastifyInstance) {
       const stats_id = await ensureStatsBase(academiaId, deporte_id, jugador_id, partido_id);
       await ensureSportRow(deporte_id, stats_id);
 
-      if (Object.keys(base).length) await db.query("UPDATE stats_base SET ? WHERE id = ? AND academia_id = ?", [base, stats_id, academiaId]);
+      if (Object.keys(base).length)
+        await db.query("UPDATE stats_base SET ? WHERE id = ? AND academia_id = ?", [base, stats_id, academiaId]);
       if (Object.keys(sport).length) await db.query(`UPDATE \`${table}\` SET ? WHERE stats_id = ?`, [sport, stats_id]);
 
       const joined = await getJoinedStatsByStatsIdScoped(stats_id, academiaId);
@@ -820,10 +843,10 @@ export default async function estadisticas(app: FastifyInstance) {
     const raw = coerceNumbers((req as any).body || {});
 
     try {
-      const [rows]: any = await db.query(
-        "SELECT deporte_id FROM stats_base WHERE id = ? AND academia_id = ? LIMIT 1",
-        [stats_id, academiaId]
-      );
+      const [rows]: any = await db.query("SELECT deporte_id FROM stats_base WHERE id = ? AND academia_id = ? LIMIT 1", [
+        stats_id,
+        academiaId,
+      ]);
       const baseRow = rows?.[0];
       if (!baseRow) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
@@ -879,7 +902,10 @@ export default async function estadisticas(app: FastifyInstance) {
     }
 
     try {
-      const [result]: any = await db.query("DELETE FROM stats_base WHERE id = ? AND academia_id = ?", [stats_id, academiaId]);
+      const [result]: any = await db.query("DELETE FROM stats_base WHERE id = ? AND academia_id = ?", [
+        stats_id,
+        academiaId,
+      ]);
       if (Number(result?.affectedRows ?? 0) === 0) return reply.code(404).send({ ok: false, message: "No encontrado" });
 
       return reply.send({ ok: true, deleted: stats_id });
