@@ -1,6 +1,7 @@
 // src/routers/usuarios.ts
 
-import { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+
 import { z } from "zod";
 import * as argon2 from "@node-rs/argon2";
 
@@ -16,246 +17,81 @@ import {
   validateCryptoConfiguration,
 } from "../services/crypto";
 
-import { requireAuth, requireRoles } from "../middlewares/authz";
+import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
-/**
- * Tabla: usuarios
- *
- * Columnas funcionales:
- *  id,
- *  academia_id,
- *  nombre_usuario,
- *  rut_usuario,
- *  email,
- *  password,
- *  rol_id,
- *  estado_id
- *
- * Columnas criptográficas:
- *  nombre_usuario_enc
- *  nombre_usuario_idx
- *  rut_usuario_enc
- *  rut_usuario_idx
- *  email_enc
- *  email_idx
- *
- * Reglas WELI:
- *
- * - READ: roles 1 y 3
- * - WRITE: roles 1 y 3
- *
- * Scope academia:
- *
- * - rol 1:
- *     solo su academia_id;
- *     al crear SIEMPRE se fuerza a su academia.
- *
- * - rol 3:
- *     bypass multiacademia.
- *
- * Regla Platino:
- *
- * - Actor rol 1 NO puede crear/editar usuarios rol 3.
- * - Actor rol 1 solo puede asignar rol_id ∈ {1,2}.
- * - Actor rol 1 NO puede editar/borrar una cuenta cuyo rol actual sea 3.
- *
- * Seguridad criptográfica:
- *
- * - nombre_usuario, rut_usuario y email se mantienen temporalmente
- *   en dual-write durante la fase de transición.
- *
- * - las lecturas priorizan *_enc.
- *
- * - las búsquedas exactas por RUT utilizan rut_usuario_idx.
- *
- * - password continúa siendo hash Argon2 irreversible.
- *
- * - *_enc y *_idx jamás provienen desde el frontend.
- */
+/* =========================================================
+   TIPOS DE AUTH
+========================================================= */
+
+type UserAuth = {
+  type: "user";
+  user_id?: number;
+  rol_id?: number;
+  academia_id?: number;
+};
+
+type ApoderadoAuth = {
+  type: "apoderado";
+  rut: string;
+  apoderado_id?: number;
+};
+
+type AuthContext = UserAuth | ApoderadoAuth | undefined;
 
 /* =========================================================
    AUTH HELPERS
 ========================================================= */
 
-function getAuth(req: any) {
-  return (req as any).auth as
-    | {
-        type: "user";
-        user_id?: number;
-        rol_id?: number;
-        academia_id?: number;
-      }
-    | {
-        type: "apoderado";
-        rut: string;
-        apoderado_id?: number;
-      }
-    | undefined;
+function getAuth(req: FastifyRequest): AuthContext {
+  return (req as any).auth as AuthContext;
 }
 
-function getActorRol(req: any): number {
-  const auth = getAuth(req);
-
-  return auth?.type === "user" ? Number(auth.rol_id ?? 0) : 0;
-}
-
-function isSuper(req: any) {
-  return getActorRol(req) === 3;
-}
-
-function isAdmin(req: any) {
-  return getActorRol(req) === 1;
-}
-
-/**
- * Devuelve:
- *
- * - null para superadmin;
- * - academia_id para admin;
- * - responde 403 si el contexto no es válido.
- */
-function getAcademiaIdOr403(req: any, reply: FastifyReply): number | null {
+function getActorRol(req: FastifyRequest): number {
   const auth = getAuth(req);
 
   if (!auth || auth.type !== "user") {
-    reply.code(403).send({
-      ok: false,
-      message: "FORBIDDEN",
-    });
-
-    return 0 as any;
+    return 0;
   }
 
-  if (Number(auth.rol_id) === 3) {
-    return null;
-  }
-
-  const academiaId = Number(auth.academia_id ?? 0);
-
-  if (!Number.isFinite(academiaId) || academiaId <= 0) {
-    reply.code(403).send({
-      ok: false,
-      message: "ACADEMIA_REQUIRED",
-    });
-
-    return 0 as any;
-  }
-
-  return academiaId;
+  return Number(auth.rol_id ?? 0);
 }
 
-async function assertUserInAcademiaOr404(id: number, academiaId: number | null, reply: FastifyReply) {
-  if (!academiaId) {
-    return true;
-  }
-
-  const [rows]: any = await db.query(
-    `
-      SELECT id
-      FROM usuarios
-      WHERE id = ?
-        AND academia_id = ?
-      LIMIT 1
-    `,
-    [id, academiaId]
-  );
-
-  if (!rows?.length) {
-    /*
-     * 404 deliberado para no filtrar
-     * información entre tenants.
-     */
-    reply.code(404).send({
-      ok: false,
-      message: "No encontrado",
-    });
-
-    return false;
-  }
-
-  return true;
+function isSuper(req: FastifyRequest): boolean {
+  return getActorRol(req) === 3;
 }
 
-/**
- * Regla Platino:
- *
- * Admin rol 1:
- *
- * - no puede asignar rol 3;
- * - sólo puede asignar roles 1 y 2.
- */
-function assertAdminCannotAssignSuperOr403(req: any, rolId: any, reply: FastifyReply) {
-  if (!isAdmin(req) || isSuper(req)) {
-    return;
-  }
-
-  const rid = Number(rolId);
-
-  if (rid === 3 || ![1, 2].includes(rid)) {
-    reply.code(403).send({
-      ok: false,
-      message: "FORBIDDEN_ROLE_ASSIGNMENT",
-    });
-
-    throw new Error("FORBIDDEN_ROLE_ASSIGNMENT");
-  }
-}
-
-/**
- * Regla Platino:
- *
- * Admin rol 1 no puede modificar ni borrar
- * una cuenta cuyo rol actual sea superadmin.
- */
-async function assertTargetNotSuperOr403(targetUserId: number, req: any, reply: FastifyReply) {
-  if (isSuper(req)) {
-    return true;
-  }
-
-  const [rows]: any = await db.query(
-    `
-        SELECT rol_id
-        FROM usuarios
-        WHERE id = ?
-        LIMIT 1
-      `,
-    [targetUserId]
-  );
-
-  const rid = Number(rows?.[0]?.rol_id ?? 0);
-
-  if (rid === 3) {
-    reply.code(403).send({
-      ok: false,
-      message: "FORBIDDEN_TARGET_SUPERADMIN",
-    });
-
-    return false;
-  }
-
-  return true;
+function isAdmin(req: FastifyRequest): boolean {
+  return getActorRol(req) === 1;
 }
 
 /* =========================================================
-   RESPONSE / ERROR HELPERS
+   RESPUESTAS
 ========================================================= */
 
 function noStore(reply: FastifyReply) {
   reply.header("Cache-Control", "no-store");
 }
 
-function duplicateFieldFromSqlMessage(msg?: string) {
-  const text = String(msg || "").toLowerCase();
-
-  if (text.includes("email")) {
-    return "email";
+function getErrorCode(err: any): number {
+  if (err?.statusCode && Number.isFinite(Number(err.statusCode))) {
+    return Number(err.statusCode);
   }
 
-  if (text.includes("rut")) {
+  return 500;
+}
+
+function duplicateFieldFromSqlMessage(message?: string): string | undefined {
+  const text = String(message ?? "").toLowerCase();
+
+  if (text.includes("rut_usuario_idx") || text.includes("rut_usuario")) {
     return "rut_usuario";
   }
 
-  if (text.includes("nombre_usuario")) {
+  if (text.includes("email_idx") || text.includes("email")) {
+    return "email";
+  }
+
+  if (text.includes("nombre_usuario_idx") || text.includes("nombre_usuario")) {
     return "nombre_usuario";
   }
 
@@ -266,126 +102,108 @@ function duplicateFieldFromSqlMessage(msg?: string) {
   return undefined;
 }
 
-/**
- * Escape mínimo para LIKE.
- *
- * Durante la fase dual se mantiene la búsqueda
- * parcial sobre columnas legacy para no romper
- * la funcionalidad existente.
- */
-function escapeLike(value: string) {
-  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
+/* =========================================================
+   NORMALIZACIONES
+========================================================= */
+
+function normalizeNombre(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function normalizeNombreIndex(value: unknown): string {
+  return normalizeNombre(value).toLocaleLowerCase("es-CL");
+}
+
+function normalizeEmail(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeRutBody(value: unknown): string {
+  const rut = String(value ?? "")
+    .replace(/\D/g, "")
+    .trim();
+
+  if (!/^\d{7,8}$/.test(rut)) {
+    throw Object.assign(new Error("rut_usuario inválido"), {
+      statusCode: 400,
+      field: "rut_usuario",
+    });
+  }
+
+  return rut;
 }
 
 /* =========================================================
-   NORMALIZACIONES CRIPTOGRÁFICAS
+   CIFRADO
 ========================================================= */
 
-function normalizeUsernameIndex(value: unknown): string {
-  const normalized = String(value ?? "")
-    .trim()
-    .toLowerCase();
+function buildEncryptedIdentity(data: { nombre_usuario?: unknown; rut_usuario?: unknown; email?: unknown }) {
+  const result: Record<string, any> = {};
 
-  if (!normalized) {
-    throw new Error("nombre_usuario inválido");
-  }
+  if (data.nombre_usuario !== undefined) {
+    const nombre = normalizeNombre(data.nombre_usuario);
 
-  return normalized;
-}
-
-function normalizeEmailIndex(value: unknown): string {
-  const normalized = String(value ?? "")
-    .trim()
-    .toLowerCase();
-
-  if (!normalized) {
-    throw new Error("email inválido");
-  }
-
-  return normalized;
-}
-
-/**
- * Añade los mirrors criptográficos.
- *
- * Nunca recibe *_enc o *_idx desde el cliente:
- * allowedKeys los excluye.
- */
-function applyEncryptedMirrors(target: Record<string, any>) {
-  if ("nombre_usuario" in target) {
-    if (
-      target.nombre_usuario === null ||
-      target.nombre_usuario === undefined ||
-      String(target.nombre_usuario).trim() === ""
-    ) {
-      target.nombre_usuario_enc = null;
-
-      target.nombre_usuario_idx = null;
-    } else {
-      const nombre = String(target.nombre_usuario).trim();
-
-      target.nombre_usuario_enc = encryptNullable(nombre);
-
-      target.nombre_usuario_idx = blindIndex(normalizeUsernameIndex(nombre));
+    if (!nombre) {
+      throw Object.assign(new Error("nombre_usuario inválido"), {
+        statusCode: 400,
+        field: "nombre_usuario",
+      });
     }
+
+    result.nombre_usuario_enc = encryptNullable(nombre);
+
+    result.nombre_usuario_idx = blindIndex(normalizeNombreIndex(nombre));
   }
 
-  if ("rut_usuario" in target) {
-    if (target.rut_usuario === null || target.rut_usuario === undefined || target.rut_usuario === "") {
-      target.rut_usuario_enc = null;
+  if (data.rut_usuario !== undefined) {
+    const rut = normalizeRutBody(data.rut_usuario);
 
-      target.rut_usuario_idx = null;
-    } else {
-      target.rut_usuario_enc = encryptRut(target.rut_usuario);
+    result.rut_usuario_enc = encryptRut(rut);
 
-      target.rut_usuario_idx = rutBlindIndex(target.rut_usuario);
+    result.rut_usuario_idx = rutBlindIndex(rut);
+  }
+
+  if (data.email !== undefined) {
+    const email = normalizeEmail(data.email);
+
+    if (!email) {
+      throw Object.assign(new Error("email inválido"), {
+        statusCode: 400,
+        field: "email",
+      });
     }
+
+    result.email_enc = encryptNullable(email);
+
+    result.email_idx = blindIndex(email);
   }
 
-  if ("email" in target) {
-    if (target.email === null || target.email === undefined || String(target.email).trim() === "") {
-      target.email_enc = null;
-      target.email_idx = null;
-    } else {
-      const email = normalizeEmailIndex(target.email);
-
-      target.email_enc = encryptNullable(email);
-
-      target.email_idx = blindIndex(email);
-    }
-  }
+  return result;
 }
 
 /* =========================================================
-   DESCIFRADO DE RESPUESTAS
+   DESCIFRADO
 ========================================================= */
 
-function decryptTextOrLegacy(encrypted: unknown, legacy: unknown): string | null {
-  if (encrypted !== null && encrypted !== undefined && String(encrypted).trim() !== "") {
-    return decryptNullable(String(encrypted));
-  }
-
-  if (legacy === null || legacy === undefined) {
+function decryptText(encrypted: unknown): string | null {
+  if (encrypted === null || encrypted === undefined || String(encrypted).trim() === "") {
     return null;
   }
 
-  return String(legacy);
+  return decryptNullable(String(encrypted));
 }
 
-function decryptRutOrLegacy(encrypted: unknown, legacy: unknown): number | null {
-  if (encrypted !== null && encrypted !== undefined && String(encrypted).trim() !== "") {
-    const decrypted = decryptRut(String(encrypted));
-
-    const numeric = Number(decrypted);
-
-    return Number.isFinite(numeric) ? numeric : null;
-  }
-
-  if (legacy === null || legacy === undefined || legacy === "") {
+function decryptRutValue(encrypted: unknown): number | null {
+  if (encrypted === null || encrypted === undefined || String(encrypted).trim() === "") {
     return null;
   }
 
-  const numeric = Number(legacy);
+  const value = decryptRut(String(encrypted));
+  const numeric = Number(value);
 
   return Number.isFinite(numeric) ? numeric : null;
 }
@@ -400,11 +218,11 @@ function normalizeUsuarioOut(row: any) {
 
     academia_id: row.academia_id != null ? Number(row.academia_id) : null,
 
-    nombre_usuario: decryptTextOrLegacy(row.nombre_usuario_enc, row.nombre_usuario) ?? "",
+    nombre_usuario: decryptText(row.nombre_usuario_enc) ?? "",
 
-    rut_usuario: decryptRutOrLegacy(row.rut_usuario_enc, row.rut_usuario),
+    rut_usuario: decryptRutValue(row.rut_usuario_enc),
 
-    email: decryptTextOrLegacy(row.email_enc, row.email),
+    email: decryptText(row.email_enc),
 
     rol_id: row.rol_id != null ? Number(row.rol_id) : null,
 
@@ -420,17 +238,8 @@ const IdParam = z.object({
   id: z.coerce.number().int().positive(),
 });
 
-/**
- * WELI:
- *
- * RUT interno = cuerpo numérico,
- * sin puntos,
- * sin guion,
- * sin DV,
- * 7 u 8 dígitos.
- */
 const RutParam = z.object({
-  rut_usuario: z.string().regex(/^\d{7,8}$/, "RUT inválido"),
+  rut_usuario: z.string().regex(/^\d{7,8}$/, "El RUT debe contener 7 u 8 dígitos sin DV"),
 });
 
 const PageQuery = z.object({
@@ -450,20 +259,23 @@ const RutValueSchema = z.union([
 const CreateSchema = z
   .object({
     /*
-     * Requerido sólo si crea un superadmin.
-     *
-     * Para rol 1 el valor recibido se ignora
-     * y se fuerza el tenant del JWT.
+     * Se acepta por compatibilidad con el frontend,
+     * pero el backend determinará finalmente
+     * la academia efectiva mediante authz.
      */
     academia_id: z.coerce.number().int().positive().optional(),
 
-    nombre_usuario: z.string().trim().min(1, "nombre_usuario es obligatorio"),
+    nombre_usuario: z
+      .string()
+      .trim()
+      .min(1, "nombre_usuario es obligatorio")
+      .max(150, "nombre_usuario demasiado largo"),
 
     rut_usuario: RutValueSchema,
 
-    email: z.string().trim().email("email inválido"),
+    email: z.string().trim().email("email inválido").max(254),
 
-    password: z.string().min(6, "password mínimo 6 caracteres"),
+    password: z.string().min(6, "password mínimo 6 caracteres").max(200, "password demasiado largo"),
 
     rol_id: z.coerce.number().int().positive(),
 
@@ -473,18 +285,15 @@ const CreateSchema = z
 
 const UpdateSchema = z
   .object({
-    /*
-     * Sólo rol 3 puede mover academia_id.
-     */
     academia_id: z.coerce.number().int().positive().optional(),
 
-    nombre_usuario: z.string().trim().min(1).optional(),
+    nombre_usuario: z.string().trim().min(1).max(150).optional(),
 
     rut_usuario: RutValueSchema.optional(),
 
-    email: z.string().trim().email().optional(),
+    email: z.string().trim().email().max(254).optional(),
 
-    password: z.string().min(6).optional(),
+    password: z.string().min(6).max(200).optional(),
 
     rol_id: z.coerce.number().int().positive().optional(),
 
@@ -492,78 +301,158 @@ const UpdateSchema = z
   })
   .strict();
 
+/* =========================================================
+   REGLA PLATINO
+========================================================= */
+
 /**
- * Whitelist pública.
+ * Admin rol 1:
  *
- * Deliberadamente NO contiene:
- *
- * nombre_usuario_enc
- * nombre_usuario_idx
- * rut_usuario_enc
- * rut_usuario_idx
- * email_enc
- * email_idx
+ * - sólo puede asignar rol 1 o 2;
+ * - nunca puede asignar rol 3.
  */
-const allowedKeys = new Set([
-  "academia_id",
-  "nombre_usuario",
-  "rut_usuario",
-  "email",
-  "password",
-  "rol_id",
-  "estado_id",
-]);
-
-function pickAllowed(body: Record<string, unknown>) {
-  const out: Record<string, unknown> = {};
-
-  for (const key in body) {
-    if (allowedKeys.has(key)) {
-      out[key] = (body as any)[key];
-    }
+function assertAdminCanAssignRole(req: FastifyRequest, rolId: unknown) {
+  if (!isAdmin(req)) {
+    return;
   }
 
-  return out;
+  const rid = Number(rolId);
+
+  if (![1, 2].includes(rid)) {
+    throw Object.assign(new Error("FORBIDDEN_ROLE_ASSIGNMENT"), {
+      statusCode: 403,
+      field: "rol_id",
+    });
+  }
 }
 
-function normalizeForDB(input: Record<string, unknown>) {
-  const out: Record<string, any> = {
-    ...input,
-  };
-
-  if (out.academia_id != null) {
-    out.academia_id = Number(out.academia_id);
+/**
+ * Admin rol 1 no puede modificar ni eliminar
+ * una cuenta superadmin.
+ */
+async function assertTargetNotSuper(userId: number, req: FastifyRequest) {
+  if (isSuper(req)) {
+    return;
   }
 
-  if (typeof out.nombre_usuario === "string") {
-    out.nombre_usuario = out.nombre_usuario.trim();
+  const [rows]: any = await db.query(
+    `
+      SELECT rol_id
+      FROM usuarios
+      WHERE id = ?
+      LIMIT 1
+    `,
+    [userId]
+  );
+
+  const rolId = Number(rows?.[0]?.rol_id ?? 0);
+
+  if (rolId === 3) {
+    throw Object.assign(new Error("FORBIDDEN_TARGET_SUPERADMIN"), {
+      statusCode: 403,
+    });
+  }
+}
+
+/* =========================================================
+   TENANT
+========================================================= */
+
+function getAcademiaId(req: FastifyRequest): number {
+  const academiaId = getEffectiveAcademiaId(req);
+
+  const id = Number(academiaId);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    throw Object.assign(new Error("ACADEMIA_REQUIRED"), {
+      statusCode: 403,
+    });
   }
 
-  if (typeof out.email === "string") {
-    out.email = out.email.trim().toLowerCase();
+  return id;
+}
+
+async function assertUserInAcademia(userId: number, academiaId: number) {
+  const [rows]: any = await db.query(
+    `
+      SELECT id
+      FROM usuarios
+      WHERE id = ?
+        AND academia_id = ?
+      LIMIT 1
+    `,
+    [userId, academiaId]
+  );
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw Object.assign(new Error("No encontrado"), {
+      statusCode: 404,
+    });
+  }
+}
+
+/* =========================================================
+   DUPLICADOS
+========================================================= */
+
+async function assertRutDisponible(rut: unknown, excludeUserId?: number) {
+  const rutNormalizado = normalizeRutBody(rut);
+
+  const rutIdx = rutBlindIndex(rutNormalizado);
+
+  let sql = `
+    SELECT id
+    FROM usuarios
+    WHERE rut_usuario_idx = ?
+  `;
+
+  const args: any[] = [rutIdx];
+
+  if (excludeUserId !== undefined && excludeUserId !== null) {
+    sql += " AND id <> ?";
+    args.push(excludeUserId);
   }
 
-  if (out.rut_usuario != null && out.rut_usuario !== "") {
-    const rutN = Number(out.rut_usuario);
+  sql += " LIMIT 1";
 
-    out.rut_usuario = Number.isNaN(rutN) ? null : rutN;
+  const [rows]: any = await db.query(sql, args);
+
+  if (rows?.length) {
+    throw Object.assign(new Error("Duplicado: el RUT ya existe"), {
+      statusCode: 409,
+      field: "rut_usuario",
+    });
+  }
+}
+
+async function assertEmailDisponible(email: unknown, excludeUserId?: number) {
+  const normalizado = normalizeEmail(email);
+
+  const emailIdx = blindIndex(normalizado);
+
+  let sql = `
+    SELECT id
+    FROM usuarios
+    WHERE email_idx = ?
+  `;
+
+  const args: any[] = [emailIdx];
+
+  if (excludeUserId !== undefined && excludeUserId !== null) {
+    sql += " AND id <> ?";
+    args.push(excludeUserId);
   }
 
-  if (out.rol_id != null) {
-    out.rol_id = Number(out.rol_id);
-  }
+  sql += " LIMIT 1";
 
-  if (out.estado_id != null) {
-    out.estado_id = Number(out.estado_id);
-  }
+  const [rows]: any = await db.query(sql, args);
 
-  for (const key of Object.keys(out)) {
-    if (out[key] === "") {
-      out[key] = null;
-    }
+  if (rows?.length) {
+    throw Object.assign(new Error("Duplicado: el email ya existe"), {
+      statusCode: 409,
+      field: "email",
+    });
   }
-
-  return out;
 }
 
 /* =========================================================
@@ -572,17 +461,11 @@ function normalizeForDB(input: Record<string, unknown>) {
 
 export default async function usuarios(app: FastifyInstance) {
   /*
-   * Fail-fast.
-   *
-   * Este router no debe quedar operativo
-   * sin las claves criptográficas.
+   * El router no queda operativo
+   * si crypto no está correctamente configurado.
    */
   validateCryptoConfiguration();
 
-  /*
-   * READ / WRITE:
-   * roles 1 y 3.
-   */
   const canRead = [requireAuth, requireRoles([1, 3])];
 
   const canWrite = [requireAuth, requireRoles([1, 3])];
@@ -599,11 +482,11 @@ export default async function usuarios(app: FastifyInstance) {
     async (_req, reply) => {
       noStore(reply);
 
-      return {
+      return reply.send({
         module: "usuarios",
         status: "ready",
         timestamp: new Date().toISOString(),
-      };
+      });
     }
   );
 
@@ -621,33 +504,31 @@ export default async function usuarios(app: FastifyInstance) {
 
       const parsed = PageQuery.safeParse((req as any).query);
 
-      const { limit, offset, q } = parsed.success
-        ? parsed.data
-        : {
-            limit: 50,
-            offset: 0,
-            q: undefined,
-          };
-
-      const academiaId = getAcademiaIdOr403(req, reply);
-
-      if ((reply as any).sent) {
-        return;
+      if (!parsed.success) {
+        return reply.code(400).send({
+          ok: false,
+          message: "Query inválida",
+          detail: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; "),
+        });
       }
 
       try {
+        const { limit, offset, q } = parsed.data;
+
+        const academiaId = getAcademiaId(req);
+
+        const args: any[] = [academiaId];
+
         let sql = `
           SELECT
             id,
             academia_id,
 
-            nombre_usuario,
             nombre_usuario_enc,
 
-            rut_usuario,
             rut_usuario_enc,
+            rut_usuario_idx,
 
-            email,
             email_enc,
 
             rol_id,
@@ -655,111 +536,96 @@ export default async function usuarios(app: FastifyInstance) {
 
           FROM usuarios
 
-          WHERE 1 = 1
+          WHERE academia_id = ?
         `;
 
-        const args: any[] = [];
+        /*
+         * RUT completo:
+         * utilizamos blind index y evitamos
+         * descifrar registros innecesarios.
+         */
+        const exactRut = Boolean(q && /^\d{7,8}$/.test(q));
 
-        if (academiaId) {
-          sql += " AND academia_id = ?";
+        if (exactRut && q) {
+          sql += " AND rut_usuario_idx = ?";
 
-          args.push(academiaId);
+          args.push(rutBlindIndex(q));
         }
 
-        /*
-         * IMPORTANTE:
-         *
-         * AES-GCM no admite LIKE.
-         *
-         * Durante la fase dual mantenemos
-         * nombre_usuario/email/rut legacy
-         * exclusivamente para búsqueda parcial
-         * y ordenamiento.
-         *
-         * Para RUT completo de 7 u 8 dígitos
-         * utilizamos además el blind index.
-         */
-        if (q) {
-          const like = `%${escapeLike(q)}%`;
-
-          if (/^\d{7,8}$/.test(q)) {
-            sql += `
-              AND (
-                rut_usuario_idx = ?
-                OR nombre_usuario LIKE ? ESCAPE '\\\\'
-                OR email LIKE ? ESCAPE '\\\\'
-                OR CAST(rut_usuario AS CHAR) LIKE ? ESCAPE '\\\\'
-              )
-            `;
-
-            args.push(rutBlindIndex(q), like, like, like);
-          } else {
-            sql += `
-              AND (
-                nombre_usuario LIKE ? ESCAPE '\\\\'
-                OR email LIKE ? ESCAPE '\\\\'
-                OR CAST(rut_usuario AS CHAR) LIKE ? ESCAPE '\\\\'
-              )
-            `;
-
-            args.push(like, like, like);
-          }
-        }
-
-        /*
-         * Orden temporal legacy.
-         *
-         * Con AES-GCM aleatorio no podemos
-         * ORDER BY nombre_usuario_enc.
-         */
-        sql += `
-          ORDER BY
-            nombre_usuario ASC,
-            id ASC
-
-          LIMIT ?
-          OFFSET ?
-        `;
-
-        args.push(limit, offset);
+        sql += " ORDER BY id ASC";
 
         const [rows]: any = await db.query(sql, args);
+
+        let items = (Array.isArray(rows) ? rows : []).map(normalizeUsuarioOut).filter(Boolean);
+
+        /*
+         * Nombre y email están cifrados con
+         * AES-GCM y por tanto no admiten LIKE.
+         *
+         * Para búsqueda parcial:
+         * 1. restringimos primero por tenant;
+         * 2. desciframos;
+         * 3. filtramos en memoria.
+         */
+        if (q && !exactRut) {
+          const needle = String(q).trim().toLocaleLowerCase("es-CL");
+
+          items = items.filter((item: any) => {
+            const nombre = String(item?.nombre_usuario ?? "").toLocaleLowerCase("es-CL");
+
+            const email = String(item?.email ?? "").toLowerCase();
+
+            const rut = String(item?.rut_usuario ?? "");
+
+            return nombre.includes(needle) || email.includes(needle) || rut.includes(needle);
+          });
+        }
+
+        items.sort((a: any, b: any) =>
+          String(a?.nombre_usuario ?? "").localeCompare(String(b?.nombre_usuario ?? ""), "es", {
+            sensitivity: "base",
+          })
+        );
+
+        const total = items.length;
+
+        const paginated = items.slice(offset, offset + limit);
 
         return reply.send({
           ok: true,
 
-          items: (rows ?? []).map(normalizeUsuarioOut),
+          items: paginated,
 
           limit,
           offset,
 
-          count: rows?.length ?? 0,
+          count: paginated.length,
+
+          total,
 
           filters: {
             q: q ?? null,
           },
         });
       } catch (err: any) {
-        return reply.code(500).send({
+        const code = getErrorCode(err);
+
+        return reply.code(code).send({
           ok: false,
 
-          message: "Error al listar usuarios",
+          message: code === 403 ? "Acceso denegado" : "Error al listar usuarios",
 
-          detail: err?.message,
+          detail: err?.sqlMessage ?? err?.message,
         });
       }
     }
   );
 
-  /*
-   * IMPORTANTE:
-   *
-   * /rut/:rut_usuario debe declararse
-   * ANTES de /:id.
-   */
-
   /* =======================================================
      GET BY RUT
+
+     IMPORTANTE:
+     debe ir antes de /:id
   ======================================================= */
 
   app.get(
@@ -779,48 +645,36 @@ export default async function usuarios(app: FastifyInstance) {
         });
       }
 
-      const academiaId = getAcademiaIdOr403(req, reply);
-
-      if ((reply as any).sent) {
-        return;
-      }
-
       try {
+        const academiaId = getAcademiaId(req);
+
         const rutIdx = rutBlindIndex(parsed.data.rut_usuario);
 
-        let sql = `
-          SELECT
-            id,
-            academia_id,
+        const [rows]: any = await db.query(
+          `
+              SELECT
+                id,
+                academia_id,
 
-            nombre_usuario,
-            nombre_usuario_enc,
+                nombre_usuario_enc,
 
-            rut_usuario,
-            rut_usuario_enc,
+                rut_usuario_enc,
+                rut_usuario_idx,
 
-            email,
-            email_enc,
+                email_enc,
 
-            rol_id,
-            estado_id
+                rol_id,
+                estado_id
 
-          FROM usuarios
+              FROM usuarios
 
-          WHERE rut_usuario_idx = ?
-        `;
+              WHERE academia_id = ?
+                AND rut_usuario_idx = ?
 
-        const args: any[] = [rutIdx];
-
-        if (academiaId) {
-          sql += " AND academia_id = ?";
-
-          args.push(academiaId);
-        }
-
-        sql += " ORDER BY id DESC";
-
-        const [rows]: any = await db.query(sql, args);
+              ORDER BY id DESC
+            `,
+          [academiaId, rutIdx]
+        );
 
         return reply.send({
           ok: true,
@@ -828,12 +682,14 @@ export default async function usuarios(app: FastifyInstance) {
           items: (rows ?? []).map(normalizeUsuarioOut),
         });
       } catch (err: any) {
-        return reply.code(500).send({
+        const code = getErrorCode(err);
+
+        return reply.code(code).send({
           ok: false,
 
-          message: "Error al buscar por RUT",
+          message: code === 403 ? "Acceso denegado" : "Error al buscar por RUT",
 
-          detail: err?.message,
+          detail: err?.sqlMessage ?? err?.message,
         });
       }
     }
@@ -860,46 +716,34 @@ export default async function usuarios(app: FastifyInstance) {
         });
       }
 
-      const academiaId = getAcademiaIdOr403(req, reply);
-
-      if ((reply as any).sent) {
-        return;
-      }
-
       try {
-        let sql = `
-          SELECT
-            id,
-            academia_id,
+        const academiaId = getAcademiaId(req);
 
-            nombre_usuario,
-            nombre_usuario_enc,
+        const [rows]: any = await db.query(
+          `
+              SELECT
+                id,
+                academia_id,
 
-            rut_usuario,
-            rut_usuario_enc,
+                nombre_usuario_enc,
 
-            email,
-            email_enc,
+                rut_usuario_enc,
+                rut_usuario_idx,
 
-            rol_id,
-            estado_id
+                email_enc,
 
-          FROM usuarios
+                rol_id,
+                estado_id
 
-          WHERE id = ?
-        `;
+              FROM usuarios
 
-        const args: any[] = [parsed.data.id];
+              WHERE id = ?
+                AND academia_id = ?
 
-        if (academiaId) {
-          sql += " AND academia_id = ?";
-
-          args.push(academiaId);
-        }
-
-        sql += " LIMIT 1";
-
-        const [rows]: any = await db.query(sql, args);
+              LIMIT 1
+            `,
+          [parsed.data.id, academiaId]
+        );
 
         if (!rows?.length) {
           return reply.code(404).send({
@@ -914,12 +758,14 @@ export default async function usuarios(app: FastifyInstance) {
           item: normalizeUsuarioOut(rows[0]),
         });
       } catch (err: any) {
-        return reply.code(500).send({
+        const code = getErrorCode(err);
+
+        return reply.code(code).send({
           ok: false,
 
-          message: "Error al obtener usuario",
+          message: code === 403 ? "Acceso denegado" : "Error al obtener usuario",
 
-          detail: err?.message,
+          detail: err?.sqlMessage ?? err?.message,
         });
       }
     }
@@ -949,76 +795,45 @@ export default async function usuarios(app: FastifyInstance) {
         });
       }
 
-      const academiaId = getAcademiaIdOr403(req, reply);
+      try {
+        /*
+         * Tenant efectivo:
+         *
+         * - rol 1: academia JWT
+         * - rol 3: academia seleccionada
+         */
+        const academiaId = getAcademiaId(req);
 
-      if ((reply as any).sent) {
-        return;
-      }
+        const body = parsed.data;
 
-      const data: any = normalizeForDB(pickAllowed(parsed.data));
+        assertAdminCanAssignRole(req, body.rol_id);
 
-      /*
-       * rol 1:
-       * SIEMPRE fuerza academia del JWT.
-       *
-       * rol 3:
-       * debe indicar academia_id.
-       */
-      if (academiaId) {
-        data.academia_id = academiaId;
-      } else {
-        if (!data.academia_id || !Number.isFinite(Number(data.academia_id)) || Number(data.academia_id) <= 0) {
-          return reply.code(400).send({
-            ok: false,
+        const nombre = normalizeNombre(body.nombre_usuario);
 
-            message: "academia_id es obligatorio para superadmin",
-          });
-        }
-      }
+        const rut = normalizeRutBody(body.rut_usuario);
 
-      if (
-        !data.nombre_usuario ||
-        !data.email ||
-        !data.password ||
-        !data.rut_usuario ||
-        !data.rol_id ||
-        !data.estado_id
-      ) {
-        return reply.code(400).send({
-          ok: false,
+        const email = normalizeEmail(body.email);
 
-          message: "Payload inválido (campos requeridos faltantes)",
+        /*
+         * Comprobaciones anticipadas para
+         * devolver errores más claros.
+         */
+        await assertRutDisponible(rut);
+
+        await assertEmailDisponible(email);
+
+        const crypto = buildEncryptedIdentity({
+          nombre_usuario: nombre,
+
+          rut_usuario: rut,
+
+          email,
         });
-      }
-
-      /*
-       * Regla Platino.
-       */
-      try {
-        assertAdminCannotAssignSuperOr403(req, data.rol_id, reply);
-      } catch {
-        return;
-      }
-
-      if ((reply as any).sent) {
-        return;
-      }
-
-      try {
-        /*
-         * Generamos cifrado e índices ANTES
-         * de reemplazar password por su hash.
-         */
-        applyEncryptedMirrors(data);
 
         /*
-         * password:
-         *
-         * siempre hash Argon2.
-         *
-         * Nunca AES.
+         * Password exclusivamente Argon2.
          */
-        data.password = await argon2.hash(String(data.password));
+        const passwordHash = await argon2.hash(String(body.password));
 
         const [result]: any = await db.query(
           `
@@ -1026,15 +841,12 @@ export default async function usuarios(app: FastifyInstance) {
               (
                 academia_id,
 
-                nombre_usuario,
                 nombre_usuario_enc,
                 nombre_usuario_idx,
 
-                rut_usuario,
                 rut_usuario_enc,
                 rut_usuario_idx,
 
-                email,
                 email_enc,
                 email_idx,
 
@@ -1043,20 +855,16 @@ export default async function usuarios(app: FastifyInstance) {
                 rol_id,
                 estado_id
               )
-
               VALUES
               (
                 ?,
 
                 ?,
                 ?,
-                ?,
 
                 ?,
                 ?,
-                ?,
 
-                ?,
                 ?,
                 ?,
 
@@ -1067,47 +875,53 @@ export default async function usuarios(app: FastifyInstance) {
               )
             `,
           [
-            data.academia_id,
+            academiaId,
 
-            data.nombre_usuario,
-            data.nombre_usuario_enc,
-            data.nombre_usuario_idx,
+            crypto.nombre_usuario_enc,
 
-            data.rut_usuario,
-            data.rut_usuario_enc,
-            data.rut_usuario_idx,
+            crypto.nombre_usuario_idx,
 
-            data.email,
-            data.email_enc,
-            data.email_idx,
+            crypto.rut_usuario_enc,
 
-            data.password,
+            crypto.rut_usuario_idx,
 
-            data.rol_id,
-            data.estado_id,
+            crypto.email_enc,
+            crypto.email_idx,
+
+            passwordHash,
+
+            Number(body.rol_id),
+
+            Number(body.estado_id),
           ]
         );
+
+        const userId = Number(result?.insertId ?? 0);
+
+        if (!Number.isInteger(userId) || userId <= 0) {
+          throw new Error("No fue posible obtener el ID del usuario creado");
+        }
 
         return reply.code(201).send({
           ok: true,
 
-          id: result.insertId,
+          id: userId,
 
-          academia_id: data.academia_id,
+          item: {
+            id: userId,
 
-          /*
-           * Se devuelve el contrato funcional,
-           * nunca ciphertext ni índices.
-           */
-          nombre_usuario: data.nombre_usuario,
+            academia_id: academiaId,
 
-          rut_usuario: data.rut_usuario,
+            nombre_usuario: nombre,
 
-          email: data.email,
+            rut_usuario: Number(rut),
 
-          rol_id: data.rol_id,
+            email,
 
-          estado_id: data.estado_id,
+            rol_id: Number(body.rol_id),
+
+            estado_id: Number(body.estado_id),
+          },
         });
       } catch (err: any) {
         if (err?.errno === 1062 || err?.code === "ER_DUP_ENTRY") {
@@ -1122,7 +936,7 @@ export default async function usuarios(app: FastifyInstance) {
           });
         }
 
-        if (err?.errno === 1452) {
+        if (err?.errno === 1452 || err?.code === "ER_NO_REFERENCED_ROW_2") {
           return reply.code(409).send({
             ok: false,
 
@@ -1132,12 +946,27 @@ export default async function usuarios(app: FastifyInstance) {
           });
         }
 
-        return reply.code(500).send({
+        if (err?.errno === 1054 || err?.code === "ER_BAD_FIELD_ERROR") {
+          return reply.code(500).send({
+            ok: false,
+
+            message: "Columna desconocida: revisa el esquema de usuarios",
+
+            detail: err?.sqlMessage ?? err?.message,
+          });
+        }
+
+        const code = getErrorCode(err);
+
+        return reply.code(code).send({
           ok: false,
 
-          message: "Error al crear usuario",
+          field: err?.field,
 
-          detail: err?.message,
+          message:
+            code === 403 ? (err?.message ?? "Acceso denegado") : code === 409 ? err?.message : "Error al crear usuario",
+
+          detail: err?.sqlMessage ?? err?.message,
         });
       }
     }
@@ -1164,8 +993,6 @@ export default async function usuarios(app: FastifyInstance) {
         });
       }
 
-      const id = pid.data.id;
-
       const parsed = UpdateSchema.safeParse((req as any).body);
 
       if (!parsed.success) {
@@ -1178,159 +1005,168 @@ export default async function usuarios(app: FastifyInstance) {
         });
       }
 
-      const academiaId = getAcademiaIdOr403(req, reply);
-
-      if ((reply as any).sent) {
-        return;
-      }
-
-      /*
-       * Admin:
-       * no puede editar fuera de su academia.
-       */
-      const okRow = await assertUserInAcademiaOr404(id, academiaId, reply);
-
-      if (!okRow) {
-        return;
-      }
-
-      /*
-       * Regla Platino:
-       *
-       * admin no puede modificar superadmin.
-       */
-      const okTarget = await assertTargetNotSuperOr403(id, req, reply);
-
-      if (!okTarget) {
-        return;
-      }
-
-      const changes: any = normalizeForDB(pickAllowed(parsed.data));
-
-      if (Object.keys(changes).length === 0) {
-        return reply.code(400).send({
-          ok: false,
-          message: "No hay campos para actualizar",
-        });
-      }
-
-      /*
-       * Admin:
-       * academia_id recibido se ignora.
-       */
-      if (academiaId && changes.academia_id !== undefined) {
-        delete changes.academia_id;
-      }
-
-      /*
-       * Regla Platino:
-       * admin no puede asignar rol 3.
-       */
-      if (changes.rol_id !== undefined) {
-        try {
-          assertAdminCannotAssignSuperOr403(req, changes.rol_id, reply);
-        } catch {
-          return;
-        }
-
-        if ((reply as any).sent) {
-          return;
-        }
-      }
-
-      if (Object.keys(changes).length === 0) {
-        return reply.code(400).send({
-          ok: false,
-          message: "No hay campos para actualizar",
-        });
-      }
-
       try {
+        const id = pid.data.id;
+
+        const academiaId = getAcademiaId(req);
+
         /*
-         * Respuesta pública antes de añadir
-         * ciphertexts e índices.
+         * El usuario objetivo debe pertenecer
+         * a la academia efectiva.
          */
-        const publicChanges = {
-          ...changes,
+        await assertUserInAcademia(id, academiaId);
+
+        await assertTargetNotSuper(id, req);
+
+        const body = {
+          ...parsed.data,
         };
 
         /*
-         * Dual-write para todo PII modificado.
+         * Admin nunca puede cambiar academia.
+         *
+         * Superadmin puede mover usuario sólo
+         * si academia_id fue explícitamente enviada.
          */
-        applyEncryptedMirrors(changes);
+        if (isAdmin(req)) {
+          delete body.academia_id;
+        }
 
-        if (typeof changes.password === "string") {
-          changes.password = await argon2.hash(String(changes.password));
+        if (body.rol_id !== undefined) {
+          assertAdminCanAssignRole(req, body.rol_id);
+        }
+
+        if (body.rut_usuario !== undefined) {
+          await assertRutDisponible(body.rut_usuario, id);
+        }
+
+        if (body.email !== undefined) {
+          await assertEmailDisponible(body.email, id);
         }
 
         const setClauses: string[] = [];
 
         const values: any[] = [];
 
-        if (changes.academia_id !== undefined) {
+        const publicChanges: Record<string, any> = {};
+
+        /* -----------------------------------------
+           ACADEMIA
+        ----------------------------------------- */
+
+        if (body.academia_id !== undefined) {
+          const nuevaAcademia = Number(body.academia_id);
+
+          if (!Number.isInteger(nuevaAcademia) || nuevaAcademia <= 0) {
+            throw Object.assign(new Error("academia_id inválido"), {
+              statusCode: 400,
+              field: "academia_id",
+            });
+          }
+
           setClauses.push("academia_id = ?");
 
-          values.push(changes.academia_id);
+          values.push(nuevaAcademia);
+
+          publicChanges.academia_id = nuevaAcademia;
         }
 
-        /* -------------------------------------------------
-           NOMBRE USUARIO
-        ------------------------------------------------- */
+        /* -----------------------------------------
+           NOMBRE
+        ----------------------------------------- */
 
-        if (changes.nombre_usuario !== undefined) {
-          setClauses.push("nombre_usuario = ?", "nombre_usuario_enc = ?", "nombre_usuario_idx = ?");
+        if (body.nombre_usuario !== undefined) {
+          const nombre = normalizeNombre(body.nombre_usuario);
 
-          values.push(changes.nombre_usuario, changes.nombre_usuario_enc, changes.nombre_usuario_idx);
+          const crypto = buildEncryptedIdentity({
+            nombre_usuario: nombre,
+          });
+
+          setClauses.push("nombre_usuario_enc = ?", "nombre_usuario_idx = ?");
+
+          values.push(
+            crypto.nombre_usuario_enc,
+
+            crypto.nombre_usuario_idx
+          );
+
+          publicChanges.nombre_usuario = nombre;
         }
 
-        /* -------------------------------------------------
+        /* -----------------------------------------
            RUT
-        ------------------------------------------------- */
+        ----------------------------------------- */
 
-        if (changes.rut_usuario !== undefined) {
-          setClauses.push("rut_usuario = ?", "rut_usuario_enc = ?", "rut_usuario_idx = ?");
+        if (body.rut_usuario !== undefined) {
+          const rut = normalizeRutBody(body.rut_usuario);
 
-          values.push(changes.rut_usuario, changes.rut_usuario_enc, changes.rut_usuario_idx);
+          const crypto = buildEncryptedIdentity({
+            rut_usuario: rut,
+          });
+
+          setClauses.push("rut_usuario_enc = ?", "rut_usuario_idx = ?");
+
+          values.push(
+            crypto.rut_usuario_enc,
+
+            crypto.rut_usuario_idx
+          );
+
+          publicChanges.rut_usuario = Number(rut);
         }
 
-        /* -------------------------------------------------
+        /* -----------------------------------------
            EMAIL
-        ------------------------------------------------- */
+        ----------------------------------------- */
 
-        if (changes.email !== undefined) {
-          setClauses.push("email = ?", "email_enc = ?", "email_idx = ?");
+        if (body.email !== undefined) {
+          const email = normalizeEmail(body.email);
 
-          values.push(changes.email, changes.email_enc, changes.email_idx);
+          const crypto = buildEncryptedIdentity({
+            email,
+          });
+
+          setClauses.push("email_enc = ?", "email_idx = ?");
+
+          values.push(crypto.email_enc, crypto.email_idx);
+
+          publicChanges.email = email;
         }
 
-        /* -------------------------------------------------
+        /* -----------------------------------------
            PASSWORD
-        ------------------------------------------------- */
+        ----------------------------------------- */
 
-        if (changes.password !== undefined) {
+        if (body.password !== undefined) {
+          const passwordHash = await argon2.hash(String(body.password));
+
           setClauses.push("password = ?");
 
-          values.push(changes.password);
+          values.push(passwordHash);
         }
 
-        /* -------------------------------------------------
+        /* -----------------------------------------
            ROL
-        ------------------------------------------------- */
+        ----------------------------------------- */
 
-        if (changes.rol_id !== undefined) {
+        if (body.rol_id !== undefined) {
           setClauses.push("rol_id = ?");
 
-          values.push(changes.rol_id);
+          values.push(Number(body.rol_id));
+
+          publicChanges.rol_id = Number(body.rol_id);
         }
 
-        /* -------------------------------------------------
+        /* -----------------------------------------
            ESTADO
-        ------------------------------------------------- */
+        ----------------------------------------- */
 
-        if (changes.estado_id !== undefined) {
+        if (body.estado_id !== undefined) {
           setClauses.push("estado_id = ?");
 
-          values.push(changes.estado_id);
+          values.push(Number(body.estado_id));
+
+          publicChanges.estado_id = Number(body.estado_id);
         }
 
         if (setClauses.length === 0) {
@@ -1340,27 +1176,20 @@ export default async function usuarios(app: FastifyInstance) {
           });
         }
 
-        values.push(id);
+        values.push(id, academiaId);
 
-        /*
-         * Scope adicional para rol 1.
-         */
-        let sql = `
-          UPDATE usuarios
+        const [result]: any = await db.query(
+          `
+              UPDATE usuarios
 
-          SET
-            ${setClauses.join(", ")}
+              SET
+                ${setClauses.join(", ")}
 
-          WHERE id = ?
-        `;
-
-        if (academiaId) {
-          sql += " AND academia_id = ?";
-
-          values.push(academiaId);
-        }
-
-        const [result]: any = await db.query(sql, values);
+              WHERE id = ?
+                AND academia_id = ?
+            `,
+          values
+        );
 
         if (Number(result?.affectedRows ?? 0) === 0) {
           return reply.code(404).send({
@@ -1369,17 +1198,12 @@ export default async function usuarios(app: FastifyInstance) {
           });
         }
 
-        /*
-         * password jamás vuelve al cliente.
-         */
-        const { password, ...safe } = publicChanges;
-
         return reply.send({
           ok: true,
 
           updated: {
             id,
-            ...safe,
+            ...publicChanges,
           },
         });
       } catch (err: any) {
@@ -1405,12 +1229,23 @@ export default async function usuarios(app: FastifyInstance) {
           });
         }
 
-        return reply.code(500).send({
+        const code = getErrorCode(err);
+
+        return reply.code(code).send({
           ok: false,
 
-          message: "Error al actualizar usuario",
+          field: err?.field,
 
-          detail: err?.message,
+          message:
+            code === 404
+              ? "No encontrado"
+              : code === 403
+                ? (err?.message ?? "Acceso denegado")
+                : code === 409
+                  ? err?.message
+                  : "Error al actualizar usuario",
+
+          detail: err?.sqlMessage ?? err?.message,
         });
       }
     }
@@ -1437,47 +1272,24 @@ export default async function usuarios(app: FastifyInstance) {
         });
       }
 
-      const academiaId = getAcademiaIdOr403(req, reply);
-
-      if ((reply as any).sent) {
-        return;
-      }
-
-      /*
-       * Admin:
-       * no puede borrar fuera del tenant.
-       */
-      const okRow = await assertUserInAcademiaOr404(parsed.data.id, academiaId, reply);
-
-      if (!okRow) {
-        return;
-      }
-
-      /*
-       * Regla Platino:
-       * admin no puede borrar superadmin.
-       */
-      const okTarget = await assertTargetNotSuperOr403(parsed.data.id, req, reply);
-
-      if (!okTarget) {
-        return;
-      }
-
       try {
-        const args: any[] = [parsed.data.id];
+        const id = parsed.data.id;
 
-        let sql = `
-          DELETE FROM usuarios
-          WHERE id = ?
-        `;
+        const academiaId = getAcademiaId(req);
 
-        if (academiaId) {
-          sql += " AND academia_id = ?";
+        await assertUserInAcademia(id, academiaId);
 
-          args.push(academiaId);
-        }
+        await assertTargetNotSuper(id, req);
 
-        const [result]: any = await db.query(sql, args);
+        const [result]: any = await db.query(
+          `
+              DELETE FROM usuarios
+
+              WHERE id = ?
+                AND academia_id = ?
+            `,
+          [id, academiaId]
+        );
 
         if (Number(result?.affectedRows ?? 0) === 0) {
           return reply.code(404).send({
@@ -1488,7 +1300,7 @@ export default async function usuarios(app: FastifyInstance) {
 
         return reply.send({
           ok: true,
-          deleted: parsed.data.id,
+          deleted: id,
         });
       } catch (err: any) {
         if (err?.errno === 1451 || err?.code === "ER_ROW_IS_REFERENCED_2") {
@@ -1501,12 +1313,19 @@ export default async function usuarios(app: FastifyInstance) {
           });
         }
 
-        return reply.code(500).send({
+        const code = getErrorCode(err);
+
+        return reply.code(code).send({
           ok: false,
 
-          message: "Error al eliminar usuario",
+          message:
+            code === 404
+              ? "No encontrado"
+              : code === 403
+                ? (err?.message ?? "Acceso denegado")
+                : "Error al eliminar usuario",
 
-          detail: err?.message,
+          detail: err?.sqlMessage ?? err?.message,
         });
       }
     }

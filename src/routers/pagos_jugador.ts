@@ -1,8 +1,13 @@
 // src/routers/pagos_jugador.ts
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+
 import { z } from "zod";
+
 import { db } from "../db";
+
+import { decryptNullable, decryptRut, rutBlindIndex } from "../services/crypto";
+
 import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
 /**
@@ -56,11 +61,23 @@ import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middleware
  *
  * pago_detalle conserva el snapshot de la transacción.
  *
- * Seguridad:
+ * SEGURIDAD / PRIVACIDAD:
+ *
  * READ  -> roles 1,3
  * WRITE -> roles 1,3
  *
  * academia_id nunca se recibe desde body.
+ *
+ * jugadores:
+ * - rut_jugador_enc
+ * - rut_jugador_idx
+ * - nombre_jugador_enc
+ *
+ * El RUT nunca se busca por texto plano.
+ * Para búsquedas se utiliza rut_jugador_idx.
+ *
+ * El RUT y nombre se descifran solamente cuando deben
+ * construirse respuestas o valores legacy compatibles.
  * =========================================================
  */
 
@@ -104,10 +121,71 @@ function roundMoney(value: number): number {
 }
 
 function cleanNullableString(value: unknown): string | null {
-  if (value === null || value === undefined) return null;
+  if (value === null || value === undefined) {
+    return null;
+  }
 
   const text = String(value).trim();
+
   return text || null;
+}
+
+/**
+ * Descifra el RUT almacenado en jugadores.rut_jugador_enc.
+ *
+ * Internamente seguimos entregándolo como number porque
+ * pagos_jugador mantiene ese contrato actualmente.
+ */
+function decryptJugadorRut(value: unknown): number | null {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    return null;
+  }
+
+  const decrypted = decryptRut(String(value));
+
+  const numeric = Number(decrypted);
+
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+/**
+ * Descifra nombre_jugador_enc únicamente para salida.
+ */
+function decryptJugadorNombre(value: unknown): string {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    return "";
+  }
+
+  return String(decryptNullable(String(value)) ?? "").trim();
+}
+
+/**
+ * Convierte un registro interno que contiene:
+ *
+ * jugador_rut_enc
+ * jugador_nombre_enc
+ *
+ * al contrato HTTP histórico:
+ *
+ * jugador_rut
+ * jugador_nombre
+ *
+ * Los campos cifrados no salen en la respuesta.
+ */
+function normalizePagoOut(row: any) {
+  if (!row) {
+    return row;
+  }
+
+  const { jugador_rut_enc, jugador_nombre_enc, ...rest } = row;
+
+  return {
+    ...rest,
+
+    jugador_rut: decryptJugadorRut(jugador_rut_enc),
+
+    jugador_nombre: decryptJugadorNombre(jugador_nombre_enc),
+  };
 }
 
 /* =========================================================
@@ -115,10 +193,13 @@ function cleanNullableString(value: unknown): string | null {
 ========================================================= */
 
 function toSQLDate(input: string): string | null {
-  if (!input) return null;
+  if (!input) {
+    return null;
+  }
 
   if (/^\d{4}-\d{2}-\d{2}$/.test(input)) {
     const parsed = new Date(`${input}T00:00:00Z`);
+
     return Number.isNaN(parsed.getTime()) ? null : input;
   }
 
@@ -132,11 +213,16 @@ function toSQLDate(input: string): string | null {
 }
 
 function normalizeSQLDate(value: any): string | null {
-  if (value === null || value === undefined) return null;
+  if (value === null || value === undefined) {
+    return null;
+  }
 
   if (typeof value === "string") {
     const match = value.match(/^(\d{4}-\d{2}-\d{2})/);
-    if (match) return match[1];
+
+    if (match) {
+      return match[1];
+    }
   }
 
   if (value instanceof Date && !Number.isNaN(value.getTime())) {
@@ -167,7 +253,9 @@ const RutParam = z.object({
 const DetalleSchema = z
   .object({
     tipo_pago_id: z.coerce.number().int().positive(),
+
     origen: z.enum(["REGULAR", "ADICIONAL"]).default("REGULAR"),
+
     observaciones: z.string().trim().max(255).nullable().optional(),
   })
   .strict();
@@ -178,14 +266,14 @@ const CreateSchema = z
 
     sucursal_id: z.union([z.coerce.number().int().positive(), z.null()]).optional().default(null),
 
-    /*
+    /**
      * Beneficio EXTRA de esta transacción.
      *
      * null:
-     *   cobra monto_asignado sin descuento extra.
+     * cobra monto_asignado sin descuento extra.
      *
      * ID:
-     *   aplica plan_reglas SOBRE monto_asignado.
+     * aplica plan_reglas SOBRE monto_asignado.
      */
     plan_catalogo_id: z.union([z.coerce.number().int().positive(), z.null()]).optional().default(null),
 
@@ -227,17 +315,25 @@ const UpdateSchema = z
 
 const PageQuery = z.object({
   limit: z.coerce.number().int().positive().max(1000).default(50),
+
   offset: z.coerce.number().int().nonnegative().default(0),
 });
 
 const ListQuery = PageQuery.extend({
   year: z.coerce.number().int().optional(),
+
   month: z.coerce.number().int().min(1).max(12).optional(),
+
   tipo_pago_id: z.coerce.number().int().positive().optional(),
+
   jugador_rut: z.coerce.number().int().positive().optional(),
+
   jugador_id: z.coerce.number().int().positive().optional(),
+
   sucursal_id: z.coerce.number().int().positive().optional(),
+
   plan_catalogo_id: z.coerce.number().int().positive().optional(),
+
   situacion_pago_id: z.coerce.number().int().positive().optional(),
 });
 
@@ -248,20 +344,21 @@ const ListQuery = PageQuery.extend({
 async function getJugadorOrThrow(conn: any, academiaId: number, jugadorId: number) {
   const [rows]: any = await conn.query(
     `
-      SELECT
-        id,
-        rut_jugador,
-        nombre_jugador,
-        academia_id,
-        categoria_id
+        SELECT
+          id,
+          rut_jugador_enc,
+          rut_jugador_idx,
+          nombre_jugador_enc,
+          academia_id,
+          categoria_id
 
-      FROM jugadores
+        FROM jugadores
 
-      WHERE id = ?
-        AND academia_id = ?
+        WHERE id = ?
+          AND academia_id = ?
 
-      LIMIT 1
-    `,
+        LIMIT 1
+      `,
     [jugadorId, academiaId]
   );
 
@@ -269,49 +366,71 @@ async function getJugadorOrThrow(conn: any, academiaId: number, jugadorId: numbe
     businessError("FORBIDDEN_JUGADOR", 403);
   }
 
-  return rows[0];
+  const row = rows[0];
+
+  return {
+    ...row,
+
+    rut_jugador: decryptJugadorRut(row.rut_jugador_enc),
+
+    nombre_jugador: decryptJugadorNombre(row.nombre_jugador_enc),
+  };
 }
 
 async function getJugadorByRutOrThrow(conn: any, academiaId: number, jugadorRut: number) {
+  const rutIdx = rutBlindIndex(String(jugadorRut));
+
   const [rows]: any = await conn.query(
     `
-      SELECT
-        id,
-        rut_jugador,
-        nombre_jugador,
-        academia_id
+        SELECT
+          id,
+          rut_jugador_enc,
+          rut_jugador_idx,
+          nombre_jugador_enc,
+          academia_id,
+          categoria_id
 
-      FROM jugadores
+        FROM jugadores
 
-      WHERE rut_jugador = ?
-        AND academia_id = ?
+        WHERE rut_jugador_idx = ?
+          AND academia_id = ?
 
-      LIMIT 1
-    `,
-    [jugadorRut, academiaId]
+        LIMIT 1
+      `,
+    [rutIdx, academiaId]
   );
 
   if (!rows?.length) {
     businessError("FORBIDDEN_JUGADOR", 403);
   }
 
-  return rows[0];
+  const row = rows[0];
+
+  return {
+    ...row,
+
+    rut_jugador: decryptJugadorRut(row.rut_jugador_enc),
+
+    nombre_jugador: decryptJugadorNombre(row.nombre_jugador_enc),
+  };
 }
 
 async function assertSucursalOrThrow(conn: any, academiaId: number, jugadorId: number, sucursalId: number | null) {
-  if (sucursalId === null) return;
+  if (sucursalId === null) {
+    return;
+  }
 
   const [sucursalRows]: any = await conn.query(
     `
-      SELECT id
+        SELECT id
 
-      FROM sucursales_real
+        FROM sucursales_real
 
-      WHERE id = ?
-        AND academia_id = ?
+        WHERE id = ?
+          AND academia_id = ?
 
-      LIMIT 1
-    `,
+        LIMIT 1
+      `,
     [sucursalId, academiaId]
   );
 
@@ -321,24 +440,24 @@ async function assertSucursalOrThrow(conn: any, academiaId: number, jugadorId: n
 
   const [relationRows]: any = await conn.query(
     `
-    SELECT
-      js.id
+        SELECT
+          js.id
 
-    FROM jugador_sucursal js
+        FROM jugador_sucursal js
 
-    INNER JOIN jugadores j
-      ON j.id = js.jugador_id
-     AND j.academia_id = ?
+        INNER JOIN jugadores j
+          ON j.id = js.jugador_id
+         AND j.academia_id = ?
 
-    INNER JOIN sucursales_real sr
-      ON sr.id = js.sucursal_id
-     AND sr.academia_id = ?
+        INNER JOIN sucursales_real sr
+          ON sr.id = js.sucursal_id
+         AND sr.academia_id = ?
 
-    WHERE js.jugador_id = ?
-      AND js.sucursal_id = ?
+        WHERE js.jugador_id = ?
+          AND js.sucursal_id = ?
 
-    LIMIT 1
-  `,
+        LIMIT 1
+      `,
     [academiaId, academiaId, jugadorId, sucursalId]
   );
 
@@ -350,11 +469,14 @@ async function assertSucursalOrThrow(conn: any, academiaId: number, jugadorId: n
 async function assertSituacionPagoOrThrow(conn: any, situacionPagoId: number) {
   const [rows]: any = await conn.query(
     `
-      SELECT id
-      FROM situacion_pago
-      WHERE id = ?
-      LIMIT 1
-    `,
+        SELECT id
+
+        FROM situacion_pago
+
+        WHERE id = ?
+
+        LIMIT 1
+      `,
     [situacionPagoId]
   );
 
@@ -366,11 +488,14 @@ async function assertSituacionPagoOrThrow(conn: any, situacionPagoId: number) {
 async function assertMedioPagoOrThrow(conn: any, medioPagoId: number) {
   const [rows]: any = await conn.query(
     `
-      SELECT id
-      FROM medio_pago
-      WHERE id = ?
-      LIMIT 1
-    `,
+        SELECT id
+
+        FROM medio_pago
+
+        WHERE id = ?
+
+        LIMIT 1
+      `,
     [medioPagoId]
   );
 
@@ -379,7 +504,11 @@ async function assertMedioPagoOrThrow(conn: any, medioPagoId: number) {
   }
 }
 
-function assertDistinctDetalles(detalles: Array<{ tipo_pago_id: number }>) {
+function assertDistinctDetalles(
+  detalles: Array<{
+    tipo_pago_id: number;
+  }>
+) {
   const ids = detalles.map((item) => Number(item.tipo_pago_id));
 
   if (new Set(ids).size !== ids.length) {
@@ -448,43 +577,78 @@ async function insertPagoHeaderCompat(
   input: {
     academia_id: number;
     jugador_id: number;
+
+    /**
+     * Solo compatibilidad con esquemas legacy
+     * de pagos_jugador.
+     *
+     * La relación real actual es jugador_id.
+     */
     jugador_rut: number;
+
     sucursal_id: number | null;
+
     plan_catalogo_id: number | null;
+
     situacion_pago_id: number;
+
     monto_base: number;
     monto_descuento: number;
     monto_total: number;
+
     fecha_pago: string;
+
     medio_pago_id: number;
+
     comprobante_url: string | null;
+
     observaciones: string | null;
+
     tipo_pago_id: number;
   }
 ) {
   const columns = await getPagosJugadorColumns(conn);
 
-  /*
-   * Además del modelo nuevo se rellenan, solo si todavía existen,
-   * las columnas legacy jugador_rut / tipo_pago_id / monto.
-   * Esto permite convivir con la migración progresiva sin volver
-   * a depender de esas columnas para la lógica financiera.
+  /**
+   * Además del modelo nuevo se rellenan,
+   * solamente si todavía existen,
+   * las columnas legacy:
+   *
+   * jugador_rut
+   * tipo_pago_id
+   * monto
+   *
+   * La lógica financiera NO depende de ellas.
    */
   const source = {
     academia_id: input.academia_id,
+
     jugador_id: input.jugador_id,
+
     jugador_rut: input.jugador_rut,
+
     sucursal_id: input.sucursal_id,
+
     plan_catalogo_id: input.plan_catalogo_id,
+
     situacion_pago_id: input.situacion_pago_id,
+
     monto_base: input.monto_base,
+
     monto_descuento: input.monto_descuento,
+
     monto_total: input.monto_total,
+
     monto: input.monto_total,
+
     tipo_pago_id: input.tipo_pago_id,
+
     fecha_pago: input.fecha_pago,
+
     medio_pago_id: input.medio_pago_id,
+
     comprobante_url: input.comprobante_url,
+
     observaciones: input.observaciones,
   };
 
@@ -502,7 +666,9 @@ async function insertPagoHeaderCompat(
     INSERT INTO pagos_jugador (
       ${names.map((name) => `\`${name}\``).join(", ")}
     )
-    VALUES (${names.map(() => "?").join(", ")})
+    VALUES (
+      ${names.map(() => "?").join(", ")}
+    )
   `;
 
   const values = names.map((name) => payload[name]);
@@ -519,16 +685,25 @@ async function updatePagoHeaderCompat(
   input: {
     jugador_id: number;
     jugador_rut: number;
+
     sucursal_id: number | null;
+
     plan_catalogo_id: number | null;
+
     situacion_pago_id: number;
+
     monto_base: number;
     monto_descuento: number;
     monto_total: number;
+
     fecha_pago: string;
+
     medio_pago_id: number;
+
     comprobante_url: string | null;
+
     observaciones: string | null;
+
     tipo_pago_id: number;
   }
 ) {
@@ -536,22 +711,36 @@ async function updatePagoHeaderCompat(
 
   const source = {
     jugador_id: input.jugador_id,
+
     jugador_rut: input.jugador_rut,
+
     sucursal_id: input.sucursal_id,
+
     plan_catalogo_id: input.plan_catalogo_id,
+
     situacion_pago_id: input.situacion_pago_id,
+
     monto_base: input.monto_base,
+
     monto_descuento: input.monto_descuento,
+
     monto_total: input.monto_total,
+
     monto: input.monto_total,
+
     tipo_pago_id: input.tipo_pago_id,
+
     fecha_pago: input.fecha_pago,
+
     medio_pago_id: input.medio_pago_id,
+
     comprobante_url: input.comprobante_url,
+
     observaciones: input.observaciones,
   };
 
   const payload = pickExistingColumns(columns, source);
+
   const names = Object.keys(payload);
 
   if (names.length === 0) {
@@ -560,13 +749,17 @@ async function updatePagoHeaderCompat(
 
   const sql = `
     UPDATE pagos_jugador
+
     SET ${names.map((name) => `\`${name}\` = ?`).join(", ")}
+
     WHERE id = ?
       AND academia_id = ?
+
     LIMIT 1
   `;
 
   const values = names.map((name) => payload[name]);
+
   values.push(pagoId, academiaId);
 
   const [result]: any = await conn.query(sql, values);
@@ -582,31 +775,31 @@ async function updatePagoHeaderCompat(
 async function getTarifaActualOrThrow(conn: any, academiaId: number, tipoPagoId: number) {
   const [rows]: any = await conn.query(
     `
-      SELECT
-        tp.id AS tipo_pago_id,
-        tp.nombre AS tipo_pago_nombre,
-        tp.estado_id AS tipo_pago_estado_id,
+        SELECT
+          tp.id AS tipo_pago_id,
+          tp.nombre AS tipo_pago_nombre,
+          tp.estado_id AS tipo_pago_estado_id,
 
-        atp.estado_id AS academia_tipo_pago_estado,
+          atp.estado_id AS academia_tipo_pago_estado,
 
-        ta.id AS tarifa_id,
-        ta.monto,
-        ta.estado_id AS tarifa_estado_id
+          ta.id AS tarifa_id,
+          ta.monto,
+          ta.estado_id AS tarifa_estado_id
 
-      FROM tipo_pago tp
+        FROM tipo_pago tp
 
-      INNER JOIN academia_tipo_pago atp
-        ON atp.tipo_pago_id = tp.id
-       AND atp.academia_id = ?
+        INNER JOIN academia_tipo_pago atp
+          ON atp.tipo_pago_id = tp.id
+         AND atp.academia_id = ?
 
-      INNER JOIN tarifas_academia ta
-        ON ta.academia_id = atp.academia_id
-       AND ta.tipo_pago_id = atp.tipo_pago_id
+        INNER JOIN tarifas_academia ta
+          ON ta.academia_id = atp.academia_id
+         AND ta.tipo_pago_id = atp.tipo_pago_id
 
-      WHERE tp.id = ?
+        WHERE tp.id = ?
 
-      LIMIT 1
-    `,
+        LIMIT 1
+      `,
     [academiaId, tipoPagoId]
   );
 
@@ -636,8 +829,11 @@ async function getTarifaActualOrThrow(conn: any, academiaId: number, tipoPagoId:
 
   return {
     tarifa_id: Number(row.tarifa_id),
+
     tipo_pago_id: Number(row.tipo_pago_id),
+
     tipo_pago_nombre: String(row.tipo_pago_nombre ?? ""),
+
     monto: roundMoney(monto),
   };
 }
@@ -662,46 +858,46 @@ async function getJugadorTipoPagoConfig(
 ) {
   const [rows]: any = await conn.query(
     `
-      SELECT
-        jpc.id AS jugador_plan_catalogo_id,
-        jpc.tipo_pago_id,
-        jpc.plan_id,
-        jpc.tarifa_id,
-        jpc.monto_tarifa,
-        jpc.monto_asignado,
-        jpc.fecha_inicio,
-        jpc.fecha_fin,
+        SELECT
+          jpc.id AS jugador_plan_catalogo_id,
+          jpc.tipo_pago_id,
+          jpc.plan_id,
+          jpc.tarifa_id,
+          jpc.monto_tarifa,
+          jpc.monto_asignado,
+          jpc.fecha_inicio,
+          jpc.fecha_fin,
 
-        tp.nombre AS tipo_pago_nombre,
+          tp.nombre AS tipo_pago_nombre,
 
-        pc.nombre AS plan_nombre
+          pc.nombre AS plan_nombre
 
-      FROM jugador_plan_catalogo jpc
+        FROM jugador_plan_catalogo jpc
 
-      INNER JOIN tipo_pago tp
-        ON tp.id = jpc.tipo_pago_id
+        INNER JOIN tipo_pago tp
+          ON tp.id = jpc.tipo_pago_id
 
-      INNER JOIN planes_catalogo pc
-        ON pc.id = jpc.plan_id
+        INNER JOIN planes_catalogo pc
+          ON pc.id = jpc.plan_id
 
-      WHERE jpc.academia_id = ?
-        AND jpc.jugador_id = ?
-        AND jpc.tipo_pago_id = ?
-        AND jpc.estado_id = 1
+        WHERE jpc.academia_id = ?
+          AND jpc.jugador_id = ?
+          AND jpc.tipo_pago_id = ?
+          AND jpc.estado_id = 1
 
-        AND jpc.fecha_inicio <= ?
+          AND jpc.fecha_inicio <= ?
 
-        AND (
-          jpc.fecha_fin IS NULL
-          OR jpc.fecha_fin >= ?
-        )
+          AND (
+            jpc.fecha_fin IS NULL
+            OR jpc.fecha_fin >= ?
+          )
 
-      ORDER BY
-        jpc.fecha_inicio DESC,
-        jpc.id DESC
+        ORDER BY
+          jpc.fecha_inicio DESC,
+          jpc.id DESC
 
-      LIMIT 1
-    `,
+        LIMIT 1
+      `,
     [academiaId, jugadorId, tipoPagoId, fechaPago, fechaPago]
   );
 
@@ -712,6 +908,7 @@ async function getJugadorTipoPagoConfig(
   const row = rows[0];
 
   const montoTarifa = Number(row.monto_tarifa);
+
   const montoAsignado = Number(row.monto_asignado);
 
   if (!Number.isFinite(montoTarifa) || montoTarifa < 0) {
@@ -728,14 +925,23 @@ async function getJugadorTipoPagoConfig(
 
   return {
     jugador_plan_catalogo_id: Number(row.jugador_plan_catalogo_id),
+
     tipo_pago_id: Number(row.tipo_pago_id),
+
     tipo_pago_nombre: String(row.tipo_pago_nombre ?? ""),
+
     plan_id: Number(row.plan_id),
+
     plan_nombre: String(row.plan_nombre ?? ""),
+
     tarifa_id: Number(row.tarifa_id),
+
     monto_tarifa: roundMoney(montoTarifa),
+
     monto_asignado: roundMoney(montoAsignado),
+
     fecha_inicio: normalizeSQLDate(row.fecha_inicio),
+
     fecha_fin: normalizeSQLDate(row.fecha_fin),
   };
 }
@@ -761,18 +967,18 @@ async function assertTransactionPlanOrThrow(conn: any, planId: number | null) {
 
   const [rows]: any = await conn.query(
     `
-      SELECT
-        id,
-        nombre,
-        descripcion,
-        estado_id
+        SELECT
+          id,
+          nombre,
+          descripcion,
+          estado_id
 
-      FROM planes_catalogo
+        FROM planes_catalogo
 
-      WHERE id = ?
+        WHERE id = ?
 
-      LIMIT 1
-    `,
+        LIMIT 1
+      `,
     [planId]
   );
 
@@ -794,24 +1000,24 @@ async function getPlanRule(conn: any, planId: number | null) {
 
   const [rows]: any = await conn.query(
     `
-      SELECT
-        id,
-        plan_id,
-        tipo_beneficio,
-        valor,
-        estado_id
+        SELECT
+          id,
+          plan_id,
+          tipo_beneficio,
+          valor,
+          estado_id
 
-      FROM plan_reglas
+        FROM plan_reglas
 
-      WHERE plan_id = ?
-        AND estado_id = 1
+        WHERE plan_id = ?
+          AND estado_id = 1
 
-      LIMIT 1
-    `,
+        LIMIT 1
+      `,
     [planId]
   );
 
-  /*
+  /**
    * SIN BENEFICIO puede no tener regla.
    */
   return rows?.length ? rows[0] : null;
@@ -853,24 +1059,31 @@ function calculateBenefit(montoBase: number, rule: any | null) {
       }
 
       descuento = roundMoney(base * (valor / 100));
+
       descuento = Math.min(base, descuento);
+
       total = roundMoney(base - descuento);
+
       break;
     }
 
     case "DESCUENTO_FIJO": {
       descuento = Math.min(base, roundMoney(valor));
+
       total = roundMoney(base - descuento);
+
       break;
     }
 
     case "PRECIO_FIJO": {
-      /*
+      /**
        * Un beneficio adicional nunca puede aumentar
        * el monto previamente asignado.
        */
       total = Math.min(base, roundMoney(valor));
+
       descuento = roundMoney(base - total);
+
       break;
     }
 
@@ -880,8 +1093,11 @@ function calculateBenefit(montoBase: number, rule: any | null) {
 
   return {
     plan_regla_id: Number(rule.id),
+
     monto_base: base,
+
     monto_descuento: roundMoney(descuento),
+
     monto_total: roundMoney(total),
   };
 }
@@ -924,6 +1140,7 @@ async function buildDetalles(
 
   for (const input of inputDetalles) {
     const tipoPagoId = Number(input.tipo_pago_id);
+
     const origen = input.origen ?? "REGULAR";
 
     const config = await getJugadorTipoPagoConfig(conn, academiaId, jugadorId, tipoPagoId, fechaPago);
@@ -932,28 +1149,30 @@ async function buildDetalles(
     let montoBase: number;
 
     if (config) {
-      /*
+      /**
        * Cobro regular o adicional de un concepto
        * que ya forma parte de la configuración del jugador.
        */
       tarifaId = config.tarifa_id;
+
       montoBase = config.monto_asignado;
     } else {
       if (origen === "REGULAR") {
         businessError(`El jugador no posee una configuración financiera vigente para el tipo de pago ${tipoPagoId}`);
       }
 
-      /*
+      /**
        * Concepto extraordinario:
        * puede usar la tarifa vigente de academia.
        */
       const tarifa = await getTarifaActualOrThrow(conn, academiaId, tipoPagoId);
 
       tarifaId = tarifa.tarifa_id;
+
       montoBase = tarifa.monto;
     }
 
-    /*
+    /**
      * El descuento de inscripción ya está incorporado
      * dentro de montoBase.
      *
@@ -964,16 +1183,19 @@ async function buildDetalles(
 
     detalles.push({
       tipo_pago_id: tipoPagoId,
+
       tarifa_id: tarifaId,
 
-      /*
+      /**
        * plan_regla_id representa exclusivamente
        * la regla adicional de esta transacción.
        */
       plan_regla_id: calculated.plan_regla_id,
 
       monto_base: calculated.monto_base,
+
       monto_descuento: calculated.monto_descuento,
+
       monto_total: calculated.monto_total,
 
       origen,
@@ -1002,7 +1224,9 @@ function calculateTotals(detalles: any[]) {
 
   return {
     monto_base: montoBase,
+
     monto_descuento: montoDescuento,
+
     monto_total: montoTotal,
   };
 }
@@ -1014,70 +1238,70 @@ function calculateTotals(detalles: any[]) {
 async function getPagoHeader(conn: any, academiaId: number, pagoId: number) {
   const [rows]: any = await conn.query(
     `
-      SELECT
-        p.id,
-        p.academia_id,
-        p.jugador_id,
-        p.sucursal_id,
-        p.plan_catalogo_id,
-        p.situacion_pago_id,
+        SELECT
+          p.id,
+          p.academia_id,
+          p.jugador_id,
+          p.sucursal_id,
+          p.plan_catalogo_id,
+          p.situacion_pago_id,
 
-        p.monto_base,
-        p.monto_descuento,
-        p.monto_total,
+          p.monto_base,
+          p.monto_descuento,
+          p.monto_total,
 
-        p.fecha_pago,
-        p.medio_pago_id,
-        p.comprobante_url,
-        p.observaciones,
-        p.created_at,
+          p.fecha_pago,
+          p.medio_pago_id,
+          p.comprobante_url,
+          p.observaciones,
+          p.created_at,
 
-        j.rut_jugador AS jugador_rut,
-        j.nombre_jugador AS jugador_nombre,
-        j.categoria_id,
+          j.rut_jugador_enc AS jugador_rut_enc,
+          j.nombre_jugador_enc AS jugador_nombre_enc,
+          j.categoria_id,
 
-        c.nombre AS categoria_nombre,
+          c.nombre AS categoria_nombre,
 
-        sr.nombre AS sucursal_nombre,
+          sr.nombre AS sucursal_nombre,
 
-        pc.nombre AS plan_nombre,
+          pc.nombre AS plan_nombre,
 
-        sp.nombre AS situacion_pago_nombre,
+          sp.nombre AS situacion_pago_nombre,
 
-        mp.nombre AS medio_pago_nombre
+          mp.nombre AS medio_pago_nombre
 
-      FROM pagos_jugador p
+        FROM pagos_jugador p
 
-      INNER JOIN jugadores j
-        ON j.id = p.jugador_id
-       AND j.academia_id = p.academia_id
+        INNER JOIN jugadores j
+          ON j.id = p.jugador_id
+         AND j.academia_id = p.academia_id
 
-      LEFT JOIN categorias c
-        ON c.id = j.categoria_id
-       AND c.academia_id = p.academia_id
+        LEFT JOIN categorias c
+          ON c.id = j.categoria_id
+         AND c.academia_id = p.academia_id
 
-      LEFT JOIN sucursales_real sr
-        ON sr.id = p.sucursal_id
-       AND sr.academia_id = p.academia_id
+        LEFT JOIN sucursales_real sr
+          ON sr.id = p.sucursal_id
+         AND sr.academia_id = p.academia_id
 
-      LEFT JOIN planes_catalogo pc
-        ON pc.id = p.plan_catalogo_id
+        LEFT JOIN planes_catalogo pc
+          ON pc.id = p.plan_catalogo_id
 
-      LEFT JOIN situacion_pago sp
-        ON sp.id = p.situacion_pago_id
+        LEFT JOIN situacion_pago sp
+          ON sp.id = p.situacion_pago_id
 
-      LEFT JOIN medio_pago mp
-        ON mp.id = p.medio_pago_id
+        LEFT JOIN medio_pago mp
+          ON mp.id = p.medio_pago_id
 
-      WHERE p.id = ?
-        AND p.academia_id = ?
+        WHERE p.id = ?
+          AND p.academia_id = ?
 
-      LIMIT 1
-    `,
+        LIMIT 1
+      `,
     [pagoId, academiaId]
   );
 
-  return rows?.length ? rows[0] : null;
+  return rows?.length ? normalizePagoOut(rows[0]) : null;
 }
 
 /* =========================================================
@@ -1087,41 +1311,41 @@ async function getPagoHeader(conn: any, academiaId: number, pagoId: number) {
 async function getPagoDetalles(conn: any, pagoId: number) {
   const [rows]: any = await conn.query(
     `
-      SELECT
-        pd.id,
-        pd.pago_id,
-        pd.tipo_pago_id,
+        SELECT
+          pd.id,
+          pd.pago_id,
+          pd.tipo_pago_id,
 
-        tp.nombre AS tipo_pago_nombre,
+          tp.nombre AS tipo_pago_nombre,
 
-        pd.tarifa_id,
-        pd.plan_regla_id,
+          pd.tarifa_id,
+          pd.plan_regla_id,
 
-        pd.monto_base,
-        pd.monto_descuento,
-        pd.monto_total,
+          pd.monto_base,
+          pd.monto_descuento,
+          pd.monto_total,
 
-        pd.origen,
-        pd.observaciones,
+          pd.origen,
+          pd.observaciones,
 
-        pd.created_at,
-        pd.updated_at,
+          pd.created_at,
+          pd.updated_at,
 
-        pr.tipo_beneficio,
-        pr.valor AS beneficio_valor
+          pr.tipo_beneficio,
+          pr.valor AS beneficio_valor
 
-      FROM pago_detalle pd
+        FROM pago_detalle pd
 
-      INNER JOIN tipo_pago tp
-        ON tp.id = pd.tipo_pago_id
+        INNER JOIN tipo_pago tp
+          ON tp.id = pd.tipo_pago_id
 
-      LEFT JOIN plan_reglas pr
-        ON pr.id = pd.plan_regla_id
+        LEFT JOIN plan_reglas pr
+          ON pr.id = pd.plan_regla_id
 
-      WHERE pd.pago_id = ?
+        WHERE pd.pago_id = ?
 
-      ORDER BY pd.id ASC
-    `,
+        ORDER BY pd.id ASC
+      `,
     [pagoId]
   );
 
@@ -1134,47 +1358,48 @@ async function attachDetalles(rows: any[]) {
   }
 
   const ids = rows.map((row) => Number(row.id));
+
   const placeholders = ids.map(() => "?").join(", ");
 
   const [detailRows]: any = await db.query(
     `
-      SELECT
-        pd.id,
-        pd.pago_id,
-        pd.tipo_pago_id,
+        SELECT
+          pd.id,
+          pd.pago_id,
+          pd.tipo_pago_id,
 
-        tp.nombre AS tipo_pago_nombre,
+          tp.nombre AS tipo_pago_nombre,
 
-        pd.tarifa_id,
-        pd.plan_regla_id,
+          pd.tarifa_id,
+          pd.plan_regla_id,
 
-        pd.monto_base,
-        pd.monto_descuento,
-        pd.monto_total,
+          pd.monto_base,
+          pd.monto_descuento,
+          pd.monto_total,
 
-        pd.origen,
-        pd.observaciones,
+          pd.origen,
+          pd.observaciones,
 
-        pd.created_at,
-        pd.updated_at,
+          pd.created_at,
+          pd.updated_at,
 
-        pr.tipo_beneficio,
-        pr.valor AS beneficio_valor
+          pr.tipo_beneficio,
+          pr.valor AS beneficio_valor
 
-      FROM pago_detalle pd
+        FROM pago_detalle pd
 
-      INNER JOIN tipo_pago tp
-        ON tp.id = pd.tipo_pago_id
+        INNER JOIN tipo_pago tp
+          ON tp.id = pd.tipo_pago_id
 
-      LEFT JOIN plan_reglas pr
-        ON pr.id = pd.plan_regla_id
+        LEFT JOIN plan_reglas pr
+          ON pr.id = pd.plan_regla_id
 
-      WHERE pd.pago_id IN (${placeholders})
+        WHERE pd.pago_id IN (${placeholders})
 
-      ORDER BY
-        pd.pago_id ASC,
-        pd.id ASC
-    `,
+        ORDER BY
+          pd.pago_id ASC,
+          pd.id ASC
+      `,
     ids
   );
 
@@ -1191,7 +1416,8 @@ async function attachDetalles(rows: any[]) {
   }
 
   return rows.map((row) => ({
-    ...row,
+    ...normalizePagoOut(row),
+
     detalles: byPago.get(Number(row.id)) ?? [],
   }));
 }
@@ -1230,13 +1456,21 @@ async function insertDetalles(conn: any, pagoId: number, detalles: any[]) {
       `,
       [
         pagoId,
+
         detalle.tipo_pago_id,
+
         detalle.tarifa_id,
+
         detalle.plan_regla_id,
+
         detalle.monto_base,
+
         detalle.monto_descuento,
+
         detalle.monto_total,
+
         detalle.origen,
+
         detalle.observaciones,
       ]
     );
@@ -1266,8 +1500,8 @@ const PAYMENT_SELECT = `
     p.observaciones,
     p.created_at,
 
-    j.rut_jugador AS jugador_rut,
-    j.nombre_jugador AS jugador_nombre,
+    j.rut_jugador_enc AS jugador_rut_enc,
+    j.nombre_jugador_enc AS jugador_nombre_enc,
     j.categoria_id,
 
     c.nombre AS categoria_nombre,
@@ -1330,8 +1564,11 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.send({
           module: "pagos_jugador",
+
           status: "ready",
+
           timestamp: new Date().toISOString(),
+
           academia_id,
         });
       } catch (err: any) {
@@ -1341,7 +1578,9 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(code).send({
           ok: false,
+
           message: "Error /health pagos_jugador",
+
           detail: err?.message,
         });
       }
@@ -1365,7 +1604,9 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
+
           message: "Query inválida",
+
           errors: queryParsed.error.flatten(),
         });
       }
@@ -1395,27 +1636,42 @@ export default async function pagos_jugador(app: FastifyInstance) {
         const params: any[] = [academia_id];
 
         if (jugador_rut) {
-          sql += ` AND j.rut_jugador = ?`;
-          params.push(jugador_rut);
+          sql += `
+            AND j.rut_jugador_idx = ?
+          `;
+
+          params.push(rutBlindIndex(String(jugador_rut)));
         }
 
         if (jugador_id) {
-          sql += ` AND p.jugador_id = ?`;
+          sql += `
+            AND p.jugador_id = ?
+          `;
+
           params.push(jugador_id);
         }
 
         if (sucursal_id) {
-          sql += ` AND p.sucursal_id = ?`;
+          sql += `
+            AND p.sucursal_id = ?
+          `;
+
           params.push(sucursal_id);
         }
 
         if (plan_catalogo_id) {
-          sql += ` AND p.plan_catalogo_id = ?`;
+          sql += `
+            AND p.plan_catalogo_id = ?
+          `;
+
           params.push(plan_catalogo_id);
         }
 
         if (situacion_pago_id) {
-          sql += ` AND p.situacion_pago_id = ?`;
+          sql += `
+            AND p.situacion_pago_id = ?
+          `;
+
           params.push(situacion_pago_id);
         }
 
@@ -1423,21 +1679,30 @@ export default async function pagos_jugador(app: FastifyInstance) {
           sql += `
             AND EXISTS (
               SELECT 1
+
               FROM pago_detalle pd_filter
+
               WHERE pd_filter.pago_id = p.id
                 AND pd_filter.tipo_pago_id = ?
             )
           `;
+
           params.push(tipo_pago_id);
         }
 
         if (year) {
-          sql += ` AND YEAR(p.fecha_pago) = ?`;
+          sql += `
+            AND YEAR(p.fecha_pago) = ?
+          `;
+
           params.push(year);
         }
 
         if (month) {
-          sql += ` AND MONTH(p.fecha_pago) = ?`;
+          sql += `
+            AND MONTH(p.fecha_pago) = ?
+          `;
+
           params.push(month);
         }
 
@@ -1464,6 +1729,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
           items,
           limit,
           offset,
+
           filters: {
             year,
             month,
@@ -1482,7 +1748,9 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(code).send({
           ok: false,
+
           message: "Error al listar pagos",
+
           detail: err?.message,
         });
       }
@@ -1505,12 +1773,12 @@ export default async function pagos_jugador(app: FastifyInstance) {
         const [rows]: any = await db.query(
           PAYMENT_SELECT +
             `
-              WHERE p.academia_id = ?
+                WHERE p.academia_id = ?
 
-              ORDER BY
-                p.fecha_pago DESC,
-                p.id DESC
-            `,
+                ORDER BY
+                  p.fecha_pago DESC,
+                  p.id DESC
+              `,
           [academia_id]
         );
 
@@ -1530,7 +1798,9 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(code).send({
           ok: false,
+
           message: "Error al obtener estado de cuenta",
+
           detail: err?.message,
         });
       }
@@ -1563,17 +1833,19 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         await getJugadorByRutOrThrow(db, academia_id, parsed.data.jugador_rut);
 
+        const rutIdx = rutBlindIndex(String(parsed.data.jugador_rut));
+
         const [rows]: any = await db.query(
           PAYMENT_SELECT +
             `
-              WHERE p.academia_id = ?
-                AND j.rut_jugador = ?
+                WHERE p.academia_id = ?
+                  AND j.rut_jugador_idx = ?
 
-              ORDER BY
-                p.fecha_pago DESC,
-                p.id DESC
-            `,
-          [academia_id, parsed.data.jugador_rut]
+                ORDER BY
+                  p.fecha_pago DESC,
+                  p.id DESC
+              `,
+          [academia_id, rutIdx]
         );
 
         const items = await attachDetalles(rows ?? []);
@@ -1624,6 +1896,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
+
           message: "RUT inválido",
         });
       }
@@ -1635,52 +1908,52 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         const [rows]: any = await db.query(
           `
-            SELECT
-              jpc.id AS jugador_plan_catalogo_id,
-              jpc.jugador_id,
-              jpc.tipo_pago_id,
+              SELECT
+                jpc.id AS jugador_plan_catalogo_id,
+                jpc.jugador_id,
+                jpc.tipo_pago_id,
 
-              tp.nombre AS tipo_pago_nombre,
+                tp.nombre AS tipo_pago_nombre,
 
-              jpc.plan_id,
-              pc.nombre AS plan_nombre,
+                jpc.plan_id,
+                pc.nombre AS plan_nombre,
 
-              jpc.tarifa_id,
-              jpc.monto_tarifa,
-              jpc.monto_asignado,
+                jpc.tarifa_id,
+                jpc.monto_tarifa,
+                jpc.monto_asignado,
 
-              (
-                jpc.monto_tarifa -
-                jpc.monto_asignado
-              ) AS descuento_inicial,
+                (
+                  jpc.monto_tarifa -
+                  jpc.monto_asignado
+                ) AS descuento_inicial,
 
-              jpc.fecha_inicio,
-              jpc.fecha_fin,
-              jpc.estado_id
+                jpc.fecha_inicio,
+                jpc.fecha_fin,
+                jpc.estado_id
 
-            FROM jugador_plan_catalogo jpc
+              FROM jugador_plan_catalogo jpc
 
-            INNER JOIN tipo_pago tp
-              ON tp.id = jpc.tipo_pago_id
+              INNER JOIN tipo_pago tp
+                ON tp.id = jpc.tipo_pago_id
 
-            INNER JOIN planes_catalogo pc
-              ON pc.id = jpc.plan_id
+              INNER JOIN planes_catalogo pc
+                ON pc.id = jpc.plan_id
 
-            WHERE jpc.academia_id = ?
-              AND jpc.jugador_id = ?
-              AND jpc.estado_id = 1
+              WHERE jpc.academia_id = ?
+                AND jpc.jugador_id = ?
+                AND jpc.estado_id = 1
 
-              AND jpc.fecha_inicio <= CURDATE()
+                AND jpc.fecha_inicio <= CURDATE()
 
-              AND (
-                jpc.fecha_fin IS NULL
-                OR jpc.fecha_fin >= CURDATE()
-              )
+                AND (
+                  jpc.fecha_fin IS NULL
+                  OR jpc.fecha_fin >= CURDATE()
+                )
 
-            ORDER BY
-              tp.nombre ASC,
-              jpc.id ASC
-          `,
+              ORDER BY
+                tp.nombre ASC,
+                jpc.id ASC
+            `,
           [academia_id, Number(jugador.id)]
         );
 
@@ -1689,12 +1962,17 @@ export default async function pagos_jugador(app: FastifyInstance) {
         return reply.send({
           ok: true,
           academia_id,
+
           jugador: {
             id: Number(jugador.id),
-            rut_jugador: Number(jugador.rut_jugador),
+
+            rut_jugador: jugador.rut_jugador,
+
             nombre_jugador: String(jugador.nombre_jugador ?? ""),
           },
+
           count: rows?.length ?? 0,
+
           items: rows ?? [],
         });
       } catch (err: any) {
@@ -1749,6 +2027,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
         if (!item) {
           return reply.code(404).send({
             ok: false,
+
             message: "Pago no encontrado",
           });
         }
@@ -1758,6 +2037,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
         return reply.send({
           ok: true,
           academia_id,
+
           item: {
             ...item,
             detalles,
@@ -1770,7 +2050,9 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(code).send({
           ok: false,
+
           message: err?.statusCode ? err.message : "Error al obtener pago",
+
           detail: err?.message,
         });
       }
@@ -1794,7 +2076,9 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
+
           message: "Payload inválido",
+
           errors: parsed.error.flatten(),
         });
       }
@@ -1808,20 +2092,29 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
+
           message: "fecha_pago inválida",
         });
       }
 
       const conn = await db.getConnection();
+
       let transactionStarted = false;
 
       try {
         const academia_id = resolveAcademiaId(req);
 
         await conn.beginTransaction();
+
         transactionStarted = true;
 
         const jugador = await getJugadorOrThrow(conn, academia_id, data.jugador_id);
+
+        const jugadorRut = Number(jugador.rut_jugador);
+
+        if (!Number.isInteger(jugadorRut) || jugadorRut <= 0) {
+          businessError("El RUT cifrado del jugador no pudo ser resuelto", 500);
+        }
 
         await assertSucursalOrThrow(conn, academia_id, data.jugador_id, data.sucursal_id);
 
@@ -1829,7 +2122,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         await assertMedioPagoOrThrow(conn, data.medio_pago_id);
 
-        /*
+        /**
          * La base ya NO proviene directamente
          * de tarifas_academia.
          *
@@ -1855,18 +2148,38 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         const result: any = await insertPagoHeaderCompat(conn, {
           academia_id,
+
           jugador_id: data.jugador_id,
-          jugador_rut: Number(jugador.rut_jugador),
+
+          /**
+           * Compatibilidad exclusiva con una eventual
+           * columna legacy pagos_jugador.jugador_rut.
+           *
+           * No se utiliza para relaciones ni búsquedas
+           * contra jugadores.
+           */
+          jugador_rut: jugadorRut,
+
           sucursal_id: data.sucursal_id,
+
           plan_catalogo_id: data.plan_catalogo_id,
+
           situacion_pago_id: data.situacion_pago_id,
+
           monto_base: totals.monto_base,
+
           monto_descuento: totals.monto_descuento,
+
           monto_total: totals.monto_total,
+
           fecha_pago: fechaPago,
+
           medio_pago_id: data.medio_pago_id,
+
           comprobante_url: cleanNullableString(data.comprobante_url),
+
           observaciones: cleanNullableString(data.observaciones),
+
           tipo_pago_id: Number(firstDetail.tipo_pago_id),
         });
 
@@ -1879,6 +2192,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
         await insertDetalles(conn, pagoId, detalles);
 
         await conn.commit();
+
         transactionStarted = false;
 
         const item = await getPagoHeader(conn, academia_id, pagoId);
@@ -1895,22 +2209,36 @@ export default async function pagos_jugador(app: FastifyInstance) {
           item: item
             ? {
                 ...item,
+
                 detalles: storedDetalles,
               }
             : {
                 id: pagoId,
+
                 academia_id,
+
                 jugador_id: data.jugador_id,
+
                 sucursal_id: data.sucursal_id,
+
                 plan_catalogo_id: data.plan_catalogo_id,
+
                 situacion_pago_id: data.situacion_pago_id,
+
                 monto_base: totals.monto_base,
+
                 monto_descuento: totals.monto_descuento,
+
                 monto_total: totals.monto_total,
+
                 fecha_pago: fechaPago,
+
                 medio_pago_id: data.medio_pago_id,
+
                 comprobante_url: cleanNullableString(data.comprobante_url),
+
                 observaciones: cleanNullableString(data.observaciones),
+
                 detalles: storedDetalles,
               },
         });
@@ -1923,10 +2251,15 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         console.error("[pagos_jugador] POST /", {
           message: err?.message,
+
           code: err?.code,
+
           errno: err?.errno,
+
           sqlMessage: err?.sqlMessage,
+
           sql: err?.sql,
+
           statusCode: err?.statusCode,
         });
 
@@ -1970,6 +2303,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
+
           message: "ID inválido",
         });
       }
@@ -1981,7 +2315,9 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
+
           message: "Payload inválido",
+
           errors: parsed.error.flatten(),
         });
       }
@@ -1991,18 +2327,22 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
+
           message: "No hay campos para actualizar",
         });
       }
 
       const id = pid.data.id;
+
       const conn = await db.getConnection();
+
       let transactionStarted = false;
 
       try {
         const academia_id = resolveAcademiaId(req);
 
         await conn.beginTransaction();
+
         transactionStarted = true;
 
         const current = await getPagoHeader(conn, academia_id, id);
@@ -2042,21 +2382,29 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         const jugador = await getJugadorOrThrow(conn, academia_id, jugadorId);
 
+        const jugadorRut = Number(jugador.rut_jugador);
+
+        if (!Number.isInteger(jugadorRut) || jugadorRut <= 0) {
+          businessError("El RUT cifrado del jugador no pudo ser resuelto", 500);
+        }
+
         await assertSucursalOrThrow(conn, academia_id, jugadorId, sucursalId);
 
         await assertSituacionPagoOrThrow(conn, situacionPagoId);
 
         await assertMedioPagoOrThrow(conn, medioPagoId);
 
-        /*
+        /**
          * Si no recalculamos, preservamos
          * el snapshot histórico existente.
          */
         let montoBase = Number(current.monto_base);
+
         let montoDescuento = Number(current.monto_descuento);
+
         let montoTotal = Number(current.monto_total);
 
-        /*
+        /**
          * Debemos recalcular cuando cambia algo
          * que pueda alterar la configuración financiera:
          *
@@ -2065,7 +2413,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
          * - jugador
          * - fecha
          *
-         * sucursal, medio, situación, observaciones
+         * sucursal, medio, situación y observaciones
          * NO recalculan montos.
          */
         const recalculateDetalles =
@@ -2077,7 +2425,9 @@ export default async function pagos_jugador(app: FastifyInstance) {
         if (recalculateDetalles) {
           let requestedDetalles: Array<{
             tipo_pago_id: number;
+
             origen: "REGULAR" | "ADICIONAL";
+
             observaciones?: string | null;
           }>;
 
@@ -2107,13 +2457,17 @@ export default async function pagos_jugador(app: FastifyInstance) {
           const totals = calculateTotals(nuevosDetalles);
 
           montoBase = totals.monto_base;
+
           montoDescuento = totals.monto_descuento;
+
           montoTotal = totals.monto_total;
 
           await conn.query(
             `
               DELETE
+
               FROM pago_detalle
+
               WHERE pago_id = ?
             `,
             [id]
@@ -2132,19 +2486,35 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         const result: any = await updatePagoHeaderCompat(conn, id, academia_id, {
           jugador_id: jugadorId,
-          jugador_rut: Number(jugador.rut_jugador),
+
+          /**
+           * Únicamente para una eventual columna
+           * legacy pagos_jugador.jugador_rut.
+           */
+          jugador_rut: jugadorRut,
+
           sucursal_id: sucursalId,
+
           plan_catalogo_id: transactionPlanId,
+
           situacion_pago_id: situacionPagoId,
+
           monto_base: montoBase,
+
           monto_descuento: montoDescuento,
+
           monto_total: montoTotal,
+
           fecha_pago: fechaPago,
+
           medio_pago_id: medioPagoId,
+
           comprobante_url:
             body.comprobante_url !== undefined ? cleanNullableString(body.comprobante_url) : current.comprobante_url,
+
           observaciones:
             body.observaciones !== undefined ? cleanNullableString(body.observaciones) : current.observaciones,
+
           tipo_pago_id: legacyTipoPagoId,
         });
 
@@ -2153,6 +2523,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
         }
 
         await conn.commit();
+
         transactionStarted = false;
 
         const updated = await getPagoHeader(conn, academia_id, id);
@@ -2183,10 +2554,15 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         console.error("[pagos_jugador] PUT /:id", {
           message: err?.message,
+
           code: err?.code,
+
           errno: err?.errno,
+
           sqlMessage: err?.sqlMessage,
+
           sql: err?.sql,
+
           statusCode: err?.statusCode,
         });
 
@@ -2229,18 +2605,22 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(400).send({
           ok: false,
+
           message: "ID inválido",
         });
       }
 
       const conn = await db.getConnection();
+
       let transactionStarted = false;
 
       try {
         const academia_id = resolveAcademiaId(req);
+
         const pagoId = parsed.data.id;
 
         await conn.beginTransaction();
+
         transactionStarted = true;
 
         const current = await getPagoHeader(conn, academia_id, pagoId);
@@ -2249,14 +2629,19 @@ export default async function pagos_jugador(app: FastifyInstance) {
           businessError("Pago no encontrado", 404);
         }
 
-        /*
+        /**
          * Eliminación explícita:
-         * pago_detalle -> pagos_jugador
+         *
+         * pago_detalle
+         *      ↓
+         * pagos_jugador
          */
         await conn.query(
           `
             DELETE
+
             FROM pago_detalle
+
             WHERE pago_id = ?
           `,
           [pagoId]
@@ -2264,14 +2649,15 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         const [result]: any = await conn.query(
           `
-            DELETE
-            FROM pagos_jugador
+              DELETE
 
-            WHERE id = ?
-              AND academia_id = ?
+              FROM pagos_jugador
 
-            LIMIT 1
-          `,
+              WHERE id = ?
+                AND academia_id = ?
+
+              LIMIT 1
+            `,
           [pagoId, academia_id]
         );
 
@@ -2280,6 +2666,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
         }
 
         await conn.commit();
+
         transactionStarted = false;
 
         reply.header("Cache-Control", "no-store");
@@ -2287,6 +2674,7 @@ export default async function pagos_jugador(app: FastifyInstance) {
         return reply.send({
           ok: true,
           academia_id,
+
           deleted: pagoId,
         });
       } catch (err: any) {
@@ -2302,7 +2690,9 @@ export default async function pagos_jugador(app: FastifyInstance) {
 
         return reply.code(code).send({
           ok: false,
+
           message: err?.statusCode ? err.message : "Error al eliminar pago",
+
           detail: err?.message,
         });
       } finally {

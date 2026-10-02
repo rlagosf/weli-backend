@@ -31,32 +31,32 @@ type EnsureResult =
    NORMALIZACIONES
 ========================================================= */
 
-function normalizeRutBody(rutLike: string) {
+function normalizeRutBody(rutLike: string): string {
   return normalizeRut(rutLike);
 }
 
-function normalizeNombre(nombreLike?: string) {
+function normalizeNombre(nombreLike?: string): string {
   return String(nombreLike ?? "")
     .trim()
     .replace(/\s+/g, " ");
 }
 
-function normalizeNombreIndex(nombreLike?: string) {
+function normalizeNombreIndex(nombreLike?: string): string {
   return normalizeNombre(nombreLike).toLowerCase();
 }
 
 /* =========================================================
-   HELPERS DE LECTURA SEGURA
+   HELPERS
 ========================================================= */
 
-function decryptNombreOrLegacy(encrypted: unknown, legacy: unknown): string {
-  if (encrypted !== null && encrypted !== undefined && String(encrypted).trim() !== "") {
-    const value = decryptNullable(String(encrypted));
-
-    return normalizeNombre(value ?? undefined);
+function decryptNombre(encrypted: unknown): string {
+  if (encrypted === null || encrypted === undefined || String(encrypted).trim() === "") {
+    return "";
   }
 
-  return normalizeNombre(legacy == null ? undefined : String(legacy));
+  const value = decryptNullable(String(encrypted));
+
+  return normalizeNombre(value ?? undefined);
 }
 
 /* =========================================================
@@ -68,21 +68,16 @@ function decryptNombreOrLegacy(encrypted: unknown, legacy: unknown): string {
  *
  * Reglas:
  *
- * - No pisa password_hash si el RUT ya existe.
- * - La búsqueda principal se realiza mediante rut_apoderado_idx.
- * - Si el apoderado ya existe, devuelve el nombre canónico guardado.
- * - Si existe una credencial histórica sin nombre, completa el nombre.
- * - Si no existe, crea credencial + nombre.
- * - must_change_password = 1 sólo al crear una credencial nueva.
- * - password_hash continúa siendo Argon2 y nunca se cifra con AES.
- *
- * Fase transitoria:
- *
- * - mantiene las columnas legacy;
- * - sincroniza rut_apoderado_enc;
- * - sincroniza rut_apoderado_idx;
- * - sincroniza nombre_apoderado_enc;
- * - sincroniza nombre_apoderado_idx.
+ * - No modifica password_hash si la identidad ya existe.
+ * - La búsqueda se realiza exclusivamente mediante rut_apoderado_idx.
+ * - El RUT nunca se busca ni almacena en plaintext.
+ * - El nombre nunca se almacena en plaintext.
+ * - Si el apoderado existe, devuelve su nombre canónico descifrado.
+ * - Si existe una identidad histórica sin nombre cifrado, permite
+ *   completar únicamente el nombre, sin alterar sus credenciales.
+ * - Si no existe, crea la identidad y sus credenciales iniciales.
+ * - must_change_password = 1 sólo al crear una nueva identidad.
+ * - password_hash continúa siendo Argon2.
  *
  * Regla WELI para RUT:
  *
@@ -102,18 +97,36 @@ export async function ensureApoderadoAuth({
   provisionalPlainPassword?: string;
 }): Promise<EnsureResult> {
   /*
-   * Fail-fast.
+   * Fail-fast:
    *
-   * Este helper no debe operar si las claves
-   * criptográficas no están configuradas correctamente.
+   * Si las claves de cifrado/índice no están correctamente
+   * configuradas, este helper no debe operar.
    */
   validateCryptoConfiguration();
+
+  /* =======================================================
+     NORMALIZAR RUT
+  ======================================================= */
 
   let rutNormalizado: string;
 
   try {
     rutNormalizado = normalizeRutBody(rut_apoderado);
   } catch {
+    return {
+      ok: false,
+      created: false,
+      message: "RUT_APODERADO_INVALID",
+    };
+  }
+
+  /*
+   * Defensa adicional.
+   *
+   * Aunque normalizeRut() ya normalice el valor, mantenemos
+   * explícita la regla funcional de WELI.
+   */
+  if (!/^\d{7,8}$/.test(rutNormalizado)) {
     return {
       ok: false,
       created: false,
@@ -134,10 +147,9 @@ export async function ensureApoderadoAuth({
   const db = getDb();
 
   /*
-   * Blind index determinístico.
+   * Blind index determinístico para búsquedas exactas.
    *
-   * Ya no usamos rut_apoderado plaintext
-   * como clave primaria de búsqueda lógica.
+   * El ciphertext nunca se utiliza como clave de búsqueda.
    */
   const rutIdx = rutBlindIndex(rutNormalizado);
 
@@ -147,33 +159,35 @@ export async function ensureApoderadoAuth({
 
   const [existRows] = await db.query<any[]>(
     `
-        SELECT
-          apoderado_id,
+      SELECT
+        apoderado_id,
+        rut_apoderado_enc,
+        rut_apoderado_idx,
+        nombre_apoderado_enc,
+        nombre_apoderado_idx,
+        password_hash,
+        must_change_password,
+        estado_id
 
-          rut_apoderado,
-          rut_apoderado_enc,
-          rut_apoderado_idx,
+      FROM apoderados_auth
 
-          nombre_apoderado,
-          nombre_apoderado_enc,
-          nombre_apoderado_idx
+      WHERE rut_apoderado_idx = ?
 
-        FROM apoderados_auth
-
-        WHERE rut_apoderado_idx = ?
-
-        LIMIT 1
-      `,
+      LIMIT 1
+    `,
     [rutIdx]
   );
 
   if (existRows?.length) {
     const actual = existRows[0];
 
-    const nombreCanonico = decryptNombreOrLegacy(actual?.nombre_apoderado_enc, actual?.nombre_apoderado);
+    /*
+     * Nunca tocamos password_hash para una identidad existente.
+     */
+    const nombreCanonico = decryptNombre(actual?.nombre_apoderado_enc);
 
     /* -----------------------------------------------------
-       REGISTRO HISTÓRICO SIN NOMBRE
+       REGISTRO EXISTENTE SIN NOMBRE CIFRADO
     ----------------------------------------------------- */
 
     if (!nombreCanonico) {
@@ -186,27 +200,18 @@ export async function ensureApoderadoAuth({
       }
 
       const nombreEnc = encryptNullable(nombre);
-
       const nombreIdx = blindIndex(normalizeNombreIndex(nombre));
 
-      /*
-       * Dual-write.
-       *
-       * Conservamos nombre_apoderado legacy
-       * sólo durante esta fase de transición.
-       */
       await db.query(
         `
           UPDATE apoderados_auth
 
           SET
-            nombre_apoderado = ?,
             nombre_apoderado_enc = ?,
             nombre_apoderado_idx = ?,
             updated_at = NOW()
 
           WHERE apoderado_id = ?
-
             AND (
               nombre_apoderado_enc IS NULL
               OR TRIM(nombre_apoderado_enc) = ''
@@ -214,7 +219,7 @@ export async function ensureApoderadoAuth({
 
           LIMIT 1
         `,
-        [nombre, nombreEnc, nombreIdx, Number(actual.apoderado_id)]
+        [nombreEnc, nombreIdx, Number(actual.apoderado_id)]
       );
 
       return {
@@ -226,38 +231,26 @@ export async function ensureApoderadoAuth({
     }
 
     /* -----------------------------------------------------
-       IDENTIDAD EXISTENTE
+       REPARACIÓN DE MIRRORS CRIPTOGRÁFICOS
     ----------------------------------------------------- */
 
-    /*
-     * Protección adicional:
-     *
-     * Si el registro histórico existía pero alguno de los
-     * mirrors criptográficos todavía estuviera incompleto,
-     * lo reparamos sin tocar password_hash.
-     */
     const repairAssignments: string[] = [];
-
     const repairValues: unknown[] = [];
 
+    /*
+     * En condiciones normales rut_apoderado_idx ya existe,
+     * porque precisamente encontramos el registro mediante él.
+     *
+     * Se conserva la validación defensiva para mantener
+     * consistencia del registro.
+     */
     if (
       actual?.rut_apoderado_enc === null ||
       actual?.rut_apoderado_enc === undefined ||
       String(actual.rut_apoderado_enc).trim() === ""
     ) {
       repairAssignments.push("rut_apoderado_enc = ?");
-
       repairValues.push(encryptRut(rutNormalizado));
-    }
-
-    if (
-      actual?.rut_apoderado_idx === null ||
-      actual?.rut_apoderado_idx === undefined ||
-      String(actual.rut_apoderado_idx).trim() === ""
-    ) {
-      repairAssignments.push("rut_apoderado_idx = ?");
-
-      repairValues.push(rutIdx);
     }
 
     if (
@@ -300,9 +293,10 @@ export async function ensureApoderadoAuth({
     }
 
     /*
-     * RUT existente:
+     * La identidad existente siempre manda.
      *
-     * el nombre almacenado manda.
+     * Aunque el frontend envíe otro nombre para el mismo RUT,
+     * se devuelve el nombre canónico previamente registrado.
      */
     return {
       ok: true,
@@ -325,16 +319,26 @@ export async function ensureApoderadoAuth({
   }
 
   /*
-   * Hash irreversible.
+   * Contraseña provisional:
    *
-   * No usar encryptField / AES para contraseña.
+   * Argon2 es irreversible.
+   * Nunca se cifra con AES.
    */
   const hash = await argon2.hash(provisionalPlainPassword);
 
+  /*
+   * Datos privados.
+   */
   const rutEnc = encryptRut(rutNormalizado);
 
   const nombreEnc = encryptNullable(nombre);
 
+  /*
+   * Índice determinístico del nombre.
+   *
+   * Permite mantener compatibilidad con funcionalidades
+   * futuras de comparación exacta sin revelar el plaintext.
+   */
   const nombreIdx = blindIndex(normalizeNombreIndex(nombre));
 
   try {
@@ -342,11 +346,9 @@ export async function ensureApoderadoAuth({
       `
         INSERT INTO apoderados_auth
         (
-          rut_apoderado,
           rut_apoderado_enc,
           rut_apoderado_idx,
 
-          nombre_apoderado,
           nombre_apoderado_enc,
           nombre_apoderado_idx,
 
@@ -363,9 +365,7 @@ export async function ensureApoderadoAuth({
         (
           ?,
           ?,
-          ?,
 
-          ?,
           ?,
           ?,
 
@@ -378,7 +378,7 @@ export async function ensureApoderadoAuth({
           NOW()
         )
       `,
-      [rutNormalizado, rutEnc, rutIdx, nombre, nombreEnc, nombreIdx, hash]
+      [rutEnc, rutIdx, nombreEnc, nombreIdx, hash]
     );
 
     return {
@@ -389,35 +389,36 @@ export async function ensureApoderadoAuth({
     };
   } catch (error: any) {
     /* -----------------------------------------------------
-       CONCURRENCIA
+       CONCURRENCIA / DUPLICADO
     ----------------------------------------------------- */
 
     if (error?.errno === 1062 || error?.code === "ER_DUP_ENTRY") {
       /*
-       * Dos solicitudes pueden haber intentado crear
-       * el mismo RUT simultáneamente.
+       * Dos solicitudes podrían intentar crear el mismo
+       * apoderado simultáneamente.
        *
-       * Reconsultamos por blind index.
+       * Reconsultamos por el blind index canónico.
        */
       const [rows] = await db.query<any[]>(
         `
-            SELECT
-              apoderado_id,
-              rut_apoderado_enc,
-              nombre_apoderado,
-              nombre_apoderado_enc
+          SELECT
+            apoderado_id,
+            rut_apoderado_enc,
+            rut_apoderado_idx,
+            nombre_apoderado_enc,
+            nombre_apoderado_idx
 
-            FROM apoderados_auth
+          FROM apoderados_auth
 
-            WHERE rut_apoderado_idx = ?
+          WHERE rut_apoderado_idx = ?
 
-            LIMIT 1
-          `,
+          LIMIT 1
+        `,
         [rutIdx]
       );
 
       if (rows?.length) {
-        const canonico = decryptNombreOrLegacy(rows[0]?.nombre_apoderado_enc, rows[0]?.nombre_apoderado);
+        const canonico = decryptNombre(rows[0]?.nombre_apoderado_enc);
 
         if (canonico) {
           return {
@@ -430,15 +431,22 @@ export async function ensureApoderadoAuth({
       }
     }
 
+    /*
+     * Cualquier otro error debe llegar al router.
+     *
+     * jugadores.ts devolverá entonces el detalle correspondiente
+     * sin esconder errores reales de infraestructura/esquema.
+     */
     throw error;
   }
 }
 
 /*
- * NO dejar hashes reales ni sentencias manuales
+ * Seguridad:
+ *
+ * No dejar hashes reales, RUT, nombres ni sentencias manuales
  * de recuperación dentro del archivo productivo.
  *
- * Si alguna vez necesitas resetear una contraseña,
- * conviene hacerlo mediante un script controlado
- * separado y no mediante SQL comentado aquí.
+ * Los resets de contraseña deben implementarse mediante
+ * un flujo o script administrativo controlado.
  */

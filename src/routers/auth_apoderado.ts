@@ -3,20 +3,17 @@
 import type { FastifyInstance, FastifyPluginOptions } from "fastify";
 
 import jwt from "jsonwebtoken";
-
 import * as argon2 from "@node-rs/argon2";
-
 import { z } from "zod";
 
 import { getDb } from "../db";
-
 import { CONFIG } from "../config";
 
-import { decryptRut, rutBlindIndex, validateCryptoConfiguration } from "../services/crypto";
+import { decryptNullable, decryptRut, rutBlindIndex, validateCryptoConfiguration } from "../services/crypto";
 
-/* ──────────────────────────────────────────────────────────────
-   Config / constants
-────────────────────────────────────────────────────────────── */
+/* =========================================================
+   CONFIG
+========================================================= */
 
 const JWT_ISSUER = String((CONFIG as any)?.JWT_ISSUER ?? process.env.JWT_ISSUER ?? "app").trim();
 
@@ -24,26 +21,13 @@ const JWT_AUDIENCE = String((CONFIG as any)?.JWT_AUDIENCE ?? process.env.JWT_AUD
 
 const PERF_LOG = String((CONFIG as any)?.AUTH_PERF_LOG ?? process.env.AUTH_PERF_LOG ?? "0") === "1";
 
-/**
- * NinjaHosting / Node App Manager:
- *
- * Por defecto NO confiamos en XFF porque el cliente puede spoofearlo.
- * Actívalo sólo si confirmas un proxy confiable que normaliza headers.
- */
 const TRUST_PROXY = String((CONFIG as any)?.TRUST_PROXY ?? process.env.TRUST_PROXY ?? "0") === "1";
 
-/*
- * Disponibilidad:
- * limita concurrencia de Argon2 para evitar CPU spikes.
- */
 const MAX_AUTH_CONCURRENCY = Math.max(
   2,
   Number((CONFIG as any)?.AUTH_CONCURRENCY ?? process.env.AUTH_CONCURRENCY ?? 8) || 8
 );
 
-/*
- * Trunca audit extra para no inflar BD.
- */
 const AUDIT_EXTRA_MAX_CHARS = Math.max(
   512,
   Number((CONFIG as any)?.AUDIT_EXTRA_MAX_CHARS ?? process.env.AUDIT_EXTRA_MAX_CHARS ?? 2048) || 2048
@@ -59,38 +43,126 @@ function getJwtSecret() {
   return secret;
 }
 
-/* ──────────────────────────────────────────────────────────────
-   Validation
-────────────────────────────────────────────────────────────── */
+/* =========================================================
+   VALIDATION
+========================================================= */
 
 const RutSchema = z.string().regex(/^\d{7,8}$/);
 
-const LoginSchema = z.object({
-  rut: RutSchema,
-  password: z.string().min(1),
-});
+const LoginSchema = z
+  .object({
+    rut: RutSchema,
+    password: z.string().min(1),
+  })
+  .strict();
 
-const ChangePasswordSchema = z.object({
-  current_password: z.string().min(1),
-  new_password: z.string().min(8),
-});
+const ChangePasswordSchema = z
+  .object({
+    current_password: z.string().min(1),
+    new_password: z.string().min(8),
+  })
+  .strict();
+
+/* =========================================================
+   TOKEN
+========================================================= */
 
 type ApoderadoToken = {
   type: "apoderado";
   apoderado_id: number;
 
   /*
-   * Se conserva durante esta fase para mantener
-   * compatibilidad con el contrato JWT existente.
+   * Compatibilidad temporal.
    *
-   * La persistencia en MySQL sí queda cifrada.
+   * El RUT continúa dentro del JWT porque existen
+   * consumidores actuales que aún dependen de él.
+   *
+   * La BD no almacena este dato en plaintext.
    */
   rut: string;
 };
 
-/* ──────────────────────────────────────────────────────────────
-   Small semaphore (limits argon2 concurrency)
-────────────────────────────────────────────────────────────── */
+function signApoderadoToken(payload: ApoderadoToken) {
+  const JWT_SECRET = getJwtSecret();
+
+  if (!JWT_ISSUER) {
+    throw new Error("JWT_ISSUER missing");
+  }
+
+  if (!JWT_AUDIENCE) {
+    throw new Error("JWT_AUDIENCE missing");
+  }
+
+  return jwt.sign(payload, JWT_SECRET, {
+    expiresIn: "12h",
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+  });
+}
+
+function verifyApoderadoToken(authHeader?: string): ApoderadoToken | null {
+  if (!authHeader) {
+    return null;
+  }
+
+  const [bearer, token] = authHeader.split(" ");
+
+  if (bearer !== "Bearer" || !token) {
+    return null;
+  }
+
+  try {
+    const JWT_SECRET = getJwtSecret();
+
+    const decoded = jwt.verify(token, JWT_SECRET, {
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    }) as any;
+
+    if (decoded?.type !== "apoderado") {
+      return null;
+    }
+
+    const rut = String(decoded?.rut ?? "");
+
+    const apoderadoId = Number(decoded?.apoderado_id);
+
+    if (!/^\d{7,8}$/.test(rut)) {
+      return null;
+    }
+
+    if (!Number.isInteger(apoderadoId) || apoderadoId <= 0) {
+      return null;
+    }
+
+    return {
+      type: "apoderado",
+      rut,
+      apoderado_id: apoderadoId,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getTokenOr401(req: any, reply: any): ApoderadoToken | null {
+  const tokenData = verifyApoderadoToken(req.headers.authorization);
+
+  if (!tokenData) {
+    reply.code(401).send({
+      ok: false,
+      message: "UNAUTHORIZED",
+    });
+
+    return null;
+  }
+
+  return tokenData;
+}
+
+/* =========================================================
+   ARGON2 SEMAPHORE
+========================================================= */
 
 function createSemaphore(max: number) {
   let inFlight = 0;
@@ -143,90 +215,9 @@ async function withAuthSlot<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-/* ──────────────────────────────────────────────────────────────
-   Token helpers
-────────────────────────────────────────────────────────────── */
-
-function signApoderadoToken(payload: ApoderadoToken) {
-  const JWT_SECRET = getJwtSecret();
-
-  if (!JWT_ISSUER) {
-    throw new Error("JWT_ISSUER missing");
-  }
-
-  if (!JWT_AUDIENCE) {
-    throw new Error("JWT_AUDIENCE missing");
-  }
-
-  return jwt.sign(payload, JWT_SECRET, {
-    expiresIn: "12h",
-    issuer: JWT_ISSUER,
-    audience: JWT_AUDIENCE,
-  });
-}
-
-function verifyApoderadoToken(authHeader?: string): ApoderadoToken | null {
-  if (!authHeader) {
-    return null;
-  }
-
-  const [bearer, token] = authHeader.split(" ");
-
-  if (bearer !== "Bearer" || !token) {
-    return null;
-  }
-
-  try {
-    const JWT_SECRET = getJwtSecret();
-
-    const decoded = jwt.verify(token, JWT_SECRET, {
-      issuer: JWT_ISSUER,
-      audience: JWT_AUDIENCE,
-    }) as any;
-
-    if (decoded?.type !== "apoderado") {
-      return null;
-    }
-
-    const rut = String(decoded?.rut ?? "");
-    const apoderado_id = Number(decoded?.apoderado_id);
-
-    if (!/^\d{7,8}$/.test(rut)) {
-      return null;
-    }
-
-    if (!Number.isInteger(apoderado_id) || apoderado_id <= 0) {
-      return null;
-    }
-
-    return {
-      type: "apoderado",
-      rut,
-      apoderado_id,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function getTokenOr401(req: any, reply: any): ApoderadoToken | null {
-  const tokenData = verifyApoderadoToken(req.headers.authorization);
-
-  if (!tokenData) {
-    reply.code(401).send({
-      ok: false,
-      message: "UNAUTHORIZED",
-    });
-
-    return null;
-  }
-
-  return tokenData;
-}
-
-/* ──────────────────────────────────────────────────────────────
-   IP helper (anti spoof)
-────────────────────────────────────────────────────────────── */
+/* =========================================================
+   IP
+========================================================= */
 
 function getIp(req: any): string | null {
   if (!TRUST_PROXY) {
@@ -256,9 +247,9 @@ function getIp(req: any): string | null {
   return req.ip ? String(req.ip) : null;
 }
 
-/* ──────────────────────────────────────────────────────────────
-   Audit helpers (auth_audit)
-────────────────────────────────────────────────────────────── */
+/* =========================================================
+   AUDIT
+========================================================= */
 
 type AuditEvent = "login" | "logout" | "refresh" | "invalid_token" | "access_denied";
 
@@ -278,9 +269,13 @@ function safeJsonTruncate(extra: any, maxChars: number) {
 
 async function auditApoderado(params: {
   req: any;
+
   event: AuditEvent;
+
   statusCode: number;
+
   apoderadoId?: number | null;
+
   extra?: any;
 }) {
   const { req, event, statusCode, apoderadoId = null, extra = null } = params;
@@ -329,8 +324,8 @@ async function auditApoderado(params: {
     );
   } catch {
     /*
-     * La auditoría jamás debe romper
-     * el flujo principal de autenticación.
+     * La auditoría nunca debe romper
+     * el flujo de autenticación.
      */
   }
 }
@@ -339,32 +334,16 @@ function fireAndForgetAudit(params: Parameters<typeof auditApoderado>[0]) {
   void auditApoderado(params).catch(() => {});
 }
 
-/* ──────────────────────────────────────────────────────────────
-   Rate limit (in-memory) + GC
-────────────────────────────────────────────────────────────── */
+/* =========================================================
+   RATE LIMIT
+========================================================= */
 
-/*
- * Máximo de fallos reales permitidos
- * dentro de la ventana.
- */
 const RL_MAX = 8;
 
-/*
- * Ventana de contabilización:
- * 10 minutos.
- */
 const RL_WINDOW_MS = 10 * 60_000;
 
-/*
- * Bloqueo:
- * 15 minutos.
- */
 const RL_BLOCK_MS = 15 * 60_000;
 
-/*
- * Protección para impedir crecimiento
- * ilimitado del Map.
- */
 const RL_MAX_KEYS = 50_000;
 
 const RL_GC_INTERVAL_MS = 60_000;
@@ -380,8 +359,10 @@ const rl = new Map<string, RLState>();
 
 function rlKey(ip: string | null, rut: string) {
   /*
-   * Esta estructura vive solamente en memoria.
-   * No se persiste el RUT en la base de datos.
+   * Sólo memoria.
+   *
+   * Nunca se persiste el RUT
+   * de esta estructura.
    */
   return `${ip || "noip"}:${rut}`;
 }
@@ -394,16 +375,6 @@ function rlSafeKeysOk() {
   return rl.size < RL_MAX_KEYS;
 }
 
-/**
- * Sólo COMPRUEBA el estado del rate limit.
- *
- * IMPORTANTE:
- *
- * - No aumenta contadores.
- * - Un login correcto jamás consume intentos.
- * - Los fallos reales se registran únicamente
- *   mediante registerFailed().
- */
 function checkRateLimit(ip: string | null, rut: string) {
   const now = Date.now();
 
@@ -411,11 +382,6 @@ function checkRateLimit(ip: string | null, rut: string) {
 
   const fallbackKey = rlFallbackKey(ip);
 
-  /*
-   * La clave normal es la principal.
-   * Si existe un estado degradado por IP,
-   * también debe respetarse.
-   */
   const normalState = rl.get(normalKey);
 
   const fallbackState = rl.get(fallbackKey);
@@ -451,9 +417,6 @@ function checkRateLimit(ip: string | null, rut: string) {
   for (const { key, state } of states) {
     state.lastSeen = now;
 
-    /*
-     * Sigue bloqueado.
-     */
     if (state.blockedUntil > now) {
       const retryAfterSec = Math.ceil((state.blockedUntil - now) / 1000);
 
@@ -464,21 +427,15 @@ function checkRateLimit(ip: string | null, rut: string) {
       continue;
     }
 
-    /*
-     * Bloqueo vencido.
-     * Eliminamos ese estado.
-     */
     if (state.blockedUntil > 0 && state.blockedUntil <= now) {
       rl.delete(key);
+
       continue;
     }
 
-    /*
-     * Ventana vencida sin bloqueo.
-     * También eliminamos el estado.
-     */
     if (now - state.windowStart > RL_WINDOW_MS) {
       rl.delete(key);
+
       continue;
     }
 
@@ -498,11 +455,6 @@ function checkRateLimit(ip: string | null, rut: string) {
   };
 }
 
-/**
- * Registra UN fallo real de autenticación.
- *
- * Cada contraseña incorrecta suma exactamente 1.
- */
 function registerFailed(ip: string | null, rut: string) {
   const now = Date.now();
 
@@ -519,35 +471,24 @@ function registerFailed(ip: string | null, rut: string) {
 
   state.lastSeen = now;
 
-  /*
-   * Si ya expiró un bloqueo previo,
-   * iniciamos un estado limpio.
-   */
   if (state.blockedUntil > 0 && state.blockedUntil <= now) {
     state.count = 0;
+
     state.windowStart = now;
+
     state.blockedUntil = 0;
   }
 
-  /*
-   * Si venció la ventana,
-   * comenzamos nuevamente.
-   */
   if (now - state.windowStart > RL_WINDOW_MS) {
     state.count = 0;
+
     state.windowStart = now;
+
     state.blockedUntil = 0;
   }
 
-  /*
-   * Sólo aquí incrementamos.
-   */
   state.count += 1;
 
-  /*
-   * Al alcanzar el máximo de fallos,
-   * dejamos activa la ventana de bloqueo.
-   */
   if (state.count >= RL_MAX) {
     state.count = RL_MAX;
 
@@ -557,15 +498,6 @@ function registerFailed(ip: string | null, rut: string) {
   rl.set(key, state);
 }
 
-/**
- * Login exitoso.
- *
- * Limpia cualquier historial de fallos asociado
- * a esta combinación IP + RUT.
- *
- * También limpia la clave degradada IP:* por si
- * fue utilizada cuando el Map alcanzó RL_MAX_KEYS.
- */
 function clearRateLimit(ip: string | null, rut: string) {
   rl.delete(rlKey(ip, rut));
 
@@ -585,26 +517,18 @@ function startRlGcOnce() {
     const now = Date.now();
 
     for (const [key, state] of rl.entries()) {
-      /*
-       * Una hora sin actividad.
-       */
       if (now - state.lastSeen > 60 * 60_000) {
         rl.delete(key);
+
         continue;
       }
 
-      /*
-       * Bloqueo ya expirado.
-       */
       if (state.blockedUntil > 0 && state.blockedUntil <= now) {
         rl.delete(key);
+
         continue;
       }
 
-      /*
-       * Estado antiguo fuera de ventana
-       * y sin bloqueo activo.
-       */
       if (state.blockedUntil === 0 && now - state.windowStart > 2 * RL_WINDOW_MS) {
         rl.delete(key);
       }
@@ -612,15 +536,9 @@ function startRlGcOnce() {
   }, RL_GC_INTERVAL_MS).unref?.();
 }
 
-/* ──────────────────────────────────────────────────────────────
-   Dummy hash (timing equalization)
-────────────────────────────────────────────────────────────── */
-
-const DUMMY_HASH_PROMISE = withAuthSlot(() => argon2.hash("dummy-password-not-valid"));
-
-/* ──────────────────────────────────────────────────────────────
-   Hash params razonables
-────────────────────────────────────────────────────────────── */
+/* =========================================================
+   ARGON2
+========================================================= */
 
 const ARGON2_HASH_OPTS: Parameters<typeof argon2.hash>[1] = {
   memoryCost: 19456,
@@ -628,25 +546,29 @@ const ARGON2_HASH_OPTS: Parameters<typeof argon2.hash>[1] = {
   parallelism: 1,
 };
 
-/* ──────────────────────────────────────────────────────────────
-   Router (prefix: /api/auth-apoderado)
-────────────────────────────────────────────────────────────── */
+/*
+ * Dummy hash para igualación temporal.
+ *
+ * Se genera una sola vez.
+ */
+const DUMMY_HASH_PROMISE = withAuthSlot(() => argon2.hash("dummy-password-not-valid", ARGON2_HASH_OPTS));
+
+/* =========================================================
+   ROUTER
+========================================================= */
 
 export default async function auth_apoderado(app: FastifyInstance, _opts: FastifyPluginOptions) {
   /*
-   * Fail-fast:
-   *
-   * Este router requiere las claves de cifrado
-   * porque el login utiliza blind indexes y /me
-   * descifra el RUT almacenado.
+   * El router requiere las claves
+   * criptográficas correctamente configuradas.
    */
   validateCryptoConfiguration();
 
   startRlGcOnce();
 
-  /* =========================================================
+  /* =======================================================
      LOGIN
-  ========================================================= */
+  ======================================================= */
 
   app.post("/login", async (req, reply) => {
     const parsed = LoginSchema.safeParse(req.body);
@@ -675,26 +597,23 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
 
     const ip = getIp(req);
 
-    /*
-     * Sólo comprueba si existe
-     * un bloqueo vigente.
-     *
-     * No suma intentos.
-     */
     const rlCheck = checkRateLimit(ip, rut);
 
     if (!rlCheck.ok) {
-      /*
-       * NO persistimos el RUT en audit.extra.
-       */
       fireAndForgetAudit({
         req,
+
         event: "access_denied",
+
         statusCode: 429,
+
         apoderadoId: null,
+
         extra: {
           where: "login",
+
           reason: "RATE_LIMIT",
+
           retryAfterSec: rlCheck.retryAfterSec,
         },
       });
@@ -703,7 +622,6 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
 
       return reply.code(429).send({
         ok: false,
-
         message: "TOO_MANY_ATTEMPTS",
       });
     }
@@ -711,10 +629,10 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
     const t0 = Date.now();
 
     /*
-     * El RUT ya no se busca por plaintext.
+     * Blind index:
      *
-     * El backend calcula HMAC-SHA256 con la
-     * clave independiente WELI_DATA_INDEX_KEY.
+     * jamás buscamos el ciphertext
+     * ni el RUT plaintext.
      */
     const rutIdx = rutBlindIndex(rut);
 
@@ -723,9 +641,13 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
             SELECT
               apoderado_id,
               password_hash,
-              must_change_password
+              must_change_password,
+              estado_id
+
             FROM apoderados_auth
+
             WHERE rut_apoderado_idx = ?
+
             LIMIT 1
           `,
       [rutIdx]
@@ -735,15 +657,24 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
 
     const auth = rows?.length ? rows[0] : null;
 
-    const apoderadoId = auth ? Number(auth.apoderado_id) || null : null;
+    /*
+     * Sólo estado 1 puede autenticarse.
+     *
+     * La respuesta externa continúa siendo
+     * INVALID_CREDENTIALS para no revelar
+     * información sobre cuentas.
+     */
+    const authActivo = auth && Number(auth.estado_id) === 1 ? auth : null;
+
+    const apoderadoId = authActivo ? Number(authActivo.apoderado_id) || null : null;
 
     /*
      * Timing equalization:
      *
-     * aunque el usuario no exista,
-     * igualmente verificamos Argon2.
+     * cuenta inexistente o inactiva
+     * sigue realizando Argon2.
      */
-    const hashToVerify = auth?.password_hash ?? (await DUMMY_HASH_PROMISE);
+    const hashToVerify = authActivo?.password_hash ?? (await DUMMY_HASH_PROMISE);
 
     const t2a = Date.now();
 
@@ -758,9 +689,6 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
     const t2b = Date.now();
 
     if (PERF_LOG) {
-      /*
-       * Deliberadamente NO se imprime el RUT.
-       */
       console.log("[AUTH_APODERADO PERF]", {
         ip,
 
@@ -770,7 +698,12 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
 
         ms_total_so_far: t2b - t0,
 
+        /*
+         * No revelamos si estaba inactivo.
+         */
         has_user: Boolean(auth),
+
+        auth_active: Boolean(authActivo),
 
         argon2_inflight: authSem.inFlight,
 
@@ -781,22 +714,30 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
     }
 
     /*
-     * Credenciales incorrectas.
+     * IMPORTANTE:
      *
-     * Cada fallo suma exactamente UN intento.
+     * aquí debe utilizarse authActivo,
+     * NO auth.
      */
-    if (!auth || !ok) {
+    if (!authActivo || !ok) {
       registerFailed(ip, rut);
 
       fireAndForgetAudit({
         req,
+
         event: "login",
+
         statusCode: 401,
+
         apoderadoId,
+
         extra: {
           ok: false,
 
-          reason: !auth ? "NO_USER" : "BAD_PASSWORD",
+          /*
+           * Deliberadamente genérico.
+           */
+          reason: "INVALID_CREDENTIALS",
 
           ms_db: t1 - t0,
 
@@ -808,32 +749,25 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
 
       return reply.code(401).send({
         ok: false,
-
         message: "INVALID_CREDENTIALS",
       });
     }
 
     /*
-     * LOGIN CORRECTO:
-     *
-     * eliminamos los fallos históricos
-     * de esta combinación IP + RUT.
+     * LOGIN CORRECTO.
      */
     clearRateLimit(ip, rut);
 
     /*
-     * Conservamos temporalmente el RUT dentro
-     * del JWT para compatibilidad con los
-     * consumidores actuales del portal.
-     *
-     * La BD ya no depende de ese valor plaintext.
+     * Compatibilidad temporal:
+     * RUT sigue presente dentro del JWT.
      */
     const token = signApoderadoToken({
       type: "apoderado",
 
       rut,
 
-      apoderado_id: Number(auth.apoderado_id),
+      apoderado_id: Number(authActivo.apoderado_id),
     });
 
     const t3a = Date.now();
@@ -842,24 +776,25 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
       await db.query(
         `
             UPDATE apoderados_auth
-            SET last_login_at = NOW()
+
+            SET
+              last_login_at = NOW()
+
             WHERE apoderado_id = ?
+
             LIMIT 1
           `,
-        [Number(auth.apoderado_id)]
+        [Number(authActivo.apoderado_id)]
       );
     } catch {
       /*
-       * No invalidamos un login correcto
-       * únicamente porque falle last_login_at.
+       * Un fallo de last_login_at
+       * no invalida credenciales correctas.
        */
     }
 
     const t3b = Date.now();
 
-    /*
-     * NO persistimos el RUT en audit.extra.
-     */
     fireAndForgetAudit({
       req,
 
@@ -867,12 +802,12 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
 
       statusCode: 200,
 
-      apoderadoId: Number(auth.apoderado_id),
+      apoderadoId: Number(authActivo.apoderado_id),
 
       extra: {
         ok: true,
 
-        must_change_password: Number(auth.must_change_password) === 1,
+        must_change_password: Number(authActivo.must_change_password) === 1,
 
         ms_db: t1 - t0,
 
@@ -889,13 +824,13 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
 
       token,
 
-      must_change_password: Number(auth.must_change_password) === 1,
+      must_change_password: Number(authActivo.must_change_password) === 1,
     });
   });
 
-  /* =========================================================
+  /* =======================================================
      LOGOUT
-  ========================================================= */
+  ======================================================= */
 
   app.post("/logout", async (req, reply) => {
     const tokenData = getTokenOr401(req, reply);
@@ -903,9 +838,13 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
     if (!tokenData) {
       fireAndForgetAudit({
         req,
+
         event: "logout",
+
         statusCode: 401,
+
         apoderadoId: null,
+
         extra: {
           ok: false,
           reason: "UNAUTHORIZED",
@@ -915,9 +854,6 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
       return;
     }
 
-    /*
-     * El RUT del JWT no se replica en la auditoría.
-     */
     fireAndForgetAudit({
       req,
 
@@ -937,9 +873,9 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
     });
   });
 
-  /* =========================================================
+  /* =======================================================
      ME
-  ========================================================= */
+  ======================================================= */
 
   app.get("/me", async (req, reply) => {
     const tokenData = getTokenOr401(req, reply);
@@ -964,20 +900,25 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
 
     const db = getDb();
 
-    /*
-     * Ya no seleccionamos rut_apoderado plaintext.
-     */
     const [rows] = await db.query<any[]>(
       `
             SELECT
               apoderado_id,
+
               rut_apoderado_enc,
+              nombre_apoderado_enc,
+
+              estado_id,
               must_change_password,
+
               last_login_at,
               created_at,
               updated_at
+
             FROM apoderados_auth
+
             WHERE apoderado_id = ?
+
             LIMIT 1
           `,
       [tokenData.apoderado_id]
@@ -995,6 +936,7 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
 
         extra: {
           where: "me",
+
           reason: "NOT_FOUND",
         },
       });
@@ -1008,15 +950,45 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
 
     const row = rows[0];
 
+    /*
+     * Un JWT válido deja de ser suficiente
+     * si la cuenta fue desactivada.
+     */
+    if (Number(row.estado_id) !== 1) {
+      fireAndForgetAudit({
+        req,
+
+        event: "access_denied",
+
+        statusCode: 401,
+
+        apoderadoId: tokenData.apoderado_id,
+
+        extra: {
+          where: "me",
+
+          reason: "ACCOUNT_INACTIVE",
+        },
+      });
+
+      return reply.code(401).send({
+        ok: false,
+
+        message: "UNAUTHORIZED",
+      });
+    }
+
     let rutApoderado: string;
+
+    let nombreApoderado: string | null = null;
 
     try {
       rutApoderado = decryptRut(row.rut_apoderado_enc);
+
+      const nombre = decryptNullable(row.nombre_apoderado_enc);
+
+      nombreApoderado = nombre === null || nombre === undefined ? null : String(nombre).trim() || null;
     } catch {
-      /*
-       * Si el ciphertext fue alterado o la clave
-       * no corresponde, jamás devolvemos contenido parcial.
-       */
       fireAndForgetAudit({
         req,
 
@@ -1028,6 +1000,7 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
 
         extra: {
           where: "me",
+
           reason: "DECRYPT_FAILED",
         },
       });
@@ -1040,11 +1013,10 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
     }
 
     /*
-     * Defensa adicional:
+     * Defensa transitoria:
      *
-     * durante esta fase el JWT todavía contiene el RUT.
-     * Comprobamos que coincida con el dato autenticado
-     * almacenado de forma cifrada.
+     * mientras el JWT conserve RUT,
+     * debe coincidir con el registro.
      */
     if (rutApoderado !== tokenData.rut) {
       fireAndForgetAudit({
@@ -1058,6 +1030,7 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
 
         extra: {
           where: "me",
+
           reason: "TOKEN_IDENTITY_MISMATCH",
         },
       });
@@ -1069,12 +1042,6 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
       });
     }
 
-    /*
-     * Mantiene exactamente el contrato público anterior:
-     *
-     * rut_apoderado aparece descifrado para el cliente
-     * autorizado, pero *_enc nunca sale del backend.
-     */
     return reply.send({
       ok: true,
 
@@ -1082,6 +1049,10 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
         apoderado_id: Number(row.apoderado_id),
 
         rut_apoderado: rutApoderado,
+
+        nombre_apoderado: nombreApoderado,
+
+        estado_id: Number(row.estado_id),
 
         must_change_password: Number(row.must_change_password),
 
@@ -1094,9 +1065,9 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
     });
   });
 
-  /* =========================================================
+  /* =======================================================
      CHANGE PASSWORD
-  ========================================================= */
+  ======================================================= */
 
   app.post("/change-password", async (req, reply) => {
     const tokenData = getTokenOr401(req, reply);
@@ -1151,15 +1122,23 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
       `
             SELECT
               apoderado_id,
-              password_hash
+              password_hash,
+              estado_id
+
             FROM apoderados_auth
+
             WHERE apoderado_id = ?
+
             LIMIT 1
           `,
       [tokenData.apoderado_id]
     );
 
-    if (!rows?.length) {
+    /*
+     * Cuenta inexistente o inactiva:
+     * mismo contrato externo.
+     */
+    if (!rows?.length || Number(rows[0]?.estado_id) !== 1) {
       fireAndForgetAudit({
         req,
 
@@ -1172,7 +1151,7 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
         extra: {
           where: "change-password",
 
-          reason: "NOT_FOUND",
+          reason: "UNAUTHORIZED",
         },
       });
 
@@ -1220,9 +1199,10 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
     }
 
     /*
-     * password_hash sigue siendo HASH irreversible.
+     * Nueva contraseña:
      *
-     * No interviene AES ni encryptField().
+     * sólo Argon2.
+     * Nunca AES.
      */
     const newHash = await withAuthSlot(() =>
       argon2.hash(
@@ -1235,11 +1215,15 @@ export default async function auth_apoderado(app: FastifyInstance, _opts: Fastif
     await db.query(
       `
           UPDATE apoderados_auth
+
           SET
             password_hash = ?,
             must_change_password = 0,
             updated_at = NOW()
+
           WHERE apoderado_id = ?
+            AND estado_id = 1
+
           LIMIT 1
         `,
       [newHash, tokenData.apoderado_id]

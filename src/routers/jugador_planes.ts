@@ -1,116 +1,10 @@
-// src/routers/jugador_planes.ts
-
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-
 import { z, ZodError } from "zod";
-
 import { db } from "../db";
-
+import { decryptNullable, decryptRut } from "../services/crypto";
 import { requireAuth, requireRoles, getEffectiveAcademiaId } from "../middlewares/authz";
 
-/**
- * =========================================================
- * WELI - BENEFICIOS ASIGNADOS A JUGADORES
- * =========================================================
- *
- * Tabla:
- *
- * jugador_plan_catalogo
- *
- * Modelo:
- *
- * - academia_id
- * - jugador_id
- * - tipo_pago_id
- * - plan_id
- *
- * SNAPSHOT FINANCIERO:
- *
- * - tarifa_id
- * - monto_tarifa
- * - monto_asignado
- *
- * VIGENCIA:
- *
- * - fecha_inicio
- * - fecha_fin
- * - estado_id
- *
- * =========================================================
- *
- * REGLAS:
- *
- * - academia_id nunca se acepta desde body.
- *
- * - jugador debe pertenecer a la academia efectiva.
- *
- * - tipo_pago_id debe estar habilitado para la academia.
- *
- * - tipo_pago_id debe poseer una tarifa activa
- *   en tarifas_academia.
- *
- * - plan_id referencia planes_catalogo.
- *
- * - el beneficio debe encontrarse activo
- *   en el catálogo global.
- *
- * - un jugador puede tener beneficios distintos
- *   para distintos tipos de pago.
- *
- * - no puede tener dos beneficios activos
- *   superpuestos para el MISMO tipo_pago_id.
- *
- * - POST /tipos-pago/bulk permite registrar
- *   la configuración financiera inicial completa.
- *
- * =========================================================
- *
- * SNAPSHOT:
- *
- * monto_tarifa
- * → tarifa de academia existente al momento
- *   de configurar al jugador.
- *
- * monto_asignado
- * → resultado después de aplicar el beneficio
- *   habitual del jugador.
- *
- * Cambios posteriores en tarifas_academia
- * NO modifican automáticamente este snapshot.
- *
- * PUT/PATCH:
- *
- * - si cambia tipo_pago_id o plan_id
- *   se recalcula el snapshot.
- *
- * - si no cambia ninguno de esos campos,
- *   se conserva el snapshot existente.
- *
- * =========================================================
- *
- * SEGURIDAD:
- *
- * READ:
- * - Admin       rol 1
- * - Staff       rol 2
- * - Superadmin  rol 3
- *
- * WRITE:
- * - Admin       rol 1
- * - Superadmin  rol 3
- *
- * =========================================================
- */
-
-/* =========================================================
-   CONSTANTES
-========================================================= */
-
 const ESTADO_ACTIVO = 1;
-
-/* =========================================================
-   SCHEMAS
-========================================================= */
 
 const IdParam = z.object({
   id: z.coerce.number().int().positive(),
@@ -126,15 +20,10 @@ const EstadoSchema = z.coerce.number().int().positive().max(255);
 const CreateSchema = z
   .object({
     jugador_id: z.coerce.number().int().positive(),
-
     tipo_pago_id: z.coerce.number().int().positive(),
-
     plan_id: z.coerce.number().int().positive(),
-
     fecha_inicio: DateString,
-
     fecha_fin: z.union([DateString, z.null()]).optional().default(null),
-
     estado_id: EstadoSchema.default(1),
   })
   .strict();
@@ -142,15 +31,10 @@ const CreateSchema = z
 const PutSchema = z
   .object({
     jugador_id: z.coerce.number().int().positive(),
-
     tipo_pago_id: z.coerce.number().int().positive(),
-
     plan_id: z.coerce.number().int().positive(),
-
     fecha_inicio: DateString,
-
     fecha_fin: z.union([DateString, z.null()]),
-
     estado_id: EstadoSchema,
   })
   .strict();
@@ -158,15 +42,10 @@ const PutSchema = z
 const PatchSchema = z
   .object({
     jugador_id: z.coerce.number().int().positive().optional(),
-
     tipo_pago_id: z.coerce.number().int().positive().optional(),
-
     plan_id: z.coerce.number().int().positive().optional(),
-
     fecha_inicio: DateString.optional(),
-
     fecha_fin: z.union([DateString, z.null()]).optional(),
-
     estado_id: EstadoSchema.optional(),
   })
   .strict();
@@ -174,15 +53,10 @@ const PatchSchema = z
 const QuerySchema = z
   .object({
     jugador_id: z.coerce.number().int().positive().optional(),
-
     tipo_pago_id: z.coerce.number().int().positive().optional(),
-
     plan_id: z.coerce.number().int().positive().optional(),
-
     estado_id: EstadoSchema.optional(),
-
     activos: z.enum(["1", "0"]).optional(),
-
     limit: z.coerce.number().int().min(1).max(500).default(200),
   })
   .strict();
@@ -190,7 +64,6 @@ const QuerySchema = z
 const BulkItemSchema = z
   .object({
     tipo_pago_id: z.coerce.number().int().positive(),
-
     plan_id: z.coerce.number().int().positive(),
   })
   .strict();
@@ -198,20 +71,12 @@ const BulkItemSchema = z
 const BulkSchema = z
   .object({
     jugador_id: z.coerce.number().int().positive(),
-
     fecha_inicio: DateString,
-
     fecha_fin: z.union([DateString, z.null()]).optional().default(null),
-
     estado_id: EstadoSchema.default(1),
-
     items: z.array(BulkItemSchema).min(1, "Debe existir al menos un tipo de pago"),
   })
   .strict();
-
-/* =========================================================
-   HELPERS GENERALES
-========================================================= */
 
 function zodDetail(err: ZodError): string {
   return err.issues.map((issue) => `${issue.path.join(".") || "field"}: ${issue.message}`).join("; ");
@@ -219,23 +84,13 @@ function zodDetail(err: ZodError): string {
 
 function businessError(message: string, statusCode = 400) {
   const error: any = new Error(message);
-
   error.statusCode = statusCode;
-
   return error;
 }
-
-/* =========================================================
-   DINERO
-========================================================= */
 
 function roundMoney(value: number): number {
   return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 }
-
-/* =========================================================
-   ACADEMIA EFECTIVA
-========================================================= */
 
 function resolveAcademiaId(req: FastifyRequest): number {
   const academiaId = Number(getEffectiveAcademiaId(req));
@@ -246,10 +101,6 @@ function resolveAcademiaId(req: FastifyRequest): number {
 
   return academiaId;
 }
-
-/* =========================================================
-   FECHAS
-========================================================= */
 
 function normalizeSqlDate(value: any): string | null {
   if (value === null || value === undefined) {
@@ -297,39 +148,39 @@ function validateDates(fechaInicio: string, fechaFin: string | null): void {
   }
 }
 
-/* =========================================================
-   NORMALIZACIÓN
-========================================================= */
-
 function normalize(row: any) {
   return {
     id: Number(row.id),
-
     academia_id: Number(row.academia_id),
-
     jugador_id: Number(row.jugador_id),
-
     tipo_pago_id: Number(row.tipo_pago_id),
-
     plan_id: Number(row.plan_id),
-
     tarifa_id: Number(row.tarifa_id),
-
     monto_tarifa: roundMoney(Number(row.monto_tarifa)),
-
     monto_asignado: roundMoney(Number(row.monto_asignado)),
-
     descuento_inicial: roundMoney(Number(row.monto_tarifa) - Number(row.monto_asignado)),
-
     fecha_inicio: normalizeSqlDate(row.fecha_inicio),
-
     fecha_fin: normalizeSqlDate(row.fecha_fin),
-
     estado_id: Number(row.estado_id),
 
-    jugador_nombre: row.jugador_nombre == null ? undefined : String(row.jugador_nombre),
+    jugador_nombre:
+      row.jugador_nombre_enc == null ? undefined : (decryptNullable(String(row.jugador_nombre_enc)) ?? undefined),
 
-    jugador_rut: row.jugador_rut == null ? undefined : Number(row.jugador_rut),
+    jugador_rut: (() => {
+      if (row.jugador_rut_enc == null) {
+        return undefined;
+      }
+
+      const rut = decryptRut(String(row.jugador_rut_enc));
+
+      if (!rut) {
+        return undefined;
+      }
+
+      const parsed = Number(rut);
+
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+    })(),
 
     tipo_pago_nombre: row.tipo_pago_nombre == null ? undefined : String(row.tipo_pago_nombre),
 
@@ -340,99 +191,69 @@ function normalize(row: any) {
     plan_estado_id: row.plan_estado_id == null ? undefined : Number(row.plan_estado_id),
 
     created_at: row.created_at ?? null,
-
     updated_at: row.updated_at ?? null,
   };
 }
 
-/* =========================================================
-   OBTENER ASIGNACIÓN
-========================================================= */
-
 async function getJugadorPlan(academiaId: number, id: number, executor: any = db) {
   const [rows]: any = await executor.query(
     `
-        SELECT
-          jpc.id,
-          jpc.academia_id,
-          jpc.jugador_id,
-          jpc.tipo_pago_id,
-          jpc.plan_id,
+      SELECT
+        jpc.id,
+        jpc.academia_id,
+        jpc.jugador_id,
+        jpc.tipo_pago_id,
+        jpc.plan_id,
+        jpc.tarifa_id,
+        jpc.monto_tarifa,
+        jpc.monto_asignado,
+        jpc.fecha_inicio,
+        jpc.fecha_fin,
+        jpc.estado_id,
+        jpc.created_at,
+        jpc.updated_at,
 
-          jpc.tarifa_id,
-          jpc.monto_tarifa,
-          jpc.monto_asignado,
+        j.nombre_jugador_enc AS jugador_nombre_enc,
+        j.rut_jugador_enc AS jugador_rut_enc,
 
-          jpc.fecha_inicio,
-          jpc.fecha_fin,
-          jpc.estado_id,
+        tp.nombre AS tipo_pago_nombre,
 
-          jpc.created_at,
-          jpc.updated_at,
+        pc.nombre AS plan_nombre,
+        pc.descripcion AS plan_descripcion,
+        pc.estado_id AS plan_estado_id
 
-          j.nombre_jugador
-            AS jugador_nombre,
+      FROM jugador_plan_catalogo jpc
 
-          j.rut_jugador
-            AS jugador_rut,
+      INNER JOIN jugadores j
+        ON j.id = jpc.jugador_id
+       AND j.academia_id = jpc.academia_id
 
-          tp.nombre
-            AS tipo_pago_nombre,
+      INNER JOIN tipo_pago tp
+        ON tp.id = jpc.tipo_pago_id
 
-          pc.nombre
-            AS plan_nombre,
+      INNER JOIN planes_catalogo pc
+        ON pc.id = jpc.plan_id
 
-          pc.descripcion
-            AS plan_descripcion,
+      WHERE jpc.id = ?
+        AND jpc.academia_id = ?
 
-          pc.estado_id
-            AS plan_estado_id
-
-        FROM jugador_plan_catalogo jpc
-
-        INNER JOIN jugadores j
-          ON j.id =
-             jpc.jugador_id
-
-         AND j.academia_id =
-             jpc.academia_id
-
-        INNER JOIN tipo_pago tp
-          ON tp.id =
-             jpc.tipo_pago_id
-
-        INNER JOIN planes_catalogo pc
-          ON pc.id =
-             jpc.plan_id
-
-        WHERE jpc.id = ?
-          AND jpc.academia_id = ?
-
-        LIMIT 1
-      `,
+      LIMIT 1
+    `,
     [id, academiaId]
   );
 
   return rows?.length ? rows[0] : null;
 }
 
-/* =========================================================
-   VALIDAR JUGADOR
-========================================================= */
-
 async function validateJugador(academiaId: number, jugadorId: number, executor: any = db) {
   const [rows]: any = await executor.query(
     `
-        SELECT
-          id
-
-        FROM jugadores
-
-        WHERE id = ?
-          AND academia_id = ?
-
-        LIMIT 1
-      `,
+      SELECT id
+      FROM jugadores
+      WHERE id = ?
+        AND academia_id = ?
+      LIMIT 1
+    `,
     [jugadorId, academiaId]
   );
 
@@ -440,10 +261,6 @@ async function validateJugador(academiaId: number, jugadorId: number, executor: 
     throw businessError("El jugador no existe o no pertenece a la academia");
   }
 }
-
-/* =========================================================
-   TARIFA DEL TIPO DE PAGO
-========================================================= */
 
 type TarifaContext = {
   tarifa_id: number;
@@ -454,42 +271,28 @@ type TarifaContext = {
 async function getTarifaOrThrow(academiaId: number, tipoPagoId: number, executor: any = db): Promise<TarifaContext> {
   const [rows]: any = await executor.query(
     `
-        SELECT
-          tp.id
-            AS tipo_pago_id,
+      SELECT
+        tp.id AS tipo_pago_id,
+        tp.estado_id AS tipo_pago_estado_id,
+        atp.estado_id AS academia_tipo_pago_estado_id,
+        ta.id AS tarifa_id,
+        ta.monto,
+        ta.estado_id AS tarifa_estado_id
 
-          tp.estado_id
-            AS tipo_pago_estado_id,
+      FROM academia_tipo_pago atp
 
-          atp.estado_id
-            AS academia_tipo_pago_estado_id,
+      INNER JOIN tipo_pago tp
+        ON tp.id = atp.tipo_pago_id
 
-          ta.id
-            AS tarifa_id,
+      INNER JOIN tarifas_academia ta
+        ON ta.academia_id = atp.academia_id
+       AND ta.tipo_pago_id = atp.tipo_pago_id
 
-          ta.monto,
+      WHERE atp.academia_id = ?
+        AND atp.tipo_pago_id = ?
 
-          ta.estado_id
-            AS tarifa_estado_id
-
-        FROM academia_tipo_pago atp
-
-        INNER JOIN tipo_pago tp
-          ON tp.id =
-             atp.tipo_pago_id
-
-        INNER JOIN tarifas_academia ta
-          ON ta.academia_id =
-             atp.academia_id
-
-         AND ta.tipo_pago_id =
-             atp.tipo_pago_id
-
-        WHERE atp.academia_id = ?
-          AND atp.tipo_pago_id = ?
-
-        LIMIT 1
-      `,
+      LIMIT 1
+    `,
     [academiaId, tipoPagoId]
   );
 
@@ -519,40 +322,30 @@ async function getTarifaOrThrow(academiaId: number, tipoPagoId: number, executor
 
   return {
     tarifa_id: Number(row.tarifa_id),
-
     tipo_pago_id: Number(row.tipo_pago_id),
-
     monto: roundMoney(monto),
   };
 }
-
-/* =========================================================
-   VALIDAR TIPO DE PAGO
-========================================================= */
 
 async function validateTipoPago(academiaId: number, tipoPagoId: number, executor: any = db) {
   return getTarifaOrThrow(academiaId, tipoPagoId, executor);
 }
 
-/* =========================================================
-   VALIDAR BENEFICIO GLOBAL
-========================================================= */
-
 async function validatePlan(planId: number, executor: any = db) {
   const [rows]: any = await executor.query(
     `
-        SELECT
-          id,
-          nombre,
-          descripcion,
-          estado_id
+      SELECT
+        id,
+        nombre,
+        descripcion,
+        estado_id
 
-        FROM planes_catalogo
+      FROM planes_catalogo
 
-        WHERE id = ?
+      WHERE id = ?
 
-        LIMIT 1
-      `,
+      LIMIT 1
+    `,
     [planId]
   );
 
@@ -567,47 +360,32 @@ async function validatePlan(planId: number, executor: any = db) {
   return rows[0];
 }
 
-/* =========================================================
-   REGLA DEL BENEFICIO
-========================================================= */
-
 async function getPlanRule(planId: number, executor: any = db) {
   const [rows]: any = await executor.query(
     `
-        SELECT
-          id,
-          plan_id,
-          tipo_beneficio,
-          valor,
-          estado_id
+      SELECT
+        id,
+        plan_id,
+        tipo_beneficio,
+        valor,
+        estado_id
 
-        FROM plan_reglas
+      FROM plan_reglas
 
-        WHERE plan_id = ?
-          AND estado_id = 1
+      WHERE plan_id = ?
+        AND estado_id = 1
 
-        LIMIT 1
-      `,
+      LIMIT 1
+    `,
     [planId]
   );
 
-  /*
-   * SIN BENEFICIO
-   * puede no poseer regla.
-   */
   return rows?.length ? rows[0] : null;
 }
-
-/* =========================================================
-   CÁLCULO BENEFICIO INICIAL
-========================================================= */
 
 function calculateAssignedAmount(montoTarifa: number, rule: any | null): number {
   const base = roundMoney(montoTarifa);
 
-  /*
-   * SIN BENEFICIO.
-   */
   if (!rule) {
     return base;
   }
@@ -646,10 +424,6 @@ function calculateAssignedAmount(montoTarifa: number, rule: any | null): number 
     }
 
     case "PRECIO_FIJO": {
-      /*
-       * Un beneficio no puede
-       * incrementar la tarifa.
-       */
       montoAsignado = roundMoney(Math.min(base, valor));
 
       break;
@@ -671,10 +445,6 @@ function calculateAssignedAmount(montoTarifa: number, rule: any | null): number 
   return roundMoney(montoAsignado);
 }
 
-/* =========================================================
-   SNAPSHOT FINANCIERO
-========================================================= */
-
 type FinancialSnapshot = {
   tarifa_id: number;
   monto_tarifa: number;
@@ -687,27 +457,10 @@ async function buildFinancialSnapshot(
   planId: number,
   executor: any = db
 ): Promise<FinancialSnapshot> {
-  /*
-   * Valida también que:
-   *
-   * - tipo pago esté activo.
-   * - esté habilitado para academia.
-   * - exista tarifa.
-   * - tarifa esté activa.
-   */
   const tarifa = await getTarifaOrThrow(academiaId, tipoPagoId, executor);
 
-  /*
-   * Valida plan global.
-   */
   await validatePlan(planId, executor);
 
-  /*
-   * Obtiene regla.
-   *
-   * null es válido para
-   * SIN BENEFICIO.
-   */
   const rule = await getPlanRule(planId, executor);
 
   const montoAsignado = calculateAssignedAmount(tarifa.monto, rule);
@@ -720,10 +473,6 @@ async function buildFinancialSnapshot(
     monto_asignado: montoAsignado,
   };
 }
-
-/* =========================================================
-   ASIGNACIÓN EQUIVALENTE
-========================================================= */
 
 async function existsEquivalentAssignment(
   academiaId: number,
@@ -738,23 +487,18 @@ async function existsEquivalentAssignment(
   const params: any[] = [academiaId, jugadorId, tipoPagoId, planId, fechaInicio, fechaFin, fechaFin];
 
   let sql = `
-    SELECT
-      id
-
+    SELECT id
     FROM jugador_plan_catalogo
-
     WHERE academia_id = ?
       AND jugador_id = ?
       AND tipo_pago_id = ?
       AND plan_id = ?
       AND fecha_inicio = ?
-
       AND (
         (
           fecha_fin IS NULL
           AND ? IS NULL
         )
-
         OR fecha_fin = ?
       )
   `;
@@ -776,10 +520,6 @@ async function existsEquivalentAssignment(
   return Array.isArray(rows) && rows.length > 0;
 }
 
-/* =========================================================
-   SUPERPOSICIÓN ACTIVA POR TIPO DE PAGO
-========================================================= */
-
 async function hasOverlappingActiveAssignment(
   academiaId: number,
   jugadorId: number,
@@ -792,21 +532,16 @@ async function hasOverlappingActiveAssignment(
   const params: any[] = [academiaId, jugadorId, tipoPagoId, fechaFin, fechaFin, fechaInicio];
 
   let sql = `
-    SELECT
-      id
-
+    SELECT id
     FROM jugador_plan_catalogo
-
     WHERE academia_id = ?
       AND jugador_id = ?
       AND tipo_pago_id = ?
       AND estado_id = 1
-
       AND (
         ? IS NULL
         OR fecha_inicio <= ?
       )
-
       AND (
         fecha_fin IS NULL
         OR fecha_fin >= ?
@@ -830,17 +565,6 @@ async function hasOverlappingActiveAssignment(
   return Array.isArray(rows) && rows.length > 0;
 }
 
-/* =========================================================
-   DEPENDENCIAS FINANCIERAS
-========================================================= */
-
-/**
- * Esta lógica se conserva por compatibilidad
- * con pagos_jugador actual.
- *
- * pagos_jugador será ajustado posteriormente
- * al nuevo modelo por tipo_pago_id.
- */
 async function hasPayments(
   academiaId: number,
   assignment: {
@@ -853,8 +577,7 @@ async function hasPayments(
 ): Promise<boolean> {
   const [rows]: any = await executor.query(
     `
-        SELECT
-          p.id
+        SELECT p.id
 
         FROM pagos_jugador p
 
@@ -862,7 +585,6 @@ async function hasPayments(
           AND p.jugador_id = ?
           AND p.plan_catalogo_id = ?
           AND p.fecha_pago >= ?
-
           AND (
             ? IS NULL
             OR p.fecha_pago <= ?
@@ -883,10 +605,6 @@ async function hasPayments(
   return Array.isArray(rows) && rows.length > 0;
 }
 
-/* =========================================================
-   CAMPOS PROTEGIDOS
-========================================================= */
-
 function protectedFieldsChanged(
   current: {
     jugador_id: number;
@@ -895,7 +613,6 @@ function protectedFieldsChanged(
     fecha_inicio: string;
     fecha_fin: string | null;
   },
-
   next: {
     jugador_id: number;
     tipo_pago_id: number;
@@ -913,16 +630,11 @@ function protectedFieldsChanged(
   );
 }
 
-/* =========================================================
-   ¿DEBE RECALCULAR SNAPSHOT?
-========================================================= */
-
 function financialIdentityChanged(
   current: {
     tipo_pago_id: number;
     plan_id: number;
   },
-
   next: {
     tipo_pago_id: number;
     plan_id: number;
@@ -930,10 +642,6 @@ function financialIdentityChanged(
 ): boolean {
   return current.tipo_pago_id !== next.tipo_pago_id || current.plan_id !== next.plan_id;
 }
-
-/* =========================================================
-   ERRORES
-========================================================= */
 
 function handleKnownError(reply: FastifyReply, err: any) {
   const status = Number(err?.statusCode ?? 0);
@@ -951,31 +659,17 @@ function handleKnownError(reply: FastifyReply, err: any) {
   return null;
 }
 
-/* =========================================================
-   ROUTER
-========================================================= */
-
 export default async function jugador_planes(app: FastifyInstance) {
   const canRead = [requireAuth, requireRoles([1, 2, 3])];
 
   const canWrite = [requireAuth, requireRoles([1, 3])];
 
-  /* =======================================================
-     HEALTH
-  ======================================================= */
-
   app.get(
     "/health",
-
     {
       preHandler: canRead,
     },
-
-    async (
-      req: FastifyRequest,
-
-      reply: FastifyReply
-    ) => {
+    async (req: FastifyRequest, reply: FastifyReply) => {
       try {
         const academiaId = resolveAcademiaId(req);
 
@@ -1010,22 +704,12 @@ export default async function jugador_planes(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
-     GET /
-  ======================================================= */
-
   app.get(
     "/",
-
     {
       preHandler: canRead,
     },
-
-    async (
-      req: FastifyRequest,
-
-      reply: FastifyReply
-    ) => {
+    async (req: FastifyRequest, reply: FastifyReply) => {
       try {
         const academiaId = resolveAcademiaId(req);
 
@@ -1077,7 +761,6 @@ export default async function jugador_planes(app: FastifyInstance) {
             `
               (
                 jpc.estado_id <> 1
-
                 OR (
                   jpc.fecha_fin IS NOT NULL
                   AND jpc.fecha_fin < CURDATE()
@@ -1097,23 +780,20 @@ export default async function jugador_planes(app: FastifyInstance) {
                 jpc.jugador_id,
                 jpc.tipo_pago_id,
                 jpc.plan_id,
-
                 jpc.tarifa_id,
                 jpc.monto_tarifa,
                 jpc.monto_asignado,
-
                 jpc.fecha_inicio,
                 jpc.fecha_fin,
                 jpc.estado_id,
-
                 jpc.created_at,
                 jpc.updated_at,
 
-                j.nombre_jugador
-                  AS jugador_nombre,
+                j.nombre_jugador_enc
+                  AS jugador_nombre_enc,
 
-                j.rut_jugador
-                  AS jugador_rut,
+                j.rut_jugador_enc
+                  AS jugador_rut_enc,
 
                 tp.nombre
                   AS tipo_pago_nombre,
@@ -1132,7 +812,6 @@ export default async function jugador_planes(app: FastifyInstance) {
               INNER JOIN jugadores j
                 ON j.id =
                    jpc.jugador_id
-
                AND j.academia_id =
                    jpc.academia_id
 
@@ -1198,23 +877,12 @@ export default async function jugador_planes(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
-     POST /tipos-pago/bulk
-     CONFIGURACIÓN FINANCIERA INICIAL
-  ======================================================= */
-
   app.post(
     "/tipos-pago/bulk",
-
     {
       preHandler: canWrite,
     },
-
-    async (
-      req: FastifyRequest,
-
-      reply: FastifyReply
-    ) => {
+    async (req: FastifyRequest, reply: FastifyReply) => {
       let conn: any = null;
 
       try {
@@ -1224,11 +892,6 @@ export default async function jugador_planes(app: FastifyInstance) {
 
         validateDates(body.fecha_inicio, body.fecha_fin);
 
-        /*
-         * Un tipo de pago solo
-         * puede aparecer una vez
-         * dentro del payload.
-         */
         const tipoPagoIds = body.items.map((item) => Number(item.tipo_pago_id));
 
         if (new Set(tipoPagoIds).size !== tipoPagoIds.length) {
@@ -1248,16 +911,6 @@ export default async function jugador_planes(app: FastifyInstance) {
 
           const planId = Number(item.plan_id);
 
-          /*
-           * Construye snapshot.
-           *
-           * Esto valida automáticamente:
-           *
-           * - concepto
-           * - tarifa
-           * - beneficio
-           * - regla
-           */
           const snapshot = await buildFinancialSnapshot(academiaId, tipoPagoId, planId, conn);
 
           const equivalent = await existsEquivalentAssignment(
@@ -1301,16 +954,13 @@ export default async function jugador_planes(app: FastifyInstance) {
                   jugador_id,
                   tipo_pago_id,
                   plan_id,
-
                   tarifa_id,
                   monto_tarifa,
                   monto_asignado,
-
                   fecha_inicio,
                   fecha_fin,
                   estado_id
                 )
-
                 VALUES (
                   ?,
                   ?,
@@ -1359,23 +1009,20 @@ export default async function jugador_planes(app: FastifyInstance) {
                 jpc.jugador_id,
                 jpc.tipo_pago_id,
                 jpc.plan_id,
-
                 jpc.tarifa_id,
                 jpc.monto_tarifa,
                 jpc.monto_asignado,
-
                 jpc.fecha_inicio,
                 jpc.fecha_fin,
                 jpc.estado_id,
-
                 jpc.created_at,
                 jpc.updated_at,
 
-                j.nombre_jugador
-                  AS jugador_nombre,
+                j.nombre_jugador_enc
+                  AS jugador_nombre_enc,
 
-                j.rut_jugador
-                  AS jugador_rut,
+                j.rut_jugador_enc
+                  AS jugador_rut_enc,
 
                 tp.nombre
                   AS tipo_pago_nombre,
@@ -1394,7 +1041,6 @@ export default async function jugador_planes(app: FastifyInstance) {
               INNER JOIN jugadores j
                 ON j.id =
                    jpc.jugador_id
-
                AND j.academia_id =
                    jpc.academia_id
 
@@ -1407,7 +1053,6 @@ export default async function jugador_planes(app: FastifyInstance) {
                    jpc.plan_id
 
               WHERE jpc.academia_id = ?
-
                 AND jpc.id
                   IN (
                     ${placeholders}
@@ -1493,22 +1138,12 @@ export default async function jugador_planes(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
-     GET /:id
-  ======================================================= */
-
   app.get(
     "/:id",
-
     {
       preHandler: canRead,
     },
-
-    async (
-      req: FastifyRequest,
-
-      reply: FastifyReply
-    ) => {
+    async (req: FastifyRequest, reply: FastifyReply) => {
       const parsed = IdParam.safeParse(req.params);
 
       if (!parsed.success) {
@@ -1561,23 +1196,12 @@ export default async function jugador_planes(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
-     POST /
-     ASIGNACIÓN INDIVIDUAL
-  ======================================================= */
-
   app.post(
     "/",
-
     {
       preHandler: canWrite,
     },
-
-    async (
-      req: FastifyRequest,
-
-      reply: FastifyReply
-    ) => {
+    async (req: FastifyRequest, reply: FastifyReply) => {
       let conn: any = null;
 
       try {
@@ -1636,16 +1260,13 @@ export default async function jugador_planes(app: FastifyInstance) {
                 jugador_id,
                 tipo_pago_id,
                 plan_id,
-
                 tarifa_id,
                 monto_tarifa,
                 monto_asignado,
-
                 fecha_inicio,
                 fecha_fin,
                 estado_id
               )
-
               VALUES (
                 ?,
                 ?,
@@ -1750,22 +1371,12 @@ export default async function jugador_planes(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
-     PUT /:id
-  ======================================================= */
-
   app.put(
     "/:id",
-
     {
       preHandler: canWrite,
     },
-
-    async (
-      req: FastifyRequest,
-
-      reply: FastifyReply
-    ) => {
+    async (req: FastifyRequest, reply: FastifyReply) => {
       const parsed = IdParam.safeParse(req.params);
 
       if (!parsed.success) {
@@ -1834,11 +1445,6 @@ export default async function jugador_planes(app: FastifyInstance) {
 
         await validateJugador(academiaId, body.jugador_id, conn);
 
-        /*
-         * Aunque no haya recalculo,
-         * confirmamos que la configuración
-         * recibida sea válida.
-         */
         await validateTipoPago(academiaId, body.tipo_pago_id, conn);
 
         await validatePlan(body.plan_id, conn);
@@ -1877,19 +1483,12 @@ export default async function jugador_planes(app: FastifyInstance) {
           }
         }
 
-        /*
-         * Snapshot actual.
-         */
         let tarifaId = Number(current.tarifa_id);
 
         let montoTarifa = roundMoney(Number(current.monto_tarifa));
 
         let montoAsignado = roundMoney(Number(current.monto_asignado));
 
-        /*
-         * Solo recalculamos si cambia
-         * tipo_pago_id o plan_id.
-         */
         if (financialIdentityChanged(currentAssignment, nextAssignment)) {
           const snapshot = await buildFinancialSnapshot(academiaId, body.tipo_pago_id, body.plan_id, conn);
 
@@ -1903,23 +1502,18 @@ export default async function jugador_planes(app: FastifyInstance) {
         const [result]: any = await conn.query(
           `
               UPDATE jugador_plan_catalogo
-
               SET
                 jugador_id = ?,
                 tipo_pago_id = ?,
                 plan_id = ?,
-
                 tarifa_id = ?,
                 monto_tarifa = ?,
                 monto_asignado = ?,
-
                 fecha_inicio = ?,
                 fecha_fin = ?,
                 estado_id = ?
-
               WHERE id = ?
                 AND academia_id = ?
-
               LIMIT 1
             `,
           [
@@ -2011,22 +1605,12 @@ export default async function jugador_planes(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
-     PATCH /:id
-  ======================================================= */
-
   app.patch(
     "/:id",
-
     {
       preHandler: canWrite,
     },
-
-    async (
-      req: FastifyRequest,
-
-      reply: FastifyReply
-    ) => {
+    async (req: FastifyRequest, reply: FastifyReply) => {
       const parsed = IdParam.safeParse(req.params);
 
       if (!parsed.success) {
@@ -2151,14 +1735,6 @@ export default async function jugador_planes(app: FastifyInstance) {
           }
         }
 
-        /*
-         * Conservamos snapshot
-         * salvo que cambie la identidad financiera:
-         *
-         * tipo_pago_id
-         * o
-         * plan_id
-         */
         let tarifaId = Number(current.tarifa_id);
 
         let montoTarifa = roundMoney(Number(current.monto_tarifa));
@@ -2178,23 +1754,18 @@ export default async function jugador_planes(app: FastifyInstance) {
         const [result]: any = await conn.query(
           `
               UPDATE jugador_plan_catalogo
-
               SET
                 jugador_id = ?,
                 tipo_pago_id = ?,
                 plan_id = ?,
-
                 tarifa_id = ?,
                 monto_tarifa = ?,
                 monto_asignado = ?,
-
                 fecha_inicio = ?,
                 fecha_fin = ?,
                 estado_id = ?
-
               WHERE id = ?
                 AND academia_id = ?
-
               LIMIT 1
             `,
           [
@@ -2286,22 +1857,12 @@ export default async function jugador_planes(app: FastifyInstance) {
     }
   );
 
-  /* =======================================================
-     DELETE /:id
-  ======================================================= */
-
   app.delete(
     "/:id",
-
     {
       preHandler: canWrite,
     },
-
-    async (
-      req: FastifyRequest,
-
-      reply: FastifyReply
-    ) => {
+    async (req: FastifyRequest, reply: FastifyReply) => {
       const parsed = IdParam.safeParse(req.params);
 
       if (!parsed.success) {
@@ -2352,10 +1913,8 @@ export default async function jugador_planes(app: FastifyInstance) {
           `
               DELETE
               FROM jugador_plan_catalogo
-
               WHERE id = ?
                 AND academia_id = ?
-
               LIMIT 1
             `,
           [id, academiaId]
@@ -2371,7 +1930,6 @@ export default async function jugador_planes(app: FastifyInstance) {
 
         return reply.send({
           ok: true,
-
           deleted: id,
         });
       } catch (err: any) {

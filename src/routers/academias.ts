@@ -448,22 +448,17 @@ function normalizeAcademiaOut(row: any) {
 
   const out: Record<string, any> = { ...row };
 
-  if (row.nombre_enc) {
-    out.nombre = decryptNullable(row.nombre_enc) ?? row.nombre ?? null;
-  }
+  out.nombre = row.nombre_enc ? decryptNullable(row.nombre_enc) : null;
 
   if (row.rut_academia_enc) {
     const rut = decryptRut(row.rut_academia_enc);
-    out.rut_academia = rut ? Number(rut) : (row.rut_academia ?? null);
+    out.rut_academia = rut ? Number(rut) : null;
+  } else {
+    out.rut_academia = null;
   }
 
-  if (row.direccion_enc) {
-    out.direccion = decryptNullable(row.direccion_enc) ?? row.direccion ?? null;
-  }
-
-  if (row.email_enc) {
-    out.email = decryptNullable(row.email_enc) ?? row.email ?? null;
-  }
+  out.direccion = row.direccion_enc ? decryptNullable(row.direccion_enc) : null;
+  out.email = row.email_enc ? decryptNullable(row.email_enc) : null;
 
   delete out.nombre_enc;
   delete out.nombre_idx;
@@ -1161,16 +1156,13 @@ export default async function academias(app: FastifyInstance) {
   );
 
   /* =======================================================
+   LIST
 
-     LIST
-
-     GET /api/academias
-
-  ======================================================= */
+   GET /api/academias
+======================================================= */
 
   app.get(
     "/",
-
     {
       preHandler: onlySuper,
     },
@@ -1180,34 +1172,51 @@ export default async function academias(app: FastifyInstance) {
         const { limit, offset, q, estado_id, deporte_id } = ListQuery.parse((req as any).query);
 
         const where: string[] = [];
-
         const params: any[] = [];
 
+        /* ---------------------------------------------------
+         BÚSQUEDA
+      --------------------------------------------------- */
+
         if (q) {
-          where.push(
-            `(
+          const clean = String(q).trim();
 
-              a.nombre LIKE ?
+          const numericRut = clean.replace(/\D/g, "");
 
-              OR CAST(
+          /*
+           * RUT exacto:
+           * búsqueda mediante blind index.
+           */
+          if (/^\d{7,8}$/.test(numericRut)) {
+            where.push("a.rut_academia_idx = ?");
 
-                   a.rut_academia
+            params.push(rutBlindIndex(numericRut));
+          } else {
+            /*
+             * Nombre exacto normalizado:
+             * búsqueda mediante blind index.
+             */
+            const normalizedName = normalizeAcademiaNameForIndex(clean);
 
-                   AS CHAR
+            where.push("a.nombre_idx = ?");
 
-                 ) LIKE ?
-
-            )`
-          );
-
-          params.push(`%${q}%`, `%${q.replace(/\D/g, "")}%`);
+            params.push(blindIndex(normalizedName));
+          }
         }
+
+        /* ---------------------------------------------------
+         ESTADO
+      --------------------------------------------------- */
 
         if (estado_id !== undefined) {
           where.push("a.estado_id = ?");
 
           params.push(estado_id);
         }
+
+        /* ---------------------------------------------------
+         DEPORTE
+      --------------------------------------------------- */
 
         if (deporte_id !== undefined) {
           where.push("a.deporte_id = ?");
@@ -1217,134 +1226,143 @@ export default async function academias(app: FastifyInstance) {
 
         const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
+        /* ---------------------------------------------------
+         LISTADO
+
+         IMPORTANTE:
+         a.id DEBE formar parte del contrato público.
+
+         Es necesario para:
+         - React keys
+         - seleccionar academia
+         - editar
+         - activar/desactivar
+         - eliminar
+         - logo
+      --------------------------------------------------- */
+
         const [rows] = await db.query(
           `
+            SELECT
 
-              SELECT
+              a.id,
 
-                a.id,
+              a.nombre_enc,
+              a.nombre_idx,
 
-                a.nombre,
-                a.nombre_enc,
-                a.nombre_idx,
+              a.rut_academia_enc,
+              a.rut_academia_idx,
 
-                a.rut_academia,
-                a.rut_academia_enc,
-                a.rut_academia_idx,
+              a.deporte_id,
 
-                a.deporte_id,
+              d.nombre
+                AS deporte_nombre,
 
-                d.nombre
+              a.direccion_enc,
 
-                  AS deporte_nombre,
+              a.ciudad_comuna_id,
 
-                a.direccion,
-                a.direccion_enc,
+              a.email_enc,
 
-                a.ciudad_comuna_id,
+              a.logo_mime,
+              a.logo_updated_at,
 
-                a.email,
-                a.email_enc,
-                a.logo_mime,
-                a.logo_updated_at,
-                CASE WHEN a.logo_base64 IS NULL THEN 0 ELSE 1 END AS tiene_logo,
+              CASE
+                WHEN a.logo_base64 IS NULL
+                  THEN 0
+                ELSE 1
+              END AS tiene_logo,
 
-                cc.ciudad_id,
+              cc.ciudad_id,
 
-                ci.nombre
+              ci.nombre
+                AS ciudad_nombre,
 
-                  AS ciudad_nombre,
+              cc.comuna_id,
 
-                cc.comuna_id,
+              co.nombre
+                AS comuna_nombre,
 
-                co.nombre
+              co.region_id,
 
-                  AS comuna_nombre,
+              r.nombre
+                AS region_nombre,
 
-                co.region_id,
+              a.estado_id,
 
-                r.nombre
+              ea.nombre
+                AS estado_nombre,
 
-                  AS region_nombre,
+              a.created_at,
 
-                a.estado_id,
+              a.updated_at
 
-                ea.nombre
+            FROM academias a
 
-                  AS estado_nombre,
+            LEFT JOIN deportes d
+              ON d.id =
+                 a.deporte_id
 
-                a.created_at,
+            LEFT JOIN ciudad_comuna cc
+              ON cc.id =
+                 a.ciudad_comuna_id
 
-                a.updated_at
+            LEFT JOIN ciudades ci
+              ON ci.id =
+                 cc.ciudad_id
 
-              FROM academias a
+            LEFT JOIN comunas co
+              ON co.id =
+                 cc.comuna_id
 
-              LEFT JOIN deportes d
+            LEFT JOIN regiones r
+              ON r.id =
+                 co.region_id
 
-                ON d.id =
+            LEFT JOIN estado_academia ea
+              ON ea.id =
+                 a.estado_id
 
-                   a.deporte_id
+            ${whereSql}
 
-              LEFT JOIN ciudad_comuna cc
+            ORDER BY
+              a.id DESC
 
-                ON cc.id =
-
-                   a.ciudad_comuna_id
-
-              LEFT JOIN ciudades ci
-
-                ON ci.id =
-
-                   cc.ciudad_id
-
-              LEFT JOIN comunas co
-
-                ON co.id =
-
-                   cc.comuna_id
-
-              LEFT JOIN regiones r
-
-                ON r.id =
-
-                   co.region_id
-
-              LEFT JOIN estado_academia ea
-
-                ON ea.id =
-
-                   a.estado_id
-
-              ${whereSql}
-
-              ORDER BY
-
-                a.id DESC
-
-              LIMIT ?
-
-              OFFSET ?
-
-            `,
-
+            LIMIT ?
+            OFFSET ?
+          `,
           [...params, limit, offset]
         );
 
+        /* ---------------------------------------------------
+         TOTAL
+      --------------------------------------------------- */
+
         const [countRows]: any = await db.query(
           `
+            SELECT
+              COUNT(*) AS total
 
-              SELECT
+            FROM academias a
 
-                COUNT(*) AS total
-
-              FROM academias a
-
-              ${whereSql}
-
-            `,
-
+            ${whereSql}
+          `,
           params
         );
+
+        /* ---------------------------------------------------
+         RESPUESTA
+
+         normalizeAcademiaOut():
+
+         - conserva id;
+         - descifra nombre;
+         - descifra RUT;
+         - descifra dirección;
+         - descifra email;
+         - elimina *_enc;
+         - elimina *_idx.
+      --------------------------------------------------- */
 
         return reply.send({
           ok: true,
@@ -1437,26 +1455,20 @@ export default async function academias(app: FastifyInstance) {
 
                 a.id,
 
-                a.nombre,
                 a.nombre_enc,
                 a.nombre_idx,
 
-                a.rut_academia,
                 a.rut_academia_enc,
                 a.rut_academia_idx,
 
                 a.deporte_id,
 
-                d.nombre
+                d.nombre AS deporte_nombre,
 
-                  AS deporte_nombre,
-
-                a.direccion,
                 a.direccion_enc,
 
                 a.ciudad_comuna_id,
 
-                a.email,
                 a.email_enc,
                 a.logo_base64,
                 a.logo_mime,
@@ -2029,54 +2041,32 @@ export default async function academias(app: FastifyInstance) {
           `
 
               INSERT INTO academias (
-
-                nombre,
-                nombre_enc,
-                nombre_idx,
-
-                rut_academia,
-                rut_academia_enc,
-                rut_academia_idx,
-
-                deporte_id,
-
-                direccion,
-                direccion_enc,
-
-                ciudad_comuna_id,
-
-                email,
-                email_enc,
-
-                logo_base64,
-                logo_mime,
-                logo_updated_at,
-                estado_id
-              )
-
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, IF(? IS NULL, NULL, NOW()), ?)
+              nombre_enc,
+              nombre_idx,
+              rut_academia_enc,
+              rut_academia_idx,
+              deporte_id,
+              direccion_enc,
+              ciudad_comuna_id,
+              email_enc,
+              logo_base64,
+              logo_mime,
+              logo_updated_at,
+              estado_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, IF(? IS NULL, NULL, NOW()), ?)
 
             `,
 
           [
-            nombre,
             encryptNullable(nombre),
             blindIndex(normalizeAcademiaNameForIndex(nombre)),
-
-            body.rut_academia,
             encryptRut(body.rut_academia),
             rutBlindIndex(body.rut_academia),
-
             body.deporte_id,
-
-            direccion,
             encryptNullable(direccion),
-
             body.ciudad_comuna_id,
-
-            email,
             encryptNullable(email),
-
             logoBase64,
             logoMime,
             logoBase64,
@@ -2721,19 +2711,17 @@ export default async function academias(app: FastifyInstance) {
         if (body.nombre !== undefined) {
           const nombre = normalizeName(body.nombre);
 
-          sets.push("nombre = ?");
           sets.push("nombre_enc = ?");
           sets.push("nombre_idx = ?");
 
-          updateParams.push(nombre, encryptNullable(nombre), blindIndex(normalizeAcademiaNameForIndex(nombre)));
+          updateParams.push(encryptNullable(nombre), blindIndex(normalizeAcademiaNameForIndex(nombre)));
         }
 
         if (body.rut_academia !== undefined) {
-          sets.push("rut_academia = ?");
           sets.push("rut_academia_enc = ?");
           sets.push("rut_academia_idx = ?");
 
-          updateParams.push(body.rut_academia, encryptRut(body.rut_academia), rutBlindIndex(body.rut_academia));
+          updateParams.push(encryptRut(body.rut_academia), rutBlindIndex(body.rut_academia));
         }
 
         if (body.deporte_id !== undefined) {
@@ -2745,10 +2733,8 @@ export default async function academias(app: FastifyInstance) {
         if (body.direccion !== undefined) {
           const direccion = normalizeName(body.direccion);
 
-          sets.push("direccion = ?");
           sets.push("direccion_enc = ?");
-
-          updateParams.push(direccion, encryptNullable(direccion));
+          updateParams.push(encryptNullable(direccion));
         }
 
         if (body.ciudad_comuna_id !== undefined) {
@@ -2760,10 +2746,8 @@ export default async function academias(app: FastifyInstance) {
         if (body.email !== undefined) {
           const email = normalizeEmail(body.email);
 
-          sets.push("email = ?");
           sets.push("email_enc = ?");
-
-          updateParams.push(email, encryptNullable(email));
+          updateParams.push(encryptNullable(email));
         }
 
         if (body.logo_base64 !== undefined && body.logo_mime !== undefined) {
