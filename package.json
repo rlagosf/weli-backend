@@ -1,7 +1,7 @@
 {
   "name": "weli-backend",
   "version": "1.0.0",
-  "description": "Backend oficial de Real Academy FC Reload (Node.js + Fastify + TypeScript)",
+  "description": "API REST DE WELI APP",
   "type": "commonjs",
   "main": "dist/index.js",
   "scripts": {
